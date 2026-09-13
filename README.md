@@ -66,7 +66,14 @@ flowchart LR
 
 ## Быстрый старт на macOS
 
-### Вариант 1: Запуск готового `.app` приложения (Рекомендуется)
+### Вариант 1: Загрузка готового установщика .dmg (Рекомендуется)
+
+Скачайте готовый `.dmg` или `.zip` из раздела [Releases (v2.13.0 macOS)](https://github.com/Fuheshka/Antigravity-Unlocker/releases/latest):
+1. Откройте `Antigravity-Unlocker-macOS.dmg`.
+2. Перетащите `Antigravity Unlocker.app` в папку **«Программы»** (`/Applications`).
+3. Запустите приложение из Spotlight или Launchpad.
+
+### Вариант 2: Сборка и установка из исходников в 1 команду
 
 ```bash
 # Клонируйте репозиторий:
