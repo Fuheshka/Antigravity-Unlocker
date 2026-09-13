@@ -84,6 +84,19 @@ fn is_install_root(path: &Path) -> bool {
             return true;
         }
     }
+    // macOS .app bundle layout: Contents/Resources/app[.asar] or Contents/MacOS
+    let mac_resources = path.join("Contents").join("Resources");
+    if mac_resources.exists() && mac_resources.is_dir() {
+        if mac_resources.join("app.asar").exists()
+            || mac_resources.join("app").exists()
+            || mac_resources.join("bin").exists()
+        {
+            return true;
+        }
+    }
+    if path.join("Contents").join("MacOS").is_dir() {
+        return true;
+    }
     // `is_file`, not `exists`: `%LOCALAPPDATA%\agy` is the CLI's *directory*, and
     // an `exists()` check there made the parent-walk treat `%LOCALAPPDATA%` itself
     // as an install root. A launcher/CLI is always a file.
@@ -140,6 +153,9 @@ pub fn resolve_install_root(raw: &Path) -> Option<PathBuf> {
     }
 
     let subfolder_candidates = [
+        "Antigravity IDE.app",
+        "Antigravity Tools.app",
+        "Antigravity.app",
         "Antigravity IDE",
         "Antigravity",
         "agy",
@@ -195,6 +211,27 @@ fn standard_install_candidates() -> Vec<PathBuf> {
 fn standard_install_candidates() -> Vec<PathBuf> {
     let home = env::var("HOME").unwrap_or_default();
     let mut v: Vec<PathBuf> = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        for app in [
+            "/Applications/Antigravity IDE.app",
+            "/Applications/Antigravity Tools.app",
+            "/Applications/Antigravity.app",
+        ] {
+            v.push(PathBuf::from(app));
+        }
+        if !home.is_empty() {
+            let h = PathBuf::from(&home);
+            v.push(h.join("Applications/Antigravity IDE.app"));
+            v.push(h.join("Applications/Antigravity Tools.app"));
+            v.push(h.join("Applications/Antigravity.app"));
+            v.push(h.join(".gemini/bin"));
+        }
+        v.push(PathBuf::from("/opt/homebrew/bin"));
+        v.push(PathBuf::from("/usr/local/bin"));
+    }
+
     // System-wide install roots, both capitalisations the packaging might use.
     for base in ["/opt", "/usr/share", "/usr/lib", "/usr/local/share"] {
         for name in [
@@ -213,10 +250,9 @@ fn standard_install_candidates() -> Vec<PathBuf> {
         v.push(h.join(".local/share/Antigravity IDE"));
         v.push(h.join("Antigravity"));
         v.push(h.join("Antigravity IDE"));
-        // The `agy` CLI: measured at `~/.local/bin/agy` on a real install, so its
-        // bin dir is an install root in its own right (binary_targets scopes to
-        // `agy`/`language_server*`, so a shared bin dir patches only ours).
+        // The `agy` CLI: measured at `~/.local/bin/agy` or `~/.gemini/bin/agy`
         v.push(h.join(".local/bin"));
+        v.push(h.join(".gemini/bin"));
         v.push(h.join(".agy/bin"));
         v.push(h.join(".agy"));
         v.push(h.join(".local/share/agy/bin"));
@@ -234,8 +270,10 @@ fn find_agy_dir() -> Option<PathBuf> {
     if let Ok(path) = env::var("PATH") {
         dirs.extend(path.split(':').filter(|d| !d.is_empty()).map(PathBuf::from));
     }
+    dirs.push(PathBuf::from(format!("{}/.gemini/bin", home)));
     dirs.push(PathBuf::from(format!("{}/.local/bin", home)));
     dirs.push(PathBuf::from(format!("{}/.agy/bin", home)));
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
     dirs.push(PathBuf::from("/usr/local/bin"));
     dirs.push(PathBuf::from("/usr/bin"));
     // Never a snap dir: `/snap/bin/agy` is a read-only wrapper, not the real
@@ -253,20 +291,25 @@ fn is_snap_path(p: &Path) -> bool {
     p.starts_with("/snap") || p.starts_with("/var/lib/snapd")
 }
 
-/// Scans the usual Linux prefixes for any `*antigravity*` directory, so an
+/// Scans the usual Linux/macOS prefixes for any `*antigravity*` directory, so an
 /// install whose name is not hardcoded is still found - the analogue of the
 /// Windows registry scan. Returns candidate roots to be resolved.
 #[cfg(not(target_os = "windows"))]
 fn scan_antigravity_dirs() -> Vec<PathBuf> {
     let home = env::var("HOME").unwrap_or_default();
     let mut out = Vec::new();
-    let bases = [
+    let mut bases = vec![
         "/opt".to_string(),
         "/usr/share".to_string(),
         "/usr/lib".to_string(),
         "/usr/local/share".to_string(),
         format!("{}/.local/share", home),
     ];
+    #[cfg(target_os = "macos")]
+    {
+        bases.push("/Applications".to_string());
+        bases.push(format!("{}/Applications", home));
+    }
     for base in bases {
         if let Ok(entries) = fs::read_dir(&base) {
             for e in entries.flatten() {
@@ -275,7 +318,7 @@ fn scan_antigravity_dirs() -> Vec<PathBuf> {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.to_lowercase().contains("antigravity"));
-                if hit && p.is_dir() {
+                if hit && (p.is_dir() || p.extension().is_some_and(|ext| ext == "app")) {
                     out.push(p);
                 }
             }
@@ -392,7 +435,11 @@ pub fn process_install(install: &Path) -> Result<InstallOutcome, String> {
     let bin_summary = patch_all_binaries(install);
     let mut warnings: Vec<String> = Vec::new();
 
-    let resources = install.join("resources");
+    let resources = if install.join("Contents").join("Resources").exists() {
+        install.join("Contents").join("Resources")
+    } else {
+        install.join("resources")
+    };
     let app_dir = resources.join("app");
     let app_asar = resources.join("app.asar");
 
@@ -617,6 +664,16 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("agy"), b"binary").unwrap();
+        assert!(is_install_root(&base));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_app_bundle_is_an_install_root() {
+        let base = env::temp_dir().join("Antigravity IDE.app");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("Contents").join("Resources").join("app")).unwrap();
         assert!(is_install_root(&base));
         fs::remove_dir_all(&base).ok();
     }

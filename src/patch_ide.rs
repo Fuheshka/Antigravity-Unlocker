@@ -94,19 +94,23 @@ fn restore_js(target: &Path) -> Result<bool, String> {
 /// Same reasoning as `patch_binary::unpatch_all_binaries`: a bare count turned a
 /// failed restore into a silent success, and the messages went to a console the
 /// window does not have.
+fn ide_app_dir(inst: &Path) -> PathBuf {
+    let mac = inst.join("Contents").join("Resources").join("app");
+    if mac.exists() {
+        mac
+    } else {
+        inst.join("resources").join("app")
+    }
+}
+
 pub fn unpatch_ide_js(inst: &Path) -> Vec<(String, Result<bool, String>)> {
     let mut out = Vec::new();
-    let main_js = inst
-        .join("resources")
-        .join("app")
-        .join("out")
-        .join("main.js");
+    let app_dir = ide_app_dir(inst);
+    let main_js = app_dir.join("out").join("main.js");
     if main_js.exists() {
         out.push(("main.js".to_string(), restore_js(&main_js)));
     }
-    let ext = inst
-        .join("resources")
-        .join("app")
+    let ext = app_dir
         .join("extensions")
         .join("antigravity")
         .join("dist")
@@ -638,9 +642,7 @@ mod tests {
 }
 
 pub fn patch_extension_js(inst: &Path) -> Result<bool, String> {
-    let ext_path = inst
-        .join("resources")
-        .join("app")
+    let ext_path = ide_app_dir(inst)
         .join("extensions")
         .join("antigravity")
         .join("dist")

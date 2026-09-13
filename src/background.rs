@@ -19,7 +19,10 @@ pub const PROXY_FLAG: &str = "--proxy";
 #[cfg(target_os = "windows")]
 pub use windows_impl::*;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+pub use macos_impl::*;
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub use unix_impl::*;
 
 #[cfg(target_os = "windows")]
@@ -466,12 +469,156 @@ mod windows_impl {
     }
 }
 
+// macOS: runs the local CONNECT proxy (`proxy::run`, via `--proxy`) as a
+// LaunchAgent in ~/Library/LaunchAgents/com.antigravity.unlocker.proxy.plist.
+// Unprivileged, no root required, auto-starts on user login.
+#[cfg(target_os = "macos")]
+mod macos_impl {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use super::PROXY_FLAG;
+
+    const LABEL: &str = "com.antigravity.unlocker.proxy";
+
+    fn home() -> PathBuf {
+        PathBuf::from(std::env::var("HOME").unwrap_or_default())
+    }
+
+    pub fn install_dir() -> PathBuf {
+        home().join("Library").join("Application Support").join("AGUnlocker")
+    }
+
+    pub fn installed_exe() -> PathBuf {
+        install_dir().join("ag_proxy")
+    }
+
+    fn plist_path() -> PathBuf {
+        home().join("Library").join("LaunchAgents").join(format!("{}.plist", LABEL))
+    }
+
+    pub fn is_enabled() -> bool {
+        plist_path().exists()
+    }
+
+    pub fn is_watchdog_enabled() -> bool {
+        false
+    }
+
+    pub fn is_running() -> bool {
+        if crate::proxy::listener_answers() {
+            return true;
+        }
+        Command::new("launchctl")
+            .args(["list", LABEL])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    pub fn relay_is_outdated() -> bool {
+        false
+    }
+
+    pub fn ensure_running() -> Result<(), String> {
+        let src = std::env::current_exe().map_err(|e| format!("нет пути к exe: {}", e))?;
+        let dir = install_dir();
+        let exe = installed_exe();
+        fs::create_dir_all(&dir).map_err(|e| format!("не создать {}: {}", dir.display(), e))?;
+        if src != exe {
+            fs::copy(&src, &exe).map_err(|e| format!("копия exe: {}", e))?;
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&exe, fs::Permissions::from_mode(0o755));
+            let _ = Command::new("codesign")
+                .args(["--force", "-s", "-", &exe.to_string_lossy()])
+                .status();
+        }
+
+        let plist = plist_path();
+        if let Some(p) = plist.parent() {
+            fs::create_dir_all(p).map_err(|e| format!("не создать {}: {}", p.display(), e))?;
+        }
+
+        let log_file = dir.join("proxy.log");
+        let content = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+        <string>{flag}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+</dict>
+</plist>
+"#,
+            label = LABEL,
+            exe = exe.display(),
+            flag = PROXY_FLAG,
+            log = log_file.display()
+        );
+        fs::write(&plist, content).map_err(|e| format!("не записать plist: {}", e))?;
+
+        let _ = Command::new("launchctl")
+            .args(["unload", "-w", &plist.to_string_lossy()])
+            .status();
+
+        let st = Command::new("launchctl")
+            .args(["load", "-w", &plist.to_string_lossy()])
+            .status()
+            .map_err(|e| format!("launchctl load: {}", e))?;
+
+        if !st.success() {
+            return Err("не удалось запустить LaunchAgent через launchctl".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn enable() -> Result<(), String> {
+        ensure_running()
+    }
+
+    pub fn enable_watchdog() -> Result<(), String> {
+        Ok(())
+    }
+
+    pub fn disable_watchdog() {}
+
+    pub fn disable() -> Result<(), String> {
+        let plist = plist_path();
+        if plist.exists() {
+            let _ = Command::new("launchctl")
+                .args(["unload", "-w", &plist.to_string_lossy()])
+                .status();
+            let _ = fs::remove_file(&plist);
+        }
+        let _ = Command::new("pkill")
+            .args(["-f", &format!("ag_proxy {}", PROXY_FLAG)])
+            .status();
+        let _ = fs::remove_file(installed_exe());
+        let _ = fs::remove_dir(install_dir());
+        Ok(())
+    }
+}
+
 // Linux: phase 2 is the **proxy route**, not the DNS relay. This runs the local
 // CONNECT proxy (`proxy::run`, via `--proxy`) as a systemd **user** unit - no
 // root, no `:53` listener, so systemd-resolved is never touched. The DNS relay
 // (phase 5) would be a separate, privileged story; this is deliberately the
 // unprivileged half that already lifts the region gate through a permitted exit.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 mod unix_impl {
     use std::fs;
     use std::path::PathBuf;

@@ -56,12 +56,28 @@ fn count_occurrences(data: &[u8], needle: &[u8]) -> usize {
 /// to launch. A running executable is locked on Windows, so the owning process is
 /// killed and the write retried only if the first attempt actually fails.
 fn write_binary(bin_path: &Path, data: &[u8]) -> Result<(), String> {
-    if write_atomic(bin_path, data).is_ok() {
-        return Ok(());
+    let outcome = if write_atomic(bin_path, data).is_ok() {
+        Ok(())
+    } else {
+        kill_holder(bin_path);
+        thread::sleep(Duration::from_millis(500));
+        write_atomic(bin_path, data).map_err(|e| e.to_string())
+    };
+
+    if outcome.is_ok() {
+        #[cfg(target_os = "macos")]
+        resign_macho_ad_hoc(bin_path);
     }
-    kill_holder(bin_path);
-    thread::sleep(Duration::from_millis(500));
-    write_atomic(bin_path, data).map_err(|e| e.to_string())
+    outcome
+}
+
+#[cfg(target_os = "macos")]
+fn resign_macho_ad_hoc(bin_path: &Path) {
+    let _ = Command::new("codesign")
+        .args(["--force", "-s", "-", bin_path.to_string_lossy().as_ref()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Kills whatever process holds `bin_path` open so the write can be retried.
@@ -324,22 +340,50 @@ pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
         .join("antigravity")
         .join("bin");
 
+    // macOS .app bundle locations
+    let mac_resources_bin = inst.join("Contents").join("Resources").join("bin");
+    let mac_ext_bin = inst
+        .join("Contents")
+        .join("Resources")
+        .join("app")
+        .join("extensions")
+        .join("antigravity")
+        .join("bin");
+    let mac_macos_bin = inst.join("Contents").join("MacOS");
+
     let mut targets: Vec<PathBuf> = vec![
         // CLI: `agy.exe` on Windows, bare `agy` on Linux/macOS.
         inst.join("agy.exe"),
         inst.join("agy"),
+        inst.join("bin").join("agy"),
         // Desktop's own language server.
         resources_bin.join("language_server.exe"),
         resources_bin.join("language_server"),
-        // IDE's bundled language server, Windows-named.
+        mac_resources_bin.join("language_server"),
+        mac_resources_bin.join("language_server_macos_arm"),
+        mac_resources_bin.join("language_server_macos_x64"),
+        // IDE's bundled language server, Windows & macOS named.
         ext_bin.join("language_server_windows_x64.exe"),
         ext_bin.join("language_server.exe"),
+        ext_bin.join("language_server_macos_arm"),
+        ext_bin.join("language_server_macos_x64"),
+        mac_ext_bin.join("language_server_macos_arm"),
+        mac_ext_bin.join("language_server_macos_x64"),
+        mac_ext_bin.join("language_server"),
+        mac_macos_bin.join("language_server"),
+        mac_macos_bin.join("language_server_macos_arm"),
     ];
 
-    // Any other `language_server*` in the two bin dirs - catches the Linux/macOS
-    // platform-suffixed names (`language_server_linux_x64`, `..._darwin_arm64`, …)
+    // Any other `language_server*` in candidate bin dirs - catches the Linux/macOS
+    // platform-suffixed names (`language_server_linux_x64`, `language_server_macos_arm`, …)
     // without pinning the exact spelling.
-    for dir in [&ext_bin, &resources_bin] {
+    for dir in [
+        &ext_bin,
+        &resources_bin,
+        &mac_ext_bin,
+        &mac_resources_bin,
+        &mac_macos_bin,
+    ] {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();

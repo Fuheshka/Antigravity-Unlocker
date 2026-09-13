@@ -205,7 +205,22 @@ pub fn message_box(title: &str, text: &str) {
 /// run from a shell); the dialog is the copy the desktop user can see. Best
 /// effort by design: none of these three is guaranteed to be installed, and a
 /// missing one must not turn a diagnostic into a second failure.
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+pub fn message_box(title: &str, text: &str) {
+    eprintln!("{}: {}", title, text);
+    let script = format!(
+        "display dialog \"{}\" with title \"{}\" buttons {{\"OK\"}} default button \"OK\" with icon stop",
+        text.replace('\\', "\\\\").replace('"', "\\\""),
+        title.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let _ = Command::new("osascript")
+        .args(["-e", &script])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn message_box(title: &str, text: &str) {
     eprintln!("{}: {}", title, text);
     let tried = [
@@ -265,7 +280,11 @@ pub fn open_url(url: &str) {
             );
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(url).status().ok();
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         Command::new("xdg-open").arg(url).status().ok();
     }
@@ -438,7 +457,39 @@ pub fn local_clock() -> Option<LocalClock> {
 
 #[cfg(not(target_os = "windows"))]
 pub fn local_clock() -> Option<LocalClock> {
-    None
+    #[repr(C)]
+    struct Tm {
+        tm_sec: i32,
+        tm_min: i32,
+        tm_hour: i32,
+        tm_mday: i32,
+        tm_mon: i32,
+        tm_year: i32,
+        tm_wday: i32,
+        tm_yday: i32,
+        tm_isdst: i32,
+        #[cfg(target_os = "macos")]
+        tm_gmtoff: std::os::raw::c_long,
+        #[cfg(target_os = "macos")]
+        tm_zone: *mut std::os::raw::c_char,
+    }
+    extern "C" {
+        fn time(tloc: *mut i64) -> i64;
+        fn localtime_r(timep: *const i64, result: *mut Tm) -> *mut Tm;
+    }
+    unsafe {
+        let mut now: i64 = 0;
+        time(&mut now);
+        let mut tm: Tm = std::mem::zeroed();
+        if localtime_r(&now, &mut tm).is_null() {
+            return None;
+        }
+        Some(LocalClock {
+            month: (tm.tm_mon + 1) as u16,
+            day: tm.tm_mday as u16,
+            second_of_day: tm.tm_hour as u32 * 3600 + tm.tm_min as u32 * 60 + tm.tm_sec as u32,
+        })
+    }
 }
 
 #[cfg(test)]
