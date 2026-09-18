@@ -97,6 +97,7 @@ pub const LISTEN_PORT: u16 = 53;
 ///     one per query, and each address resumes its own TLS session. dns-ai.ru
 ///     measured 1.06 queries per connection and its CPU going to handshakes;
 ///     the relay is where those queries come from, so it is what has to change.
+///     Same generation: a third dns-ai.ru node (msk1) in the walk.
 pub const RELAY_VERSION: u32 = 29;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can

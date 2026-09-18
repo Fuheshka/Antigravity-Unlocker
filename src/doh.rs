@@ -1320,9 +1320,10 @@ mod tests {
     /// A, B, then A again is exactly that interleaving: with a shared store the
     /// second round is `Full`.
     ///
-    /// A node that resumes nothing at all is left out, and said so - a server
-    /// setting, not something a client store can fix. `node_resumes` asks each
-    /// node on a store of its own.
+    /// A node that resumes nothing at all is left out, and said so: msk1
+    /// (`94.232.43.149`, nginx) issues two tickets on every handshake and
+    /// accepts none, measured 2026-09-18 - a server setting, not something a
+    /// client store can fix. `node_resumes` asks each node on a store of its own.
     #[test]
     #[ignore = "needs a live network, VPN off; run with --ignored"]
     fn each_address_resumes_its_own_session() {

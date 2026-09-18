@@ -120,7 +120,7 @@ pub const PROVIDERS: &[Provider] = &[
     },
 ];
 
-/// Addresses are the two `dns.dns-ai.ru` resolves to, hardcoded so the relay can
+/// Addresses are the three `dns.dns-ai.ru` resolves to, hardcoded so the relay can
 /// reach it before anything else resolves. Safe because the certificate still has
 /// to prove the name (`*.dns-ai.ru`, verified live), so a stale or poisoned
 /// address fails the handshake instead of becoming a silent man-in-the-middle.
@@ -135,14 +135,19 @@ pub const PROVIDERS: &[Provider] = &[
 /// of a core while its sibling sat at 15 %, because the certificate check meant a
 /// dead address failed safely and therefore failed *quietly*.
 ///
-/// Both entries below are live and were verified answering `200` on
-/// `/dns-query` before being written here. When re-checking (P14), check the
-/// ADDRESSES too, not only whether the provider still substitutes: a hardcoded
-/// address is a measurement with an expiry date.
+/// Every entry below is live and was verified answering on `/dns-query` before
+/// being written here. The third, `94.232.43.149`, joined 2026-09-18 at the
+/// service's own request: it was already in the public A record, and measured
+/// the same day it proves the name, speaks h2 (nginx in front, where the other
+/// two run dnsdist) and substitutes both gate names. The walk spreads queries
+/// evenly across all three - which is the point of listing a node at all (G43).
+/// When re-checking (P14), check the ADDRESSES too, not only whether the
+/// provider still substitutes: a hardcoded address is a measurement with an
+/// expiry date.
 pub static DNS_AI: crate::doh::Endpoint = crate::doh::Endpoint {
     host: "dns.dns-ai.ru",
     path: "/dns-query",
-    addrs: &["192.144.59.14", "186.246.49.127"],
+    addrs: &["192.144.59.14", "186.246.49.127", "94.232.43.149"],
 };
 
 /// Resolvers used only to recognise an unsubstituted answer. They must be
