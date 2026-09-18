@@ -93,7 +93,11 @@ pub const LISTEN_PORT: u16 = 53;
 ///     about the last region 400. Without this generation the window can see
 ///     the refusal in the client's log but nothing about the answer, so the
 ///     bump is what tells the user their service is too old to report (S48).
-pub const RELAY_VERSION: u32 = 28;
+/// 29 = the DoH provider keeps its connections (`doh::Pool`) instead of opening
+///     one per query, and each address resumes its own TLS session. dns-ai.ru
+///     measured 1.06 queries per connection and its CPU going to handshakes;
+///     the relay is where those queries come from, so it is what has to change.
+pub const RELAY_VERSION: u32 = 29;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
