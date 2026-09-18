@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use rustls::client::Resumption;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
 
@@ -72,8 +74,8 @@ const FLAG_END_HEADERS: u8 = 0x4;
 /// A DNS reply that does not fit this is not a reply we would use.
 const MAX_BODY: usize = 64 * 1024;
 
-fn tls_config() -> Arc<ClientConfig> {
-    static CFG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+fn base_tls_config() -> &'static ClientConfig {
+    static CFG: OnceLock<ClientConfig> = OnceLock::new();
     CFG.get_or_init(|| {
         let roots = rustls::RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
@@ -86,9 +88,38 @@ fn tls_config() -> Arc<ClientConfig> {
         // server were to pick http/1.1 the frames below would be nonsense on the
         // wire, and failing in ALPN is the honest place to find that out.
         cfg.alpn_protocols = vec![b"h2".to_vec()];
-        Arc::new(cfg)
+        cfg
     })
-    .clone()
+}
+
+/// The TLS config for one ADDRESS, not one process: each carries its own
+/// session store.
+///
+/// rustls files tickets under the server name, and every address of an
+/// `Endpoint` proves the same name - but they are separate machines, each with
+/// its own ticket keys (on purpose; the operator will not share them). One
+/// store, and a walk that alternates the nodes, meant every connection
+/// presented the ticket the *other* node had issued: the store hands out the
+/// newest one first. The node cannot decrypt it and falls back to a full
+/// handshake - measured on dns-ai.ru 2026-09-18 as ~26 `tlsunknownticketkeys`
+/// a second per node, with resumption almost never happening.
+///
+/// A store per address makes the server name mean one machine again.
+fn tls_config(ip: IpAddr) -> Arc<ClientConfig> {
+    static PER_ADDR: OnceLock<Mutex<HashMap<IpAddr, Arc<ClientConfig>>>> = OnceLock::new();
+    let fresh = || {
+        let mut cfg = base_tls_config().clone();
+        // The clone copies the `Arc` of the base config's store, so without this
+        // line every address would still share one - and nothing would change.
+        cfg.resumption = Resumption::in_memory_sessions(16);
+        Arc::new(cfg)
+    };
+    let Ok(mut map) = PER_ADDR.get_or_init(Default::default).lock() else {
+        // Poisoned only by a panic inside `fresh`; a config that cannot resume
+        // still connects, which is all this path has to guarantee.
+        return fresh();
+    };
+    map.entry(ip).or_insert_with(fresh).clone()
 }
 
 /// base64url without padding (RFC 4648 §5), which is what `?dns=` takes.
@@ -230,46 +261,8 @@ pub fn query(ep: &Endpoint, wire: &[u8], budget: Duration) -> Result<Vec<u8>, St
 
 fn query_one(ep: &Endpoint, ip: IpAddr, wire: &[u8], budget: Duration) -> Result<Vec<u8>, String> {
     let deadline = Instant::now() + budget;
-
-    let mut sock = TcpStream::connect_timeout(&SocketAddr::new(ip, 443), budget)
-        .map_err(|_| format!("{}: нет соединения", ip))?;
-    sock.set_nodelay(true).ok();
-
-    let server = ServerName::try_from(ep.host.to_string())
-        .map_err(|_| "неверное имя DoH-сервера".to_string())?;
-    let mut conn = ClientConnection::new(tls_config(), server)
-        .map_err(|e| format!("TLS не настроен: {}", e))?;
-
-    // Driven by hand so the budget covers the whole handshake rather than each
-    // syscall inside it - the same shape `resolvers::reachable` uses, and for
-    // the same reason: an address that completes TCP and stalls in TLS is the
-    // failure this has to notice quickly (G23).
+    let (mut sock, mut conn) = handshake(ep, ip, deadline)?;
     let remaining = |d: Instant| d.saturating_duration_since(Instant::now());
-    while conn.is_handshaking() {
-        let left = remaining(deadline);
-        if left.is_zero() {
-            return Err(format!("{}: TLS не уложился в бюджет", ip));
-        }
-        sock.set_read_timeout(Some(left)).ok();
-        sock.set_write_timeout(Some(left)).ok();
-        if conn.wants_write() {
-            conn.write_tls(&mut sock)
-                .map_err(|_| format!("{}: обрыв при handshake", ip))?;
-        }
-        if conn.is_handshaking() && conn.wants_read() {
-            match conn.read_tls(&mut sock) {
-                Ok(0) => return Err(format!("{}: сервер закрыл handshake", ip)),
-                Ok(_) => conn
-                    .process_new_packets()
-                    .map(|_| ())
-                    .map_err(|e| format!("{}: TLS отклонён: {}", ip, e))?,
-                Err(_) => return Err(format!("{}: обрыв при handshake", ip)),
-            }
-        }
-    }
-    if conn.alpn_protocol() != Some(b"h2") {
-        return Err(format!("{}: сервер не согласовал h2", ip));
-    }
 
     let path = format!("{}?dns={}", ep.path, base64url(wire));
     let mut out = Vec::with_capacity(256);
@@ -295,6 +288,58 @@ fn query_one(ep: &Endpoint, ip: IpAddr, wire: &[u8], budget: Duration) -> Result
     std::io::Write::flush(&mut tls).ok();
 
     read_reply(&mut tls, ip, deadline)
+}
+
+/// TCP + TLS to one address, h2 negotiated, all inside `deadline`.
+fn handshake(
+    ep: &Endpoint,
+    ip: IpAddr,
+    deadline: Instant,
+) -> Result<(TcpStream, ClientConnection), String> {
+    let remaining = |d: Instant| d.saturating_duration_since(Instant::now());
+    let budget = remaining(deadline);
+    if budget.is_zero() {
+        return Err(format!("{}: бюджет истёк до соединения", ip));
+    }
+    let mut sock = TcpStream::connect_timeout(&SocketAddr::new(ip, 443), budget)
+        .map_err(|_| format!("{}: нет соединения", ip))?;
+    sock.set_nodelay(true).ok();
+
+    let server = ServerName::try_from(ep.host.to_string())
+        .map_err(|_| "неверное имя DoH-сервера".to_string())?;
+    let mut conn = ClientConnection::new(tls_config(ip), server)
+        .map_err(|e| format!("TLS не настроен: {}", e))?;
+
+    // Driven by hand so the budget covers the whole handshake rather than each
+    // syscall inside it - the same shape `resolvers::reachable` uses, and for
+    // the same reason: an address that completes TCP and stalls in TLS is the
+    // failure this has to notice quickly (G23).
+    while conn.is_handshaking() {
+        let left = remaining(deadline);
+        if left.is_zero() {
+            return Err(format!("{}: TLS не уложился в бюджет", ip));
+        }
+        sock.set_read_timeout(Some(left)).ok();
+        sock.set_write_timeout(Some(left)).ok();
+        if conn.wants_write() {
+            conn.write_tls(&mut sock)
+                .map_err(|_| format!("{}: обрыв при handshake", ip))?;
+        }
+        if conn.is_handshaking() && conn.wants_read() {
+            match conn.read_tls(&mut sock) {
+                Ok(0) => return Err(format!("{}: сервер закрыл handshake", ip)),
+                Ok(_) => conn
+                    .process_new_packets()
+                    .map(|_| ())
+                    .map_err(|e| format!("{}: TLS отклонён: {}", ip, e))?,
+                Err(_) => return Err(format!("{}: обрыв при handshake", ip)),
+            }
+        }
+    }
+    if conn.alpn_protocol() != Some(b"h2") {
+        return Err(format!("{}: сервер не согласовал h2", ip));
+    }
+    Ok((sock, conn))
 }
 
 /// Reads frames until stream 1 ends, collecting its DATA.
@@ -653,6 +698,42 @@ mod tests {
                 name, got, reference
             );
             println!("{} -> {:?} (эталон {:?})", name, got, reference);
+        }
+    }
+
+    /// Each address resumes the session **it** issued. The walk alternates the
+    /// two nodes, and rustls hands out the newest ticket stored under the server
+    /// name - so with one store per process every connection presented the
+    /// *other* node's ticket, which that node cannot decrypt (ticket keys are
+    /// per node, on purpose). The server side counted it as
+    /// `tlsunknownticketkeys`, ~26/s per node, each one a full handshake.
+    ///
+    /// A, B, then A again is exactly that interleaving: with a shared store the
+    /// third handshake is `Full`.
+    #[test]
+    #[ignore = "needs a live network, VPN off; run with --ignored"]
+    fn each_address_resumes_its_own_session() {
+        use crate::dns_client;
+        use rustls::HandshakeKind;
+        let ep = &crate::resolvers::DNS_AI;
+        let ips: Vec<IpAddr> = ep.addrs.iter().map(|a| a.parse().unwrap()).collect();
+        assert!(ips.len() >= 2, "the point is two peer nodes");
+        let q = dns_client::build_query("cloudcode-pa.googleapis.com", 0x5151);
+
+        // One full exchange per node, in walk order: reading the reply is what
+        // takes in the tickets the server sends after its Finished.
+        for &ip in &ips {
+            query_one(ep, ip, &q, Duration::from_secs(8)).unwrap_or_else(|e| panic!("{}", e));
+        }
+        for &ip in &ips {
+            let (_, conn) = handshake(ep, ip, Instant::now() + Duration::from_secs(8))
+                .unwrap_or_else(|e| panic!("{}", e));
+            assert_eq!(
+                conn.handshake_kind(),
+                Some(HandshakeKind::Resumed),
+                "{}: полное рукопожатие — предъявлен чужой билет",
+                ip
+            );
         }
     }
 }
