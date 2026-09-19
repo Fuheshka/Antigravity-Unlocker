@@ -59,9 +59,37 @@ pub struct Report {
     /// forced, which is the ordinary state.
     pub forced_until: u64,
     /// Whether the DNS layer is standing down for a tunnel carrying the client.
+    /// Always false since D25 - the bypass carries the gate hosts on every
+    /// network - and kept so an older window reading a newer record still parses.
     pub stood_down: bool,
     /// The last refusal episode and what was done about it.
     pub last_400: Option<Episode>,
+    /// The last model answer the relay saw in a client log, and the route it
+    /// credited with it.
+    pub last_ok: Option<Proof>,
+    /// Whether gate hosts are answered with the loopback listener's addresses
+    /// (`loopback`), i.e. whether every gate connection on the machine is ours
+    /// to route, env variable or not.
+    pub loopback: bool,
+    /// Whether a VPN holds the default route, and where its exit is (a country
+    /// code, empty until measured).
+    pub tunnel: bool,
+    pub vpn_exit: String,
+    /// The route table, best first, for the report the window copies out.
+    pub routes: Vec<crate::routes::Row>,
+    /// The relay generation that wrote this.
+    pub version: u32,
+}
+
+/// A model answer, as the relay saw it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Proof {
+    /// When the relay noticed it.
+    pub at: u64,
+    /// The route credited with it, by label. Empty when no gate tunnel of ours
+    /// was open around it - the client reached Google some other way.
+    pub route: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +102,12 @@ pub struct Episode {
     /// What was done about it, in the words the window shows. Written by the
     /// side that knows, so the window never has to guess from a switch.
     pub acted: String,
+    /// The route the refusal was pinned on, by label; empty when none of ours
+    /// was open around it.
+    pub route: String,
+    /// No gate tunnel of ours carried it: the client dialled Google itself, so
+    /// nothing the route table does can help until its connections come to us.
+    pub bypassed: bool,
 }
 
 impl Report {
@@ -88,7 +122,9 @@ impl Report {
         self.age() > STALE_AFTER
     }
 
-    /// How much of the forced-substitution window is left.
+    /// How much of the forced-substitution window is left. Only ever set with
+    /// the loopback door down (D25's fallback, `resolvers::force_substitution`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn forced_left(&self) -> Option<Duration> {
         self.forced_until
             .checked_sub(now_unix())
@@ -100,11 +136,18 @@ impl Report {
     ///
     /// `at` moves every warm pass and changes nothing on screen, so comparing it
     /// would wake the UI every fifteen seconds to redraw the same words.
+    /// The route table rows are left out on purpose: their ages move every
+    /// pass, and nothing on screen shows them - only the copied report does, and
+    /// that reads the file fresh when the button is pressed.
     fn same_state_as(&self, other: &Report) -> bool {
         self.route == other.route
             && self.forced_until == other.forced_until
             && self.stood_down == other.stood_down
             && self.last_400 == other.last_400
+            && self.last_ok == other.last_ok
+            && self.loopback == other.loopback
+            && self.tunnel == other.tunnel
+            && self.vpn_exit == other.vpn_exit
     }
 }
 
@@ -169,24 +212,52 @@ fn update(change: impl FnOnce(&mut Report)) {
     }
 }
 
+/// What the relay is doing now, as one warm pass sees it.
+pub struct Now<'a> {
+    pub route: Option<&'a str>,
+    pub forced_for: Option<Duration>,
+    pub stood_down: bool,
+    pub loopback: bool,
+    pub tunnel: bool,
+    pub vpn_exit: &'a str,
+    pub routes: Vec<crate::routes::Row>,
+}
+
 /// Called once per warm pass with what the relay is doing now.
-pub fn publish(route: Option<&str>, forced_for: Option<Duration>, stood_down: bool) {
+pub fn publish(now: Now<'_>) {
     update(|r| {
-        if let Some(route) = route {
+        if let Some(route) = now.route {
             r.route = route.to_string();
         }
-        r.forced_until = forced_for.map_or(0, |left| now_unix() + left.as_secs());
-        r.stood_down = stood_down;
+        r.forced_until = now.forced_for.map_or(0, |left| now_unix() + left.as_secs());
+        r.stood_down = now.stood_down;
+        r.loopback = now.loopback;
+        r.tunnel = now.tunnel;
+        r.vpn_exit = now.vpn_exit.to_string();
+        r.routes = now.routes;
+        r.version = crate::dns_forwarder::RELAY_VERSION;
     });
 }
 
 /// Called when a refusal has been answered, with what was done about it.
-pub fn record_episode(count: u32, acted: String) {
+pub fn record_episode(count: u32, acted: String, route: Option<&str>) {
     update(|r| {
         r.last_400 = Some(Episode {
             at: now_unix(),
             count,
             acted,
+            route: route.unwrap_or_default().to_string(),
+            bypassed: route.is_none(),
+        })
+    });
+}
+
+/// Called when a model answer shows up in a client log.
+pub fn record_answer(route: Option<&str>) {
+    update(|r| {
+        r.last_ok = Some(Proof {
+            at: now_unix(),
+            route: route.unwrap_or_default().to_string(),
         })
     });
 }
@@ -200,6 +271,13 @@ pub fn record_episode(count: u32, acted: String) {
 /// window; short enough that it is about this session rather than this morning.
 pub const RECENT: Duration = Duration::from_secs(10 * 60);
 
+/// How far back a model answer still counts as proof that the bypass works.
+/// Longer than `RECENT`: a working setup is quiet between messages, and a user
+/// who opens the window after lunch should still see that it worked this
+/// morning - on the same network, which is what the relay's context reset
+/// (`routes::set_context`) is for when it is not.
+pub const ANSWER_RECENT: Duration = Duration::from_secs(12 * 60 * 60);
+
 /// The whole of what the watcher knows.
 #[derive(Debug, Clone, Default)]
 pub struct View {
@@ -207,6 +285,13 @@ pub struct View {
     /// the window adds its own elapsed time on top rather than being sent a
     /// fresh one every tick.
     pub seen: Option<crate::ls_log::Sighting>,
+    /// The newest model answer in the client's log, the same way.
+    pub answered: Option<crate::ls_log::Sighting>,
+    /// The newest refusal over the same horizon as `answered`. `seen` stops at
+    /// `RECENT`, and without this a refusal eleven minutes old that came *after*
+    /// the last answer disappeared, and the answer before it turned the card
+    /// green again - a claim about a route that was last seen failing.
+    pub refused_long: Option<crate::ls_log::Sighting>,
     /// The relay's record, or `None` when there is none or it has gone stale.
     pub relay: Option<Report>,
 }
@@ -264,6 +349,8 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
     // The last real scan and when it was taken, so an age can be carried
     // forward without reading the file again.
     let mut found: Option<(crate::ls_log::Sighting, Instant)> = None;
+    let mut answered: Option<(crate::ls_log::Sighting, Instant)> = None;
+    let mut refused_long: Option<(crate::ls_log::Sighting, Instant)> = None;
     // The first tick scans whatever is already there: a user who hits the gate
     // and *then* opens this window is the case this whole path exists for.
     let mut scan = true;
@@ -296,9 +383,11 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
             // of the bytes we look at - and flipping from "поймана" to "не
             // встречалась" on that is a positive claim about the part of the
             // file nobody read. Only time retires a sighting, below.
-            found = crate::ls_log::newest_refusal(&logs, RECENT)
-                .map(|s| (s, Instant::now()))
-                .or(found);
+            let h = crate::ls_log::history(&logs, RECENT, ANSWER_RECENT);
+            let at = Instant::now();
+            found = h.refused_recent.map(|s| (s, at)).or(found);
+            answered = h.answered.map(|s| (s, at)).or(answered);
+            refused_long = h.refused.map(|s| (s, at)).or(refused_long);
         }
 
         let view = View {
@@ -309,6 +398,14 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
             seen: found.and_then(|(s, at)| {
                 let ago = s.ago + at.elapsed();
                 (ago <= RECENT).then_some(crate::ls_log::Sighting { ago, ..s })
+            }),
+            answered: answered.and_then(|(s, at)| {
+                let ago = s.ago + at.elapsed();
+                (ago <= ANSWER_RECENT).then_some(crate::ls_log::Sighting { ago, ..s })
+            }),
+            refused_long: refused_long.and_then(|(s, at)| {
+                let ago = s.ago + at.elapsed();
+                (ago <= ANSWER_RECENT).then_some(crate::ls_log::Sighting { ago, ..s })
             }),
             relay: read().filter(|r| !r.is_stale()),
         };
@@ -355,10 +452,13 @@ fn worth_sending(fresh: &View, shown: &View) -> bool {
     if relay_changed {
         return true;
     }
-    match (fresh.seen, shown.seen) {
+    let newer = |a: Option<crate::ls_log::Sighting>, b: Option<crate::ls_log::Sighting>| match (a, b) {
         (Some(a), Some(b)) => a.count != b.count || a.ago < b.ago,
         (a, b) => a.is_some() != b.is_some(),
-    }
+    };
+    newer(fresh.seen, shown.seen)
+        || newer(fresh.answered, shown.answered)
+        || newer(fresh.refused_long, shown.refused_long)
 }
 
 #[cfg(test)]
@@ -379,6 +479,8 @@ mod tests {
     fn only_a_change_is_worth_waking_the_window_for() {
         let shown = View {
             seen: seen(120, 2),
+            answered: None,
+            refused_long: None,
             relay: None,
         };
         let older = View {
@@ -400,6 +502,19 @@ mod tests {
         };
         assert!(worth_sending(&expired, &shown));
         assert!(worth_sending(&shown, &expired));
+        // A model answer appearing is news too - it is what turns the card green.
+        let proved = View {
+            answered: seen(5, 1),
+            ..shown.clone()
+        };
+        assert!(worth_sending(&proved, &shown));
+        assert!(!worth_sending(
+            &View {
+                answered: seen(8, 1),
+                ..proved.clone()
+            },
+            &proved
+        ));
     }
 
     /// `at` moves every warm pass and draws nothing, so it must not count as a
@@ -426,6 +541,7 @@ mod tests {
                 at: 1_010,
                 count: 1,
                 acted: "маршрут отложен".into(),
+                ..Episode::default()
             }),
             ..base.clone()
         };
@@ -433,6 +549,8 @@ mod tests {
 
         let shown = View {
             seen: None,
+            answered: None,
+            refused_long: None,
             relay: Some(base),
         };
         assert!(!worth_sending(

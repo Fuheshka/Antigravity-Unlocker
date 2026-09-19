@@ -10,7 +10,9 @@ use crate::dns;
 use crate::dns_client;
 use crate::egress;
 use crate::gate;
+use crate::loopback;
 use crate::ls_log;
+use crate::net;
 use crate::proxy;
 use crate::resolvers::{self, Verdict};
 use crate::routes;
@@ -98,7 +100,22 @@ pub const LISTEN_PORT: u16 = 53;
 ///     measured 1.06 queries per connection and its CPU going to handshakes;
 ///     the relay is where those queries come from, so it is what has to change.
 ///     Same generation: a third dns-ai.ru node (msk1) in the walk.
-pub const RELAY_VERSION: u32 = 29;
+/// 30 = carries the gate hosts itself on every network (2.14.0_1): answers them
+///     with its own loopback addresses (`loopback`), so a client started before
+///     the proxy variable is routed too (G50); pins its own connections to the
+///     ISP link while a VPN holds the default route, DoH included (N25, P13);
+///     ranks routes by the model answers they carried, not only by speed, and
+///     closes a refused route's tunnels (`routes`); watches the client logs
+///     every two seconds, the CLI's included; answers AAAA/HTTPS for the gate
+///     hosts with nothing (P40); and no longer stands down for a VPN while that
+///     door is up (D25) - the VPN is a route of its own. xbox-dns.ru is out of
+///     the pool.
+/// 31 = its watchdog patches a fresh install too, not only one an update
+///     reverted: gated on auto-patch minus a patch declined by hand instead of
+///     on the user having patched once (D27), re-scanning for installs every
+///     10 s instead of 5 min, the user's own paths included. An older relay
+///     leaves a newly installed Antigravity unpatched with auto-patch on.
+pub const RELAY_VERSION: u32 = 31;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -231,6 +248,13 @@ fn stamp() -> String {
 /// so a torn connection cannot be lined up against the error the user saw - which
 /// is precisely the question a bug report asks.
 fn log(line: &str) {
+    // Never from a test. The file is the *installed* relay's log, and a unit test
+    // exercising `health` or `routes` used to append lines like «тест отложен на
+    // 5 мин» to it on the developer's machine - which the window's «Скопировать
+    // отчёт» now pastes into a support message (G18's other half).
+    if cfg!(test) {
+        return;
+    }
     let path = log_path();
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).ok();
@@ -336,11 +360,83 @@ const WARM_EVERY: Duration = Duration::from_secs(15);
 /// clock - see the warm loop below for why.
 const PROBE_HEALTHY_EVERY: Duration = Duration::from_secs(2 * 60);
 
+/// Where the relay asks the routing table to send a packet, to notice a tunnel
+/// coming up or going down between the full scans. Any public address works;
+/// this one is only ever used as a route lookup, never contacted.
+const ROUTE_PROBE_DEST: std::net::Ipv4Addr = std::net::Ipv4Addr::new(8, 8, 8, 8);
+
+/// How often the tunnel's exit country is re-read while a VPN stays up. A
+/// VPN client can switch servers without the route table noticing anything.
+const VPN_EXIT_EVERY: Duration = Duration::from_secs(30 * 60);
+
+/// The tunnel's exit country, as last measured; empty when unknown.
+static VPN_EXIT_COUNTRY: Mutex<String> = Mutex::new(String::new());
+static MEASURING_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Reads where the tunnel comes out - Cloudflare's trace over the default
+/// route, which is the tunnel - and decides whether the `Vpn` route may be
+/// offered. On a thread: it is a real HTTPS request, and the warm pass has
+/// budgets of its own.
+fn measure_vpn_exit() {
+    use std::sync::atomic::Ordering;
+    if MEASURING_EXIT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let spawned = thread::Builder::new()
+        .name("vpn-exit".to_string())
+        .spawn(|| {
+            let exit = upstream::machine_exit();
+            let (country, permitted) = match &exit {
+                Some((_, loc)) => (loc.clone(), Some(!upstream::region_is_blocked(loc))),
+                None => (String::new(), None),
+            };
+            // Only while a tunnel is still up: a measurement that raced the VPN
+            // going down would otherwise offer a route that no longer exists.
+            if net::tunnel_up() {
+                proxy::set_vpn_exit(permitted);
+                if let Ok(mut c) = VPN_EXIT_COUNTRY.lock() {
+                    *c = country.clone();
+                }
+                log(&match permitted {
+                    Some(true) => format!(
+                        "VPN выходит в {} — его можно использовать как маршрут",
+                        country
+                    ),
+                    Some(false) => format!(
+                        "VPN выходит в {} — там ошибка 400, этот маршрут не используется",
+                        country
+                    ),
+                    None => "страну выхода VPN узнать не удалось".to_string(),
+                });
+            }
+            MEASURING_EXIT.store(false, Ordering::SeqCst);
+        });
+    if spawned.is_err() {
+        MEASURING_EXIT.store(false, Ordering::SeqCst);
+    }
+}
+
+fn vpn_exit_country() -> String {
+    VPN_EXIT_COUNTRY
+        .lock()
+        .map(|c| c.clone())
+        .unwrap_or_default()
+}
+
+/// A fingerprint of the network the route table's evidence belongs to: which
+/// adapter is the ISP link, which one the default route leaves through, and
+/// whether that is a tunnel. Never 0 - that is the table's "not set yet".
+fn network_fingerprint(isp: u32, best: Option<u32>, tunnel: bool) -> u64 {
+    1 + ((isp as u64) << 33) + ((best.unwrap_or(0) as u64) << 1) + tunnel as u64
+}
+
 fn warm_forever() {
     let mut since_upstream = PROBE_HEALTHY_EVERY;
     let mut since_exits = PROBE_HEALTHY_EVERY;
     let mut since_direct = PROBE_HEALTHY_EVERY;
     let mut since_vpn = VPN_CHECK_EVERY;
+    let mut since_exit_check = Duration::ZERO;
+    let mut last_best: Option<u32> = None;
     loop {
         // One small record per pass, for a window that is another process and
         // can otherwise only read the log meant for a person (P29). **First** in
@@ -350,11 +446,27 @@ fn warm_forever() {
         // - which is exactly when a user has just switched the bypass on and is
         // watching the window. The leader is the one the last pass settled on,
         // which is the one in force right now.
-        gate::publish(
-            routes::leader().map(|k| k.label()),
-            resolvers::substitution_forced_for(),
-            resolvers::tunnel_carries_client(),
-        );
+        let exit_country = vpn_exit_country();
+        gate::publish(gate::Now {
+            route: routes::leader().map(|k| k.label()),
+            forced_for: resolvers::substitution_forced_for(),
+            stood_down: resolvers::tunnel_carries_client(),
+            loopback: loopback::active(),
+            tunnel: net::tunnel_up(),
+            vpn_exit: &exit_country,
+            routes: routes::rows(|k| proxy::route_usable(k, ROUTE_PROBE_HOST)),
+        });
+        // One syscall, every pass: where the default route goes now. A change
+        // is a VPN coming up or going down, or a different network - worth the
+        // full scan right away rather than on the four-minute clock.
+        let best = net::best_interface(ROUTE_PROBE_DEST);
+        if best != last_best {
+            if last_best.is_some() {
+                invalidate_interface();
+            }
+            last_best = best;
+            since_vpn = VPN_CHECK_EVERY;
+        }
         // First, because everything below depends on it: when a tunnel carries
         // the client the relay stops substituting and answers as the tunnel's
         // own resolver would. The rules cannot be removed from here - the task
@@ -363,56 +475,74 @@ fn warm_forever() {
         // reaches the same place. Menu 1 removes the rules outright on the next
         // elevated run (`dns::refresh_pinned_hosts`).
         if since_vpn >= VPN_CHECK_EVERY {
-            // Not "is a tunnel up" but "is the client in it" - a tunnel the
-            // client is excluded from must not turn substitution off, or the
-            // rules menu 1 wrote resolve to genuine Google and the gate answers
-            // 400 with the whole layer nominally installed (G29). This is also
-            // where the excluded case repairs itself: the rules are already in
-            // place, and within one interval of Antigravity starting the relay
-            // sees its sockets on the ISP link and starts substituting again.
+            // A tunnel holding the default route no longer takes the bypass down
+            // (D25): the client's gate connections come to us on loopback, so the
+            // tunnel can only ever catch *our* connections - and those are pinned
+            // to the ISP link while it is up, the same way every resolver query
+            // already was (I4). The user's VPN is still used, as a route of its
+            // own (`routes::Kind::Vpn`), whenever it exits somewhere the gate
+            // does not apply.
             let eg = egress::detect();
-            let (stand_down, client) = egress::vpn_verdict(eg.as_ref());
-            // Compared against the raw verdict, not `vpn_is_active()`: while
-            // substitution is forced on (region 400 through the tunnel) the
-            // latter reads false whatever the tunnel does, and the line below
-            // would repeat every pass.
+            let tunnel = eg.as_ref().is_some_and(|e| e.vpn_active);
+            let was = net::tunnel_up();
+            net::set_pin_interface(match &eg {
+                Some(e) if tunnel => e.if_index,
+                _ => 0,
+            });
+            // The stand-down survives for exactly one case: the loopback door is
+            // down, so the client dials Google itself, and it is measured inside
+            // the tunnel. Then the tunnel is its only way out, and a substituted
+            // address reached from the tunnel's exit is refused by the RU-only
+            // providers (N25) - so the relay answers as the tunnel would (D13's
+            // old rule, now the fallback D25 leaves in place).
+            let (stand_down, _) = if tunnel && !loopback::active() {
+                egress::vpn_verdict(eg.as_ref())
+            } else {
+                (false, egress::ClientEgress::Unknown)
+            };
             if stand_down != resolvers::tunnel_carries_client() {
-                log(
-                    &match (stand_down, eg.is_some_and(|e| e.vpn_active), client) {
-                        (true, _, _) => {
-                            "VPN поднят — подмена выключена, DNS идёт как настроил VPN".to_string()
-                        }
-                        (false, true, egress::ClientEgress::Physical) => {
-                            "VPN поднят, но трафик Antigravity идёт мимо него — подмена включена"
-                                .to_string()
-                        }
-                        (false, true, egress::ClientEgress::ViaLocalProxy) => {
-                            "VPN поднят, Antigravity ходит через локальный прокси — подмена включена"
-                                .to_string()
-                        }
-                        (false, true, _) => {
-                            "VPN поднят, маршрут Antigravity неизвестен — подмена включена"
-                                .to_string()
-                        }
-                        (false, false, _) => "VPN отключён — подмена снова включена".to_string(),
-                    },
-                );
+                log(if stand_down {
+                    "Antigravity ходит через VPN мимо обхода — адреса отдаются как у VPN"
+                } else {
+                    "подмена адресов снова включена"
+                });
             }
             resolvers::set_vpn_active(stand_down);
+            if tunnel != was {
+                log(if tunnel {
+                    "VPN поднят — соединения службы с сервисами разблокировки идут мимо него, через провайдера"
+                } else {
+                    "VPN отключён"
+                });
+            }
+            if tunnel && (!was || proxy::vpn_exit().is_none()) {
+                measure_vpn_exit();
+                since_exit_check = Duration::ZERO;
+            }
+            if !tunnel {
+                proxy::set_vpn_exit(None);
+                if let Ok(mut c) = VPN_EXIT_COUNTRY.lock() {
+                    c.clear();
+                }
+            }
             since_vpn = Duration::ZERO;
         }
-        let egress = isp_interface();
-        // The client's own log is the one place the region 400 is written down
-        // (ls_log). Every pass, because a refusal costs the user every request
-        // until it is answered, and reading a file's tail costs nothing. Before
-        // the warm, not after: answering a refusal expires the cached answers
-        // for the gate names, and the warm below is what refills them - in the
-        // other order the cache sat empty for a whole pass and a client query
-        // in that window paid for a cold race (I23).
-        let refusals = ls_log::poll();
-        if !refusals.is_empty() {
-            answer_region_400(&refusals);
+        if net::tunnel_up() && since_exit_check >= VPN_EXIT_EVERY {
+            measure_vpn_exit();
+            since_exit_check = Duration::ZERO;
         }
+        let egress = isp_interface();
+        // Not while the ISP interface is unknown: `isp_interface` answers 0 for
+        // half a minute after a failed detection, and taking that for a new
+        // network wiped every bench - and put back first the route the gate had
+        // just refused - twice per hiccup.
+        if egress != 0 && routes::set_context(network_fingerprint(egress, best, net::tunnel_up())) {
+            log_proxy("сеть изменилась — что работает, выясняется заново");
+        }
+        // The client logs are watched on a thread of their own every two
+        // seconds (`watch_client_logs`), not here: a refusal costs the user
+        // every request until it is answered, and a warm pass is fifteen
+        // seconds plus its probes.
         resolvers::warm(dns::core_namespaces(), egress);
         // The relay is somebody else's server, so it is the one route we never
         // probe on a timer. A health check every two minutes, from every machine
@@ -451,6 +581,7 @@ fn warm_forever() {
         // a region penalty is a clock, and no measurement shortens it.
         if since_direct >= PROBE_HEALTHY_EVERY {
             proxy::probe_direct(egress);
+            proxy::probe_vpn();
             since_direct = Duration::ZERO;
         }
         routes::refresh_leader(|k| proxy::route_usable(k, ROUTE_PROBE_HOST));
@@ -459,104 +590,204 @@ fn warm_forever() {
         since_exits += WARM_EVERY;
         since_direct += WARM_EVERY;
         since_vpn += WARM_EVERY;
+        since_exit_check += WARM_EVERY;
+    }
+}
+
+/// How often the client logs are looked at. Two seconds: a user who sees the
+/// error and presses "send" again should find the route already switched.
+const LOG_WATCH_EVERY: Duration = Duration::from_secs(2);
+
+/// The one place the region 400 and the model answer are written down is the
+/// client's own log (`ls_log`). Looked at every two seconds; reading a file's
+/// tail when it has not grown costs one `metadata`.
+fn watch_client_logs() {
+    loop {
+        thread::sleep(LOG_WATCH_EVERY);
+        let hits = ls_log::poll();
+        if !hits.is_empty() {
+            answer_log(&hits);
+        }
     }
 }
 
 /// The name the route table is refreshed against: the gate host the IDE uses.
 const ROUTE_PROBE_HOST: &str = "daily-cloudcode-pa.googleapis.com";
 
-/// A region 400 is attributed to the route that opened a gate tunnel within
-/// this long before it was seen. Longer than the client's pool idle (90 s), so
-/// a refusal on a pooled connection still finds the route it rode on.
-const ATTRIBUTION_WINDOW: Duration = Duration::from_secs(5 * 60);
-
-/// Does what a region 400 in the client's log calls for.
+/// Answers what the client logs say: a refusal benches the route that carried
+/// it and closes its tunnels, an answer proves the route that carried it.
 ///
-/// Three things, each aimed at a different way the gate can have been met:
-/// - the relay was standing down for a tunnel the client is in, and the tunnel
-///   exits somewhere blocked -> substitution is forced back on for a while, so
-///   the client is sent to a provider's proxy through the tunnel (D13 revised
-///   once more: the tunnel decides *until it is measured wrong*);
-/// - the relay was substituting, so the address it handed out led to the gate
-///   anyway -> every remembered choice and answer for the gate names is
-///   dropped, and the next warm pass races the providers from scratch;
-/// - a proxy route carried the refusal -> that route goes to the back of the
-///   route table for a while, so the client's retry takes another one.
+/// The older of the two is handled first, so a pass that saw a refusal and then
+/// an answer on the route that replaced it ends with the right route proven -
+/// and one that saw an answer and then a refusal ends with it benched.
 ///
-/// Anything in flight stays in flight: nothing here touches an open tunnel, and
-/// the client's next connection is what takes the new route.
-fn answer_region_400(refusals: &[(std::path::PathBuf, usize)]) {
-    let total: usize = refusals.iter().map(|(_, n)| n).sum();
-    for (path, n) in refusals {
-        log_proxy(&format!(
-            "region-400 x{} в {} — Antigravity упёрся в гейт",
-            n,
-            path.file_name()
-                .map_or_else(String::new, |f| f.to_string_lossy().into_owned())
-        ));
-    }
-    // What was done about it, in the words the window shows (`gate`). Collected
-    // here rather than reconstructed there: the window can see that a refusal
-    // happened, but only this function knows which of the three answers it
-    // called for, and "перехвачено" is a claim that has to rest on the side that
-    // acted rather than on a switch being on.
-    let mut acted: Vec<String> = Vec::new();
-    if resolvers::vpn_is_active() {
-        resolvers::force_substitution(resolvers::FORCE_SUBSTITUTE_FOR);
-        log(&format!(
-            "VPN-выход не снимает гейт — подмена включена принудительно на {} мин",
-            resolvers::FORCE_SUBSTITUTE_FOR.as_secs() / 60
-        ));
-        acted.push(format!(
-            "ваш VPN не снимает блокировку — подмена адресов включена поверх туннеля на {} мин",
-            resolvers::FORCE_SUBSTITUTE_FOR.as_secs() / 60
-        ));
-    } else {
-        resolvers::forget_names(dns::core_namespaces());
-        log("кэш выбора провайдера сброшен — гейт-имена опрашиваются заново");
-        acted.push("адреса серверов Google подбираются заново".to_string());
-    }
-    // One penalty per episode. The refusal is attributed to the route that most
-    // recently opened a gate tunnel, and that is only right for the *first*
-    // refusal: the client keeps retrying on the pooled connection it already
-    // has - which stays on the penalised route (I35) - while its next tunnel
-    // opens on whichever route now comes first. Read naively, every retry would
-    // then penalise the route that replaced the bad one, and within a minute
-    // all of them were benched by the mechanism meant to switch between them.
-    if let Some((kind, ago)) = routes::last_used() {
-        let in_episode = LAST_PENALTY
-            .lock()
-            .ok()
-            .and_then(|g| *g)
-            .is_some_and(|at| at.elapsed() < PENALTY_EPISODE);
-        if ago < ATTRIBUTION_WINDOW && !routes::is_penalised(kind) && !in_episode {
-            routes::penalise(kind);
-            if let Ok(mut g) = LAST_PENALTY.lock() {
-                *g = Some(Instant::now());
-            }
+/// Nothing is attributed on a guess: `routes::attribute` names the route whose
+/// gate tunnel was open around the line's own stamp, and with none open the
+/// refusal is one the client made without us (it dialled Google itself), which
+/// no route switch can help with - so the DNS layer re-races instead, the only
+/// lever that reaches such a client.
+fn answer_log(hits: &[(std::path::PathBuf, ls_log::Tally)]) {
+    let mut refusals = 0usize;
+    let mut answers = 0usize;
+    let mut refused_ago: Option<Duration> = None;
+    let mut answered_ago: Option<Duration> = None;
+    let mut refused_host: Option<String> = None;
+    let mut answered_host: Option<String> = None;
+    for (path, t) in hits {
+        let file = path
+            .file_name()
+            .map_or_else(String::new, |f| f.to_string_lossy().into_owned());
+        if t.refusals > 0 {
             log_proxy(&format!(
-                "маршрут «{}» нёс region-400 ({} шт.) — отложен на {} мин",
-                kind.label(),
-                total,
-                routes::REGION_PENALTY.as_secs() / 60
-            ));
-            acted.push(format!(
-                "маршрут «{}» отложен на {} мин, следующее соединение пойдёт другим",
-                kind.label(),
-                routes::REGION_PENALTY.as_secs() / 60
+                "region-400 x{} в {} — Antigravity упёрся в гейт",
+                t.refusals, file
             ));
         }
+        refusals += t.refusals;
+        answers += t.answers;
+        if t.refused_ago.is_some() && newest(refused_ago, t.refused_ago) == t.refused_ago {
+            refused_host = t.refused_host.clone();
+        }
+        if t.answered_ago.is_some() && newest(answered_ago, t.answered_ago) == t.answered_ago {
+            answered_host = t.answered_host.clone();
+        }
+        refused_ago = newest(refused_ago, t.refused_ago);
+        answered_ago = newest(answered_ago, t.answered_ago);
     }
-    gate::record_episode(total as u32, acted.join("; "));
+    // Only an event that can be placed in time is acted on. A line whose stamp
+    // will not parse, or one older than the tunnels are remembered, would be
+    // pinned on whatever route is open *now* - and bench a route that never saw
+    // it (review finding before 2.14.0_1).
+    let when = |ago: Option<Duration>| {
+        ago.filter(|a| *a <= routes::TUNNEL_MEMORY)
+            .and_then(|a| Instant::now().checked_sub(a))
+    };
+    let refusal = (refusals > 0).then(|| when(refused_ago)).flatten();
+    let answer = (answers > 0).then(|| when(answered_ago)).flatten();
+    match (refusal, answer) {
+        (Some(r), Some(a)) if a < r => {
+            on_answers(answers, a, answered_host.as_deref());
+            on_refusals(refusals, r, refused_host.as_deref());
+        }
+        (r, a) => {
+            if let Some(r) = r {
+                on_refusals(refusals, r, refused_host.as_deref());
+            }
+            if let Some(a) = a {
+                on_answers(answers, a, answered_host.as_deref());
+            }
+        }
+    }
 }
 
-/// When a route was last penalised for a refusal. While the episode lasts,
-/// further refusals penalise nobody: they are the client's retries on the
-/// connection it still holds to the route already benched.
-static LAST_PENALTY: Mutex<Option<Instant>> = Mutex::new(None);
-/// Longer than the client's pool idle (Go's 90 s), so the old connection is
-/// gone before a refusal can be attributed again.
-const PENALTY_EPISODE: Duration = Duration::from_secs(3 * 60);
+fn newest(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, None) => x,
+        (None, y) => y,
+    }
+}
+
+fn on_refusals(count: usize, at: Instant, host: Option<&str>) {
+    let carried = routes::attribute(at, host);
+    let mut acted: Vec<String> = Vec::new();
+    match carried {
+        Some(kind) => match routes::blame(kind) {
+            Some(penalty) => {
+                log_proxy(&format!(
+                    "маршрут «{}» нёс region-400 — отложен на {}, его соединения закрыты",
+                    kind.label(),
+                    human_minutes(penalty)
+                ));
+                acted.push(format!(
+                    "маршрут «{}» отложен на {}, следующее соединение пойдёт другим",
+                    kind.label(),
+                    human_minutes(penalty)
+                ));
+            }
+            None => {
+                acted.push(format!(
+                    "соединения через «{}» закрыты — повтор пойдёт другим путём",
+                    kind.label()
+                ));
+            }
+        },
+        // The client reached Google without us, from inside a tunnel the relay
+        // was standing down for: that tunnel exits somewhere blocked, so the
+        // substituted address is sent back through it for a while (D15's rule,
+        // alive where the loopback door is down).
+        None if resolvers::vpn_is_active() => {
+            resolvers::force_substitution(FORCE_SUBSTITUTE_FOR);
+            log("VPN-выход не снимает гейт — подмена включена принудительно на 30 мин");
+            acted.push(
+                "ваш VPN не снимает блокировку — подмена адресов включена поверх туннеля на 30 мин"
+                    .to_string(),
+            );
+        }
+        None => {
+            // The client reached Google without us. The only lever that reaches
+            // it is what the name resolves to, so that is re-raced now.
+            resolvers::forget_names(dns::core_namespaces());
+            resolvers::warm(dns::core_namespaces(), isp_interface());
+            log("Antigravity обратился к Google мимо обхода — адреса подбираются заново");
+            acted.push(
+                "Antigravity обратился к Google мимо обхода — адреса подбираются заново"
+                    .to_string(),
+            );
+        }
+    }
+    gate::record_episode(count as u32, acted.join("; "), carried.map(|k| k.label()));
+}
+
+fn on_answers(count: usize, at: Instant, host: Option<&str>) {
+    let carried = routes::attribute(at, host);
+    if let Some(kind) = carried {
+        routes::credit(kind);
+        // A model answer is the one thing that settles whether the relay works,
+        // so it clears the relay's dud streak and lifts any bench: a client fans
+        // out several gate tunnels and the short ancillary ones the relay closes
+        // early otherwise read as an outage and park a working relay on the slow
+        // route (no-op in a build without the relay module).
+        if kind == routes::Kind::Relay {
+            crate::proxy::note_relay_answer();
+        }
+    }
+    // One line a minute at most: a user in a long session produces an answer
+    // every few seconds, and the log is 64 KB.
+    static LAST_LINE: Mutex<Option<Instant>> = Mutex::new(None);
+    let due = LAST_LINE
+        .lock()
+        .map(|mut g| {
+            let due = g.is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
+            if due {
+                *g = Some(Instant::now());
+            }
+            due
+        })
+        .unwrap_or(false);
+    if due {
+        log_proxy(&format!(
+            "модель ответила (x{}) — маршрут «{}»",
+            count,
+            carried.map_or("не наш", |k| k.label())
+        ));
+    }
+    gate::record_answer(carried.map(|k| k.label()));
+}
+
+/// How long one refusal through a tunnel the relay stood down for keeps
+/// substitution forced on (D15, the fallback D25 leaves for a closed door).
+const FORCE_SUBSTITUTE_FOR: Duration = Duration::from_secs(30 * 60);
+
+/// «10 мин», «1 ч», «6 ч».
+fn human_minutes(d: Duration) -> String {
+    let mins = d.as_secs() / 60;
+    if mins >= 60 && mins % 60 == 0 {
+        format!("{} ч", mins / 60)
+    } else {
+        format!("{} мин", mins)
+    }
+}
 
 /// How long the proxy listener is given to appear before the route is treated as
 /// absent. Covers `proxy::bind_listener`'s own retries (15 s) with room to spare.
@@ -637,6 +868,14 @@ pub fn run() -> Result<(), String> {
             log_proxy(&format!("not started: {}", e));
         }
     });
+    // The gate hosts' own door (`loopback`). If it cannot be bound the relay
+    // keeps answering with substituted addresses, exactly as before.
+    thread::spawn(|| {
+        if let Err(e) = loopback::run() {
+            log_proxy(&format!("локальные адреса гейт-хостов не заняты: {}", e));
+        }
+    });
+    thread::spawn(watch_client_logs);
 
     let mut buf = [0u8; 4096];
     loop {
@@ -657,6 +896,10 @@ pub fn run() -> Result<(), String> {
         // upstream must not stall the queries behind it.
         thread::spawn(move || {
             let name = dns_client::question_name(&query).unwrap_or_else(|| "?".to_string());
+            if let Some(reply) = own_answer(&query, &name) {
+                out.send_to(&reply, from).ok();
+                return;
+            }
             match relay(&query) {
                 Some((reply, provider, verdict)) => {
                     out.send_to(&reply, from).ok();
@@ -677,10 +920,94 @@ pub fn run() -> Result<(), String> {
     }
 }
 
+/// The answer the relay gives a gate host itself instead of relaying anyone's.
+///
+/// A record: the loopback listener's address for that host, while it is up
+/// (`loopback`). AAAA, SVCB and HTTPS: an empty answer, always - every provider
+/// answers AAAA with Google's own IPv6 or with nothing, and an IPv6 client
+/// handed the former dials the gate from the blocked region with the whole
+/// layer "working" (P40); an HTTPS record can carry address hints of its own.
+/// Anything else is relayed as before.
+fn own_answer(query: &[u8], name: &str) -> Option<Vec<u8>> {
+    if !proxy::is_gate_host(name) {
+        return None;
+    }
+    match dns_client::question_type(query)? {
+        1 => {
+            let ip = loopback::answer_for(name)?;
+            note_loopback(name);
+            dns_client::synth_reply(query, Some(ip), loopback::ANSWER_TTL)
+        }
+        28 | 64 | 65 => dns_client::synth_reply(query, None, loopback::ANSWER_TTL),
+        _ => None,
+    }
+}
+
+/// Logs that a gate host is being answered with our own address - once, and
+/// again only after it has not been for a while, so a client re-asking every
+/// thirty seconds does not fill the 64 KB log.
+fn note_loopback(name: &str) {
+    static LAST: Mutex<Option<std::collections::HashMap<String, Instant>>> = Mutex::new(None);
+    let due = LAST
+        .lock()
+        .map(|mut g| {
+            let map = g.get_or_insert_with(std::collections::HashMap::new);
+            let key = name.to_ascii_lowercase();
+            let due = map
+                .get(&key)
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(30 * 60));
+            if due {
+                map.insert(key, Instant::now());
+            }
+            due
+        })
+        .unwrap_or(false);
+    if due {
+        log(&format!("loopback     {} [наш маршрут]", name));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn a_gate_hosts_aaaa_and_https_questions_get_an_empty_answer() {
+        for qtype in [28u8, 64, 65] {
+            let mut q = dns_client::build_query("daily-cloudcode-pa.googleapis.com", 9);
+            let n = q.len();
+            q[n - 3] = qtype;
+            let r = own_answer(&q, "daily-cloudcode-pa.googleapis.com").expect("answered");
+            assert!(dns_client::answer_addrs(&r).is_empty(), "qtype {qtype}");
+            assert_eq!(dns_client::question_type(&r), Some(qtype as u16));
+        }
+        // Not a gate host: relayed as before.
+        let mut q = dns_client::build_query("storage.googleapis.com", 9);
+        let n = q.len();
+        q[n - 3] = 28;
+        assert!(own_answer(&q, "storage.googleapis.com").is_none());
+    }
+
+    #[test]
+    fn the_network_fingerprint_is_never_the_unset_value_and_tells_networks_apart() {
+        let a = network_fingerprint(27, Some(27), false);
+        let b = network_fingerprint(27, Some(55), true);
+        let c = network_fingerprint(27, Some(27), true);
+        assert_ne!(a, 0);
+        assert_ne!(network_fingerprint(0, None, false), 0);
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a, network_fingerprint(27, Some(27), false));
+    }
+
+    #[test]
+    fn a_penalty_reads_in_minutes_or_hours() {
+        assert_eq!(human_minutes(Duration::from_secs(600)), "10 мин");
+        assert_eq!(human_minutes(Duration::from_secs(3600)), "1 ч");
+        assert_eq!(human_minutes(Duration::from_secs(6 * 3600)), "6 ч");
+        assert_eq!(human_minutes(Duration::from_secs(90 * 60)), "90 мин");
+    }
 
     /// Everything the version check does hangs off this: a relay that predates
     /// versioning leaves no file, and it must read as older than this build

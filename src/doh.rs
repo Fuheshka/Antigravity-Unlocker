@@ -44,13 +44,11 @@ use rustls::{ClientConfig, ClientConnection, HandshakeKind};
 // per query was the design here, so this client paid for its share of that in
 // full.
 //
-// KNOWN GAP: this connection is not pinned to the ISP interface. Every UDP
-// resolver query is (`dns_client::query_raw_via` + IP_UNICAST_IF, I4/N4) so a VPN
-// cannot change the geolocation the provider sees. IP_UNICAST_IF has to be set
-// *before* connect, which a `TcpStream::connect_timeout` cannot do, so pinning
-// this needs a raw socket. Until then a DoH provider is queried over the default
-// route: correct with no VPN, and under a VPN it sees the tunnel's exit like any
-// other traffic. Tracked as P13.
+// Pinned to the ISP interface while a tunnel holds the default route, like every
+// UDP resolver query (`dns_client::query_raw_via` + IP_UNICAST_IF, I4/N4), so a
+// VPN cannot change the geolocation the provider sees. IP_UNICAST_IF has to be
+// set *before* connect, which is why the socket comes from `net::connect`
+// rather than `TcpStream::connect_timeout` (P13, closed in 2.14.0_1).
 
 /// A DoH service: the name its certificate has to prove, the path that answers
 /// RFC 8484 queries, and addresses to reach it at.
@@ -660,8 +658,15 @@ fn handshake(
     if budget.is_zero() {
         return Err(format!("{}: бюджет истёк до соединения", ip));
     }
-    let mut sock = TcpStream::connect_timeout(&SocketAddr::new(ip, 443), budget)
-        .map_err(|_| format!("{}: нет соединения", ip))?;
+    // Pinned to the ISP link while a tunnel holds the default route (P13): a
+    // provider that substitutes only for Russian addresses answers a query that
+    // arrives from the tunnel's foreign exit with the genuine address.
+    let mut sock = crate::net::connect(
+        SocketAddr::new(ip, 443),
+        budget,
+        crate::net::pin_interface(),
+    )
+    .map_err(|_| format!("{}: нет соединения", ip))?;
     sock.set_nodelay(true).ok();
 
     let server = ServerName::try_from(ep.host.to_string())
@@ -1307,6 +1312,57 @@ mod tests {
                 name, got, reference
             );
             println!("{} -> {:?} (эталон {:?})", name, got, reference);
+        }
+    }
+
+    /// Live: **every** node, not just whichever answers first - each address is
+    /// asked for both gate names on its own connection, and each answer has to
+    /// be a substitution (P14: "the addresses too"). One dead or passthrough node
+    /// in the walk costs a share of all queries a timeout or a wrong answer, and
+    /// `reaches_a_real_doh_server_and_gets_a_substitution` would not notice it
+    /// as long as another node answered first (G43).
+    ///
+    ///     cargo test every_node_substitutes_both_gate_names -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs a live network, VPN off; run with --ignored"]
+    fn every_node_substitutes_both_gate_names() {
+        use crate::dns_client;
+        let ep = &crate::resolvers::DNS_AI;
+        for addr in ep.addrs {
+            let ip: IpAddr = addr.parse().expect("an address");
+            for name in [
+                "cloudcode-pa.googleapis.com",
+                "daily-cloudcode-pa.googleapis.com",
+            ] {
+                let q = dns_client::build_query(name, 0x4E4E);
+                let started = Instant::now();
+                let reply = query_one(&Pool::new(), ep, ip, &q, Duration::from_secs(8))
+                    .unwrap_or_else(|e| panic!("{} {}: {}", addr, name, e));
+                let got = dns_client::answer_addrs(&reply);
+                let reference = dns_client::resolve_a_via(name, "8.8.8.8".parse().unwrap(), 0)
+                    .expect("reference resolver");
+                let ref16: Vec<[u8; 2]> = reference
+                    .iter()
+                    .map(|a| [a.octets()[0], a.octets()[1]])
+                    .collect();
+                let passthrough = got.iter().any(|a| match a {
+                    IpAddr::V4(v) => ref16.contains(&[v.octets()[0], v.octets()[1]]),
+                    IpAddr::V6(_) => false,
+                });
+                println!(
+                    "{:<15} {:<34} {:>4} мс  {:?}",
+                    addr,
+                    name,
+                    started.elapsed().as_millis(),
+                    got
+                );
+                assert!(!got.is_empty(), "{} {}: пустой ответ", addr, name);
+                assert!(
+                    !passthrough,
+                    "{} {}: {:?} — подлинный Google, узел не подменяет",
+                    addr, name, got
+                );
+            }
         }
     }
 

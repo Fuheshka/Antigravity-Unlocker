@@ -7,6 +7,8 @@
 mod icon;
 mod license;
 mod main_view;
+mod report;
+mod status;
 mod theme;
 mod widgets;
 
@@ -85,6 +87,9 @@ pub struct App {
     providers_reordering: bool,
     path_dialog: Option<String>,
     path_dialog_error: Option<String>,
+    /// When «Скопировать отчёт» was last pressed, for the few seconds the card
+    /// says so.
+    report_copied_at: Option<std::time::Instant>,
 }
 
 impl App {
@@ -114,8 +119,14 @@ impl App {
         // from here on — two writers each saving the whole thing meant whichever
         // saved last silently reverted the other.
         let settings = Settings::load();
+        let screen = first_screen();
+        // A debug build told to skip the key never passes the licence screen,
+        // which is where `Unlocked` is otherwise sent from.
+        if matches!(screen, Screen::Main) {
+            worker.send(Cmd::Unlocked);
+        }
         Self {
-            screen: Screen::License,
+            screen,
             key_input: String::new(),
             key_rejected: false,
             key_needs_focus: true,
@@ -138,6 +149,7 @@ impl App {
             providers_reordering: false,
             path_dialog: None,
             path_dialog_error: None,
+            report_copied_at: None,
         }
     }
 
@@ -314,6 +326,18 @@ pub fn run() -> Result<(), String> {
         )
         .map_err(|second| format!("не удалось открыть окно (DirectX: {first}; OpenGL: {second})")),
     }
+}
+
+/// The licence screen, always - except in a *debug* build started with
+/// `AG_UNLOCKER_DEV_SKIP_KEY` set, so the main screen can be looked at while it
+/// is being worked on. Compiled out of every release build (`build_rust.py`
+/// builds release), so a shipped exe has no way past the key.
+fn first_screen() -> Screen {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some() {
+        return Screen::Main;
+    }
+    Screen::License
 }
 
 fn title() -> String {

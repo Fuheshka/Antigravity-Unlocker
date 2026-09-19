@@ -98,13 +98,68 @@ pub fn kill_holder(bin_path: &Path) {
     }
 }
 
+/// Where a patched copy of `target` is written before it is renamed over it.
+pub(crate) fn temp_path(target: &Path) -> PathBuf {
+    let mut tmp = target.as_os_str().to_os_string();
+    tmp.push(format!(".{}{}", std::process::id(), TEMP_SUFFIX));
+    PathBuf::from(tmp)
+}
+
+/// The tail every patch temp carries, so a directory scan can tell one from the
+/// file it is a copy of.
+pub(crate) const TEMP_SUFFIX: &str = ".agtmp";
+
+/// Removes the patch temps a writer killed mid-write left beside `target` -
+/// `<target>.<pid>.agtmp`, and the single `<target>.agtmp` builds before D27
+/// used. A shared name was overwritten by the next write; one per process is
+/// not, and the relay is `taskkill`ed on every upgrade, possibly mid-patch.
+///
+/// Only temps older than any write takes: a younger one may be another
+/// patcher's, being written this second.
+pub(crate) fn sweep_stale_temps(target: &Path) {
+    const STALE: Duration = Duration::from_secs(10 * 60);
+    let (Some(dir), Some(name)) = (target.parent(), target.file_name().and_then(|n| n.to_str()))
+    else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{}.", name);
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        let Some(file) = file.to_str() else { continue };
+        if !(file.starts_with(&prefix) && file.ends_with(TEMP_SUFFIX)) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > STALE);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Temp-on-same-dir + rename. The temp sits beside the target so the rename is a
 /// same-volume move (atomic), not a cross-volume copy.
+///
+/// The temp is named per process. Up to three patchers can meet on one file -
+/// the relay's watchdog thread, the standalone watchdog task and the window's
+/// auto-patch (D27) - and with one shared name a second writer truncating the
+/// temp while the first renamed it over the target could leave a torn 150 MB
+/// binary in place. Separate temps make every rename a whole file.
 fn write_atomic(bin_path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let mut tmp = bin_path.as_os_str().to_os_string();
-    tmp.push(".agtmp");
-    let tmp = PathBuf::from(tmp);
-    fs::write(&tmp, data)?;
+    sweep_stale_temps(bin_path);
+    let tmp = temp_path(bin_path);
+    if let Err(e) = fs::write(&tmp, data) {
+        // A full disk leaves a partial 150 MB copy; nothing else would remove it.
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     // On Unix a fresh temp file is created 0644, and renaming it over the language
     // server would strip the execute bit - a non-executable binary the app then
     // cannot launch. Copy the original's mode onto the temp before the rename so
@@ -343,10 +398,12 @@ pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
+                // Never a patch temp: `language_server_linux_x64.<pid>.agtmp`
+                // matches the prefix for the second or so it exists.
                 let is_ls = path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("language_server"));
+                    .is_some_and(|n| n.starts_with("language_server") && !n.ends_with(TEMP_SUFFIX));
                 if is_ls && path.is_file() && !targets.contains(&path) {
                     targets.push(path);
                 }
@@ -673,7 +730,11 @@ mod tests {
         let installs = crate::discover_installs_fast();
         println!("установок найдено: {}", installs.len());
         for install in &installs {
-            println!("\n{} — {}", crate::install_label(install), install.display());
+            println!(
+                "\n{} — {}",
+                crate::install_label(install),
+                install.display()
+            );
             for (path, state) in inspect_install(install).files {
                 // The second rename is not part of `FileState` (it is not what
                 // decides eligibility), and it is the half a new build is just
@@ -914,6 +975,38 @@ mod tests {
         assert_eq!(repatch_if_needed(&legacy), RepatchOutcome::AlreadyPatched);
         assert_eq!(fs::read(&legacy).unwrap(), after);
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A temp a killed writer left behind goes on the next write; one young
+    /// enough to be another patcher's, and anything that is not a temp of this
+    /// file, stay.
+    #[test]
+    fn a_stale_temp_is_swept_and_a_fresh_one_is_not() {
+        let dir = std::env::temp_dir().join("ag_sweep_temps");
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("language_server.exe");
+        fs::write(&target, b"x").unwrap();
+        let stale = dir.join("language_server.exe.1234.agtmp");
+        let fresh = dir.join("language_server.exe.5678.agtmp");
+        let other = dir.join("webm_encoder.exe.1234.agtmp");
+        for f in [&stale, &fresh, &other] {
+            fs::write(f, b"partial").unwrap();
+        }
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        for f in [&stale, &other] {
+            fs::File::options()
+                .write(true)
+                .open(f)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        sweep_stale_temps(&target);
+        assert!(!stale.exists(), "an hour-old temp of this file is swept");
+        assert!(fresh.exists(), "a young one may be another writer's");
+        assert!(other.exists(), "another file's temp is not ours to judge");
+        assert!(target.exists());
         fs::remove_dir_all(&dir).ok();
     }
 

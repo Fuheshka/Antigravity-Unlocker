@@ -176,6 +176,11 @@ const CLIENT_PROBE_LIMIT: Duration = Duration::from_secs(15);
 /// port** is the client telling us it is not making gate connections at all, and
 /// that its egress is the relay's to answer. Counted separately, never as a
 /// tunnel: loopback is not an adapter the routing table has an opinion about.
+///
+/// The same goes for a connection to a loopback address on 443 - that is the
+/// gate hosts' own door (`loopback`), and without this line its source address
+/// (127.x, the loopback adapter, which is not physical) read as a *tunnel*: the
+/// client would have been reported inside a VPN for talking to us.
 pub fn read() -> Reading {
     let script = format!(
         "$ids=@(Get-Process -Name '{glob}' -ErrorAction SilentlyContinue | \
@@ -196,6 +201,7 @@ pub fn read() -> Reading {
              if ($mine -and $c.RemotePort -eq {port} -and $c.RemoteAddress -eq '{listen}') {{ \
                $l++; continue }}; \
              if ($c.RemotePort -ne 443) {{ continue }}; \
+             if ($c.RemoteAddress -like '127.*') {{ if ($mine) {{ $l++ }}; continue }}; \
              $i=$ix[($c.LocalAddress -split '%')[0]]; \
              if ($null -eq $i) {{ continue }}; \
              $hw = $phys -contains $i; \
@@ -306,6 +312,16 @@ pub fn client_egress() -> ClientEgress {
 /// not have to repeat the condition or spawn the probe twice. With no tunnel up
 /// the probe does not run at all - the answer cannot change the verdict, and the
 /// warm loop would be paying for it every four minutes.
+///
+/// **Since D25 (2.14.0_1) only the relay asks this, and only while its loopback
+/// door is down** (`loopback::active` false: the local proxy switched off, a
+/// proxy of the user's own, `:443` taken). With the door up the client's gate
+/// connections come to us on loopback and a tunnel cannot carry them past us, so
+/// there is nothing to stand down for; without it the client dials Google itself,
+/// and a client inside a working tunnel must keep reaching genuine Google through
+/// it - the RU-only providers refuse the tunnel's foreign exit (N25). The rules
+/// are always installed now (`dns::setup_dns_nrpt`): the relay decides what they
+/// answer, at runtime.
 pub fn vpn_verdict(egress: Option<&Egress>) -> (bool, ClientEgress) {
     if !egress.is_some_and(|e| e.vpn_active) {
         return (false, ClientEgress::Unknown);
@@ -421,8 +437,9 @@ mod tests {
             ClientEgress::Mixed,
             "the shape this test is about"
         );
-        // `vpn_verdict`'s bool is `client == Tunnel`, and nothing else.
-        for (line, stands_down) in [
+        // `vpn_verdict`'s bool is `client == Tunnel`, and nothing else - and since
+        // D25 only the relay asks it, and only with its loopback door down.
+        for (line, in_tunnel) in [
             ("0|4|0|0|0", true),
             ("1|4|0|0|0", false),
             ("4|0|0|0|0", false),
@@ -431,7 +448,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse_reading(line).client == ClientEgress::Tunnel,
-                stands_down,
+                in_tunnel,
                 "{line}"
             );
         }

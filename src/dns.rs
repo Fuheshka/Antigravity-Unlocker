@@ -460,54 +460,19 @@ pub fn setup_dns_nrpt() -> Result<DnsOutcome, String> {
     let egress = egress::detect();
     let via_relay = background::is_enabled();
 
-    // A tunnel is up: install nothing and leave the machine resolving exactly as
-    // the VPN configured it (owner's call).
+    // The rules go in whatever the tunnel does (D25). Until 2.14.0_1 a tunnel
+    // carrying the client installed nothing and left the VPN to decide (D13) -
+    // which also meant the client could never be brought back to us, and G29's
+    // and G50's users got nothing at all. Now the relay decides at runtime what
+    // the rules answer: with its loopback door up every gate connection comes to
+    // its route table, where the user's VPN is one of the routes; with the door
+    // down it answers as the tunnel's own resolver would for a client measured
+    // inside it (`resolvers::resolve_through_tunnel`). It is the one process
+    // that knows which of the two is true at the moment it matters.
     //
-    // The rules cannot help here and can only hurt. An NRPT rule *overrides* the
-    // VPN's own DNS for those names, so it takes a decision away from the thing
-    // the user deliberately turned on; and the answer it substitutes points at a
-    // provider's proxy, which the traffic then reaches **through** the tunnel -
-    // client -> tunnel -> proxy -> Google, a detour to reach what the tunnel
-    // already reaches directly. Worse, if the exit is in a permitted region the
-    // gate is already lifted by the tunnel alone (S25), so the whole layer is
-    // paying latency for nothing. Measured on a live machine: exit `loc=FI`,
-    // TLS to CloudCode 0.126 s direct, against a substituted address that adds a
-    // hop. G26.
-    //
-    // This is the counterpart to N3, not a contradiction of it: N3 says a tunnel
-    // *breaks* substitution (the provider geolocates the exit, not the user), and
-    // the answer used to be to dodge the tunnel for DNS. Dodging is still right
-    // when the exit is blocked, but the tool cannot tell a Finnish exit from a
-    // Russian one without asking, and the owner's instruction is unambiguous:
-    // with a VPN up, the VPN decides. `remove_dns_nrpt()` above has already taken
-    // ours off, which is the whole of the work.
-    //
-    // What that reasoning silently assumed is that a tunnel carrying a default
-    // route carries *the client*. Windows VPN clients route per application, so
-    // it need not: with `language_server.exe` on an exclusion list the machine
-    // shows a full tunnel while the client talks to Google straight off the ISP
-    // link. Standing down there leaves it in the blocked region with nothing at
-    // all - the one state that cannot work (G29). So the condition is now the
-    // measured one, and the absence of a measurement installs the rules rather
-    // than skipping them; `egress::stand_down_for_vpn` carries the whole rule and
-    // the reason for it.
-    // The switch only ever *suppresses* the stand-down; it can never cause one.
-    // Measuring stays unconditional so `DnsOutcome` still reports the tunnel it
-    // saw, which is what the window's indicator is drawn from.
-    let (measured_stand_down, client) = egress::vpn_verdict(egress.as_ref());
-    let stand_down = measured_stand_down && crate::settings::vpn_detect_enabled();
-    if stand_down {
-        return Ok(DnsOutcome {
-            vpn_active: true,
-            stood_down_for_vpn: true,
-            client,
-            via_relay,
-            pinned: Vec::new(),
-            pin_error: None,
-            taken_over: Vec::new(),
-            probe_gave_up: false,
-        });
-    }
+    // Measured all the same, so `DnsOutcome` still reports what the tunnel was
+    // doing when the rules went in.
+    let (_, client) = egress::vpn_verdict(egress.as_ref());
 
     let namespaces: Vec<&str> = AG_NRPT_CORE.to_vec();
 
@@ -746,12 +711,8 @@ pub fn refresh_pinned_hosts() {
     // only when the client is measured inside it - and here the measurement is
     // usually available, because a user opens this tool while Antigravity is
     // running.
-    if egress::vpn_verdict(egress::detect().as_ref()).0 && crate::settings::vpn_detect_enabled() {
-        // Takes the pinned block with it - `remove_dns_nrpt` owns both, because
-        // the addresses only ever existed to serve the rules.
-        remove_dns_nrpt();
-        return;
-    }
+    // No VPN branch any more (D25): the rules stay whatever the tunnel does, and
+    // the relay decides at runtime what they answer.
     // The relay resolves live, so a pinned block would only be a stale copy.
     if background::is_enabled() {
         hosts_pin::remove_entries().ok();

@@ -62,7 +62,7 @@ mod relay;
 // `main` by default (kb/rivals.md). `#[allow(unused_imports)]` keeps the stub
 // build (cfg(not(relay))) honest without a second cfg arm.
 #[cfg(relay)]
-pub use relay::{probe_relay, relay_is_benched};
+pub use relay::{note_answer as note_relay_answer, probe_relay, relay_is_benched};
 
 #[cfg(not(relay))]
 pub fn relay_available() -> bool {
@@ -77,6 +77,10 @@ pub fn probe_relay() {}
 pub fn relay_is_benched() -> bool {
     false
 }
+
+/// No relay route to credit in a build that has no relay module.
+#[cfg(not(relay))]
+pub fn note_relay_answer() {}
 
 // The built-in exits - third-party CONNECT proxies that already egress in a
 // permitted region - live in the gitignored `src/exits.rs` with their address
@@ -153,7 +157,7 @@ pub fn proxy_url() -> String {
 
 /// The address the listener holds, as a `SocketAddr`. Both parts are literals in
 /// this file, so it cannot fail.
-fn listen_addr() -> std::net::SocketAddr {
+pub(crate) fn listen_addr() -> std::net::SocketAddr {
     std::net::SocketAddr::from((LISTEN_IP.parse::<Ipv4Addr>().unwrap(), LISTEN_PORT))
 }
 
@@ -243,6 +247,41 @@ fn upstream_config() -> Arc<ClientConfig> {
     .clone()
 }
 
+/// What to put in a `CONNECT` to the proxy at `proxy_host` for `host`.
+///
+/// The name, except for a gate host through a proxy on this machine or the
+/// local network while the loopback door is up: that proxy would resolve the
+/// name through the system resolver, get our own loopback address, and dial
+/// back into us (a loop with no end). It gets genuine Google's address instead
+/// (`resolvers::genuine_a`), or the name when none is known.
+pub fn connect_target(proxy_host: &str, host: &str) -> String {
+    if !is_gate_host(host) || !crate::loopback::active() || !is_local_host(proxy_host) {
+        return host.to_string();
+    }
+    crate::resolvers::genuine_a(host)
+        .first()
+        .map_or_else(|| host.to_string(), |ip| ip.to_string())
+}
+
+/// A host on this machine or on a private network - where a proxy resolves
+/// names the way this machine does.
+fn is_local_host(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match h.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+        }
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback() || v6.is_unspecified(),
+        // A name: a machine on the LAN by its hostname resolves like we do, and
+        // a public proxy by name resolves remotely. Only the first loops, and a
+        // bare single-label name is the shape it comes in.
+        Err(_) => !h.contains('.'),
+    }
+}
+
 /// The two region-gated CloudCode endpoints - the only names that ever need a
 /// route other than a plain direct tunnel. Everything else reaches genuine
 /// Google unaided, so it is never sent through anybody's proxy.
@@ -299,15 +338,22 @@ const DIRECT_OPEN_BUDGET: Duration = Duration::from_secs(4);
 /// own 21 s per address.
 const TUNNEL_OPEN_BUDGET: Duration = Duration::from_secs(10);
 
-/// The direct route for a gate host: a plain tunnel to whatever the system
-/// resolver - i.e. the NRPT rule, i.e. our own relay - says the name is.
+/// The direct route for a gate host: a plain tunnel to the address the relay's
+/// own pool substituted for the name, pinned to the ISP link while a VPN holds
+/// the default route (N25).
+///
+/// Not through the system resolver any more: with the loopback listener up
+/// (`loopback`) the system resolver answers a gate host with *our own* address,
+/// and a direct route that asked it would dial itself. The pool is in this
+/// process and knows the substituted address anyway - it is the answer it has
+/// been handing out all along.
 ///
 /// A route like the others, not the floor under them: it fails *before* the
 /// `200` when nothing answers inside its budget, and hands the client back for
 /// the next route (I35). The old shape connected with the OS default timeout
 /// and answered 502, which cost a client 21 s per dead address and then nothing.
 fn try_direct(mut client: TcpStream, host: &str, port: u16) -> Result<(), TcpStream> {
-    let upstream = match connect_bounded(host, port, DIRECT_OPEN_BUDGET) {
+    let upstream = match connect_gate_direct(host, port, DIRECT_OPEN_BUDGET) {
         Ok(sock) => sock,
         Err(why) => {
             crate::dns_forwarder::log_proxy(&format!("напрямую {}: {}", host, why));
@@ -322,14 +368,59 @@ fn try_direct(mut client: TcpStream, host: &str, port: u16) -> Result<(), TcpStr
     Ok(())
 }
 
+/// The substituted address of a gate host, from the relay's own pool, and the
+/// interface to reach it through. On a build without the DNS layer (Linux) the
+/// system resolver is all there is, and nothing is pinned.
+fn gate_direct_addrs(host: &str, port: u16) -> Result<(Vec<std::net::SocketAddr>, u32), String> {
+    if !cfg!(target_os = "windows") {
+        let addrs: Vec<_> = (host, port)
+            .to_socket_addrs()
+            .map_err(|e| format!("имя не разрешается: {}", e))?
+            .collect();
+        return Ok((addrs, 0));
+    }
+    let if_index = crate::net::pin_interface();
+    let (addrs, _, verdict) = crate::resolvers::resolve_a_best(host, if_index)
+        .ok_or_else(|| "имя не разрешилось".to_string())?;
+    // While the relay stands down for a tunnel the answer is genuine Google,
+    // reached through that tunnel; pinning it to the ISP link would take it out
+    // of the tunnel and into the gate.
+    let pin =
+        if crate::resolvers::vpn_is_active() || verdict != crate::resolvers::Verdict::Substituted {
+            0
+        } else {
+            if_index
+        };
+    let addrs = addrs
+        .into_iter()
+        .map(|a| std::net::SocketAddr::from((a, port)))
+        .collect();
+    Ok((addrs, pin))
+}
+
+fn connect_gate_direct(host: &str, port: u16, budget: Duration) -> Result<TcpStream, String> {
+    let (addrs, pin) = gate_direct_addrs(host, port)?;
+    connect_addrs(addrs, budget, pin)
+}
+
 /// Connects to `host:port` inside `budget`, walking every address the name
 /// resolves to and giving each a slice rather than the remainder.
 fn connect_bounded(host: &str, port: u16, budget: Duration) -> Result<TcpStream, String> {
-    let deadline = Instant::now() + budget;
-    let mut addrs: Vec<_> = (host, port)
+    let addrs: Vec<_> = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("имя не разрешается: {}", e))?
         .collect();
+    connect_addrs(addrs, budget, 0)
+}
+
+/// Walks `addrs` inside `budget`, a slice each, leaving through `pin` when it is
+/// not 0.
+fn connect_addrs(
+    mut addrs: Vec<std::net::SocketAddr>,
+    budget: Duration,
+    pin: u32,
+) -> Result<TcpStream, String> {
+    let deadline = Instant::now() + budget;
     if addrs.is_empty() {
         return Err("имя не разрешается".to_string());
     }
@@ -347,12 +438,68 @@ fn connect_bounded(host: &str, port: u16, budget: Duration) -> Result<TcpStream,
         if left.is_zero() {
             break;
         }
-        match TcpStream::connect_timeout(&addr, slice.min(left)) {
+        match crate::net::connect(addr, slice.min(left), pin) {
             Ok(sock) => return Ok(sock),
             Err(e) => last = e.to_string(),
         }
     }
     Err(format!("не подключиться: {}", last))
+}
+
+/// The user's own VPN as a route: genuine Google, through whatever the routing
+/// table says - which, while a tunnel holds the default route, is that tunnel.
+///
+/// This is D13's "the VPN decides" turned into a row of the table instead of a
+/// switch that took the whole bypass down (D25): when the tunnel exits
+/// somewhere the gate does not apply it carries the traffic the way the user
+/// set it up to, and when it does not, the refusal benches this row and the
+/// next connection takes another.
+fn try_vpn(mut client: TcpStream, host: &str, port: u16) -> Result<(), TcpStream> {
+    let addrs: Vec<_> = crate::resolvers::genuine_a(host)
+        .into_iter()
+        .map(|a| std::net::SocketAddr::from((a, port)))
+        .collect();
+    let upstream = match connect_addrs(addrs, DIRECT_OPEN_BUDGET, 0) {
+        Ok(sock) => sock,
+        Err(why) => {
+            crate::dns_forwarder::log_proxy(&format!("через VPN {}: {}", host, why));
+            return Err(client);
+        }
+    };
+    if client.write_all(RESP_ESTABLISHED).is_err() {
+        return Ok(());
+    }
+    routes::note_used(routes::Kind::Vpn);
+    splice(client, upstream);
+    Ok(())
+}
+
+/// What the relay found out about the tunnel's exit: `Some(true)` for a
+/// country the gate lets through, `Some(false)` for one it does not, `None`
+/// before anything was measured. The `Vpn` row is only offered on `Some(true)`:
+/// a tunnel exiting in Russia would hand the first request of every session to
+/// the gate.
+static VPN_EXIT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_vpn_exit(permitted: Option<bool>) {
+    let v = match permitted {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    VPN_EXIT.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn vpn_exit() -> Option<bool> {
+    match VPN_EXIT.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+fn vpn_usable() -> bool {
+    crate::net::tunnel_up() && vpn_exit() == Some(true) && !routes::is_penalised(routes::Kind::Vpn)
 }
 
 /// Whether `kind` is worth offering the next gate connection to. The route
@@ -367,6 +514,7 @@ pub fn route_usable(kind: routes::Kind, host: &str) -> bool {
         routes::Kind::Exits => crate::settings::builtin_exits_enabled() && exits_available(),
         routes::Kind::Relay => relay_usable(),
         routes::Kind::Direct => direct_usable(host),
+        routes::Kind::Vpn => vpn_usable(),
     }
 }
 
@@ -435,25 +583,37 @@ pub fn probe_direct(if_index: u32) {
     }
 }
 
-fn probe_direct_once(if_index: u32) -> Result<(), String> {
-    let (addrs, _, _) = crate::resolvers::resolve_a_best(DIRECT_PROBE_HOST, if_index)
-        .ok_or_else(|| "имя не разрешилось".to_string())?;
-    let deadline = Instant::now() + DIRECT_OPEN_BUDGET;
-    let slice = (DIRECT_OPEN_BUDGET / addrs.len().max(1) as u32).max(Duration::from_secs(1));
-    let mut sock = None;
-    for a in addrs {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            break;
-        }
-        if let Ok(s) =
-            TcpStream::connect_timeout(&std::net::SocketAddr::from((a, 443)), slice.min(left))
-        {
-            sock = Some(s);
-            break;
+fn probe_direct_once(_if_index: u32) -> Result<(), String> {
+    let sock = connect_gate_direct(DIRECT_PROBE_HOST, 443, DIRECT_OPEN_BUDGET)?;
+    probe_request(sock)
+}
+
+/// Times the user's VPN as a route, the same request as the others. Only while
+/// a tunnel holds the default route and exits somewhere usable; otherwise the
+/// row is simply unmeasured.
+pub fn probe_vpn() {
+    if !crate::net::tunnel_up() || vpn_exit() != Some(true) {
+        routes::record_failure(routes::Kind::Vpn);
+        return;
+    }
+    let started = Instant::now();
+    let addrs: Vec<_> = crate::resolvers::genuine_a(DIRECT_PROBE_HOST)
+        .into_iter()
+        .map(|a| std::net::SocketAddr::from((a, 443)))
+        .collect();
+    let outcome = connect_addrs(addrs, DIRECT_OPEN_BUDGET, 0).and_then(probe_request);
+    match outcome {
+        Ok(()) => routes::record(routes::Kind::Vpn, started.elapsed()),
+        Err(why) => {
+            routes::record_failure(routes::Kind::Vpn);
+            crate::dns_forwarder::log_proxy(&format!("через VPN не отвечает: {}", why));
         }
     }
-    let mut sock = sock.ok_or_else(|| "не подключиться".to_string())?;
+}
+
+/// One small request over an open socket: TLS to the gate host, a `GET`, an
+/// HTTP answer. What every route is timed by.
+fn probe_request(mut sock: TcpStream) -> Result<(), String> {
     sock.set_read_timeout(Some(DIRECT_PROBE_BUDGET)).ok();
     sock.set_write_timeout(Some(DIRECT_PROBE_BUDGET)).ok();
     let name =
@@ -561,7 +721,7 @@ fn tunnel(mut client: TcpStream, host: &str, port: u16) {
 /// Split out of `tunnel` because a tunnel through the user's proxy is the same
 /// splice with a socket that was opened differently - and a second copy of the
 /// teardown discipline below would be a second place to get it wrong.
-fn splice(mut client: TcpStream, mut upstream: TcpStream) {
+pub(crate) fn splice(mut client: TcpStream, mut upstream: TcpStream) {
     // A tunnel sets its own idle policy, whatever the two sockets were carrying
     // when they got here - the accept loop's silence limit on one, a CONNECT
     // reply budget on the other. Neither is a tunnel policy, and a stray one is
@@ -588,7 +748,29 @@ fn splice(mut client: TcpStream, mut upstream: TcpStream) {
     };
     // Raw bytes need no shared TLS state, so the simple two-thread shape works
     // here even though the intercepted path cannot use it.
-    let up = thread::spawn(move || io::copy(&mut client, &mut upstream_w));
+    //
+    // A gate tunnel's upstream is handed to the route table, so a refused
+    // route's tunnels can be closed on *both* sides (`routes::blame`, D26):
+    // closing only the client side left the other direction in a blocking read
+    // on an idle Google connection until Google closed it, minutes later (G52).
+    routes::attach_upstream(&upstream);
+    let up = thread::spawn(move || {
+        let moved = io::copy(&mut client, &mut upstream_w);
+        match moved {
+            // The client finished sending. Pass the half-close on rather than
+            // tearing the socket down: a client that half-closes still wants
+            // the answer, and the upstream closing its side in turn is what
+            // ends the other direction.
+            Ok(_) => {
+                upstream_w.shutdown(std::net::Shutdown::Write).ok();
+            }
+            // Broken, or cut from outside: nobody will read anything more.
+            Err(_) => {
+                upstream_w.shutdown(std::net::Shutdown::Both).ok();
+            }
+        }
+        moved
+    });
     io::copy(&mut upstream, &mut client_w).ok();
     // FIN first, and only then the full shutdown that releases the thread still
     // reading from this socket. Going straight to `Both` closes it with whatever
@@ -717,34 +899,8 @@ fn serve(mut client: TcpStream, _if_index: u32) {
     // one to the next costs the client nothing (I35), and a tunnel already
     // open keeps its route whatever the table says next.
     if port == 443 && is_gate_host(&host) {
-        let mut client = client;
-        let mut tried_direct = false;
-        for kind in routes::order(|k| route_usable(k, &host)) {
-            let attempt = match kind {
-                routes::Kind::Own => try_own_proxy(client, &host, port),
-                routes::Kind::Exits => try_builtin_exit(client, &host, port),
-                routes::Kind::Relay => try_relay_route(client, &host, port),
-                routes::Kind::Direct => {
-                    tried_direct = true;
-                    try_direct(client, &host, port)
-                }
-            };
-            client = match attempt {
-                Ok(()) => return,
-                Err(returned) => returned,
-            };
-        }
-        // Every route refused. The plain tunnel is the last resort when the
-        // table left it out - a genuine Google address that answers 400 is
-        // still better than a client that gets no status line at all. When the
-        // direct route was already tried and found nothing, trying the same
-        // name again only delays the 502 by another budget.
-        if tried_direct {
-            client.write_all(RESP_BAD_GATEWAY).ok();
-            return;
-        }
-        client.set_read_timeout(None).ok();
-        tunnel(client, &host, port);
+        let _gate = routes::begin_gate_connection(&client, &host);
+        serve_gate(client, &host, port);
         return;
     }
 
@@ -756,6 +912,70 @@ fn serve(mut client: TcpStream, _if_index: u32) {
     // reached cert-free through the routes above; nothing here needs a CA.
     client.set_read_timeout(None).ok();
     tunnel(client, &host, port);
+}
+
+/// The most one gate connection may spend walking routes that fail to open.
+/// A client that came in through the loopback door is already in its TLS
+/// handshake timer (10 s in Go) while this runs; past this the connection is
+/// given up, and the routes that failed on it have stepped aside
+/// (`routes::stumble`), so the client's retry goes straight to one that opens.
+const GATE_OPEN_BUDGET: Duration = Duration::from_secs(12);
+
+/// Walks the route table for one gate connection.
+fn serve_gate(client: TcpStream, host: &str, port: u16) {
+    let started = Instant::now();
+    let mut client = client;
+    let mut tried_direct = false;
+    for kind in routes::order(|k| route_usable(k, host)) {
+        if started.elapsed() >= GATE_OPEN_BUDGET {
+            break;
+        }
+        let attempt = match kind {
+            routes::Kind::Own => try_own_proxy(client, host, port),
+            routes::Kind::Exits => try_builtin_exit(client, host, port),
+            routes::Kind::Relay => try_relay_route(client, host, port),
+            routes::Kind::Direct => {
+                tried_direct = true;
+                try_direct(client, host, port)
+            }
+            routes::Kind::Vpn => try_vpn(client, host, port),
+        };
+        client = match attempt {
+            Ok(()) => return,
+            // Failed before any `200`: not the gate, just a route that would not
+            // open. Out of the way of the next few connections.
+            Err(returned) => {
+                routes::stumble(kind);
+                returned
+            }
+        };
+    }
+    // Every route refused. Where the direct route was left out of the table (a
+    // passthrough answer, or benched), it is tried anyway as the last resort -
+    // a genuine Google address that answers 400 still beats a client with no
+    // status line at all, and the refusal it earns is what the watch learns
+    // from. Through the relay's pool, never the system resolver: with the
+    // loopback listener up, that one answers with our own address.
+    if !tried_direct && started.elapsed() < GATE_OPEN_BUDGET {
+        client.set_read_timeout(None).ok();
+        if let Ok(upstream) = connect_gate_direct(host, port, DIRECT_OPEN_BUDGET) {
+            if client.write_all(RESP_ESTABLISHED).is_ok() {
+                routes::note_used(routes::Kind::Direct);
+                splice(client, upstream);
+            }
+            return;
+        }
+    }
+    client.write_all(RESP_BAD_GATEWAY).ok();
+}
+
+/// Whether the proxy's listener is bound. The loopback listener hands its
+/// connections to this one, so it is only worth answering DNS with a loopback
+/// address while both are up.
+static PROXY_BOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn bound() -> bool {
+    PROXY_BOUND.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// How long a taken port is given to come free, and how often it is retried.
@@ -806,6 +1026,7 @@ fn bind_listener() -> Result<TcpListener, String> {
 /// Runs the proxy until the process ends. Never returns while the socket holds.
 pub fn run(if_index: u32) -> Result<(), String> {
     let listener = bind_listener()?;
+    PROXY_BOUND.store(true, std::sync::atomic::Ordering::Relaxed);
     // Costs a loopback socket and nothing else: no key is generated, nothing is
     // put in a trust store, and a client that never points at this port never
     // notices it is here.
@@ -1016,6 +1237,31 @@ mod tests {
         assert_eq!(parse_connect("CONNECT nohost HTTP/1.1\r\n\r\n"), None);
         assert_eq!(parse_connect("CONNECT :443 HTTP/1.1\r\n\r\n"), None);
         assert_eq!(parse_connect(""), None);
+    }
+
+    #[test]
+    fn a_proxy_on_this_machine_or_the_lan_is_local_and_a_public_one_is_not() {
+        for h in [
+            "127.0.0.1",
+            "localhost",
+            "192.168.1.10",
+            "10.0.0.2",
+            "[::1]",
+            "mybox",
+        ] {
+            assert!(is_local_host(h), "{h}");
+        }
+        for h in ["proxy.example.com", "203.0.113.5", "8.8.8.8"] {
+            assert!(!is_local_host(h), "{h}");
+        }
+        // Not a gate host, or no loopback door: the name, always.
+        assert_eq!(connect_target("127.0.0.1", "example.com"), "example.com");
+        if !crate::loopback::active() {
+            assert_eq!(
+                connect_target("127.0.0.1", "daily-cloudcode-pa.googleapis.com"),
+                "daily-cloudcode-pa.googleapis.com"
+            );
+        }
     }
 
     #[test]

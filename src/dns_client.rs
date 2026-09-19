@@ -409,6 +409,49 @@ pub fn question_type(buf: &[u8]) -> Option<u16> {
     Some(u16::from_be_bytes([bytes[0], bytes[1]]))
 }
 
+/// An answer of our own to `query`, instead of anyone's upstream reply.
+///
+/// `Some(ip)` answers the question with one A record; `None` is an empty
+/// NOERROR answer (NODATA) — "the name exists and has no record of this type".
+/// The question is copied byte for byte, so the client matches the reply to what
+/// it asked; the header keeps the id, the opcode and RD, and says RA. Anything
+/// after the question (an EDNS OPT record) is left out, which every resolver is
+/// allowed to do and every stub accepts.
+///
+/// `None` for a query this cannot read, and the caller then relays it the usual
+/// way — an answer built on a misread question is worse than none.
+pub fn synth_reply(query: &[u8], a: Option<Ipv4Addr>, ttl: u32) -> Option<Vec<u8>> {
+    if query.len() < 12 || u16::from_be_bytes([query[4], query[5]]) != 1 {
+        return None;
+    }
+    // Only a standard query is answered; anything with QR set is not a query.
+    if query[2] & 0x80 != 0 {
+        return None;
+    }
+    let end = skip_name(query, 12)?.checked_add(4)?;
+    if end > query.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(end + 16);
+    out.extend_from_slice(&query[0..2]);
+    // QR, the query's opcode, AA clear, TC clear, the query's RD.
+    out.push(0x80 | (query[2] & 0x78) | (query[2] & 0x01));
+    // RA set, Z clear, RCODE 0.
+    out.push(0x80);
+    out.extend_from_slice(&[0, 1]);
+    out.extend_from_slice(&(a.is_some() as u16).to_be_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    out.extend_from_slice(&query[12..end]);
+    if let Some(ip) = a {
+        // A pointer to the question name, type A, class IN.
+        out.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1]);
+        out.extend_from_slice(&ttl.to_be_bytes());
+        out.extend_from_slice(&[0, 4]);
+        out.extend_from_slice(&ip.octets());
+    }
+    Some(out)
+}
+
 /// The question name of a query, for logging. Cheap enough to run per packet
 /// and never fails loudly - a name we cannot read is simply not logged.
 pub fn question_name(buf: &[u8]) -> Option<String> {
@@ -498,6 +541,53 @@ pub fn resolve_a_via(host: &str, server: Ipv4Addr, if_index: u32) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An answer we build ourselves has to be one the reader we trust for
+    /// upstream replies reads back the same way: same id, same question, the
+    /// address we put in, and a TTL that ages like any other.
+    #[test]
+    fn a_built_answer_reads_back_as_what_was_put_in() {
+        let q = build_query("daily-cloudcode-pa.googleapis.com", 0x1234);
+        let ip: Ipv4Addr = "127.65.71.2".parse().unwrap();
+        let r = synth_reply(&q, Some(ip), 20).expect("built");
+        assert_eq!(&r[0..2], &[0x12, 0x34]);
+        assert_eq!(r[2] & 0x80, 0x80, "QR set");
+        assert_eq!(r[3] & 0x0F, 0, "NOERROR");
+        assert_eq!(
+            question_name(&r).as_deref(),
+            Some("daily-cloudcode-pa.googleapis.com")
+        );
+        assert_eq!(question_type(&r), Some(1));
+        assert_eq!(answer_addrs(&r), vec![IpAddr::V4(ip)]);
+        assert_eq!(answer_ttl(&r), Some(20));
+        // Aged like an upstream reply, which is what the cache path does.
+        assert_eq!(answer_ttl(&age_reply(&r, 5).unwrap()), Some(15));
+    }
+
+    #[test]
+    fn nodata_is_an_empty_noerror_answer_to_the_same_question() {
+        let mut q = build_query("cloudcode-pa.googleapis.com", 7);
+        let n = q.len();
+        q[n - 3] = 28; // AAAA
+        let r = synth_reply(&q, None, 20).expect("built");
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0, "no answer records");
+        assert_eq!(r[3] & 0x0F, 0, "NOERROR, not NXDOMAIN");
+        assert_eq!(question_type(&r), Some(28));
+        assert!(answer_addrs(&r).is_empty());
+    }
+
+    #[test]
+    fn a_packet_that_is_not_a_readable_query_gets_no_invented_answer() {
+        assert_eq!(synth_reply(&[], None, 20), None);
+        assert_eq!(synth_reply(&[0u8; 11], None, 20), None);
+        let q = build_query("x.example", 1);
+        // Truncated inside the question.
+        assert_eq!(synth_reply(&q[..q.len() - 2], None, 20), None);
+        // A reply is not a query.
+        let mut reply = q.clone();
+        reply[2] |= 0x80;
+        assert_eq!(synth_reply(&reply, None, 20), None);
+    }
 
     #[test]
     fn query_carries_the_name_as_labels() {

@@ -394,6 +394,15 @@ pub fn open(up: &Upstream, host: &str, port: u16, budget: Duration) -> Result<Tc
     sock.set_read_timeout(Some(left())).ok();
     sock.set_write_timeout(Some(left())).ok();
 
+    // A proxy on this machine or the LAN (v2rayN, Privoxy, a router's proxy)
+    // resolves the name itself, usually through the system resolver - which,
+    // with the loopback door up, answers a gate host with *our* address. The
+    // proxy would then dial us, we would dial it, and so on: an avalanche of
+    // connections with no end (found in review before 2.14.0_1 shipped). Such a
+    // proxy is handed Google's address instead of the name; the client's own
+    // TLS still names the host, so nothing else changes.
+    let target = crate::proxy::connect_target(up.host.as_str(), host);
+    let host = target.as_str();
     let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
     if let Some(a) = &up.auth {
         req.push_str(&format!("Proxy-Authorization: Basic {}\r\n", basic(a)));
@@ -632,7 +641,11 @@ fn trace_direct(host: &'static str) -> Option<(String, String)> {
 /// Regions where a proxy is pointless, because they are the ones being blocked.
 /// Not a complete list and not meant to be - it exists to catch the common case
 /// of someone pointing this at a VPN that surfaces next door.
-const BLOCKED_REGIONS: &[&str] = &["RU", "BY"];
+/// Where the gate refuses. Russia and Belarus are the ones measured; the rest are
+/// the countries Google lists no Gemini service for at all, which is the same
+/// refusal for the same reason - and a VPN or proxy exiting in one of them must
+/// not be offered as a way around it.
+const BLOCKED_REGIONS: &[&str] = &["RU", "BY", "CN", "HK", "MO", "IR", "KP", "SY", "CU"];
 
 pub fn region_is_blocked(loc: &str) -> bool {
     BLOCKED_REGIONS.iter().any(|r| r.eq_ignore_ascii_case(loc))

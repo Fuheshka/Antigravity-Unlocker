@@ -1,6 +1,6 @@
 [package]
 name = "ag_unlocker"
-version = "2.14.0"
+version = "2.15.0"
 edition = "2021"
 description = "Antigravity Configuration Tool"
 authors = ["Brent t.me/nova_txt"]
@@ -29,6 +29,11 @@ eframe = { version = "0.36", features = ["glow"] }
 # expose. `default-features = false` because the image half is eframe's business,
 # not ours; features unify, so the build is unchanged either way.
 arboard = { version = "3.6", default-features = false }
+# The one socket `TcpStream` cannot build: IP_UNICAST_IF has to be set before
+# `connect`, and std creates and connects in one call. Pins the relay's own
+# connections to the ISP link while a VPN holds the default route (`net.rs`),
+# the same way every UDP resolver query already is (I4). Small, no runtime.
+socket2 = "0.6"
 
 [build-dependencies]
 winres = "0.1"
