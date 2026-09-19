@@ -37,11 +37,65 @@ use crate::utils::no_window;
 // with `BadCertificate`. The CA helpers below survive for one purpose - removing
 // a certificate an older version installed. Measurements: kb/dns.md.
 
-/// Loopback only. The port is fixed because `HTTPS_PROXY` is a static string in
-/// the user's environment - an ephemeral port would need rewriting on every
-/// relay start, and would be wrong for any process that read it earlier.
+/// Loopback only. The port is stable because the proxy variable is a static
+/// string in the user's environment - an ephemeral port would need rewriting on
+/// every relay start, and would be wrong for any process that read it earlier.
 pub const LISTEN_IP: &str = "127.0.0.1";
-pub const LISTEN_PORT: u16 = 53129;
+/// The port the proxy starts on, and keeps for as long as it can have it.
+pub const DEFAULT_PORT: u16 = 53129;
+/// Where it moves when it cannot (P26). 53129 is inside Windows' dynamic range
+/// (49152-65535), which is where Hyper-V, WSL 2 and Docker reserve ports and
+/// where every outgoing connection borrows one; these sit below it, where
+/// neither happens on a default Windows.
+const FALLBACK_PORTS: [u16; 6] = [43129, 44129, 45129, 46129, 47129, 48129];
+
+/// The port this process bound, 0 until it has (the relay's own answer).
+static PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// The file the relay records a moved port in, beside `settings.json` - the one
+/// place the window (another process, as the same user) and the relay agree on.
+/// Absent while the proxy is on `DEFAULT_PORT`.
+fn port_file() -> PathBuf {
+    crate::dns_forwarder::log_dir().join("proxy_port")
+}
+
+/// The port the local proxy listens on: the one this process bound, else the
+/// one the relay recorded, else the default. Everything that names the proxy -
+/// the variable, the door's hop, the egress probe - asks this.
+pub fn port() -> u16 {
+    match PORT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => fs::read_to_string(port_file())
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .filter(|p| *p != 0)
+            .unwrap_or(DEFAULT_PORT),
+        p => p,
+    }
+}
+
+/// Takes `port` as this machine's, in this process and on disk.
+fn adopt(port: u16) {
+    PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+    // Never from a test: the file is the real user's, and the relay reads it.
+    if cfg!(test) {
+        return;
+    }
+    if port == DEFAULT_PORT {
+        fs::remove_file(port_file()).ok();
+    } else {
+        let path = port_file();
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).ok();
+        }
+        fs::write(path, port.to_string()).ok();
+    }
+}
+
+/// The URL the variable held before any move - still ours, never a foreign
+/// proxy to stand aside for (`endpoint::is_ours_on_any_port`).
+pub fn default_url() -> String {
+    format!("http://{}:{}", LISTEN_IP, DEFAULT_PORT)
+}
 
 /// Common name of the certificate authority older versions generated on this
 /// machine. Nothing creates one any more; the name is kept so the three helpers
@@ -152,13 +206,77 @@ fn ca_key_path() -> PathBuf {
 
 /// The proxy URL that goes into the environment of the processes being routed.
 pub fn proxy_url() -> String {
-    format!("http://{}:{}", LISTEN_IP, LISTEN_PORT)
+    url_at(port())
 }
 
-/// The address the listener holds, as a `SocketAddr`. Both parts are literals in
+/// The URL naming the proxy on `port`.
+pub fn url_at(port: u16) -> String {
+    format!("http://{}:{}", LISTEN_IP, port)
+}
+
+/// Waits up to `budget` for **our** proxy to answer, and says on which port -
+/// the one a variable written after this has to name (I53).
+///
+/// The port is read again on every try: the relay can move it while this waits
+/// (P26), and a URL built from the port read before the wait named the one it
+/// had just left - a dead port in `AG_LS_PROXY` that the watchdog, asking about
+/// the new one, would never take back off. "Ours": in the relay, the listener
+/// this process bound; elsewhere on Windows, a listener owned by the relay's exe,
+/// because somebody else's program on the default port answers too and naming it
+/// would route Antigravity into it. Linux has no table to ask, and there the
+/// proxy never moves.
+pub fn wait_for_our_listener(budget: Duration) -> Option<u16> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let p = port();
+        if ours_answers(p) {
+            return Some(p);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(POLL_FOR_LISTENER);
+    }
+}
+
+fn ours_answers(port: u16) -> bool {
+    if bound() {
+        // The relay asking about itself: `PORT` is set before `PROXY_BOUND`.
+        return PORT.load(std::sync::atomic::Ordering::Relaxed) == port;
+    }
+    if !answers_at(addr_at(port)) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let relay = crate::background::installed_exe();
+        let mine = std::env::current_exe().ok();
+        let names: Vec<String> = [Some(relay), mine]
+            .into_iter()
+            .flatten()
+            .filter_map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().to_ascii_lowercase())
+            })
+            .collect();
+        // A name that cannot be read is given the benefit of the doubt: the
+        // relay writes the variable itself anyway, and a refusal here would
+        // only keep the window from doing it too.
+        return crate::portcheck::listener_image(addr_at(port))
+            .is_none_or(|n| names.contains(&n.to_ascii_lowercase()));
+    }
+    #[cfg(not(windows))]
+    true
+}
+
+/// The address the listener holds, as a `SocketAddr`. The IP is a literal in
 /// this file, so it cannot fail.
 pub(crate) fn listen_addr() -> std::net::SocketAddr {
-    std::net::SocketAddr::from((LISTEN_IP.parse::<Ipv4Addr>().unwrap(), LISTEN_PORT))
+    addr_at(port())
+}
+
+fn addr_at(port: u16) -> std::net::SocketAddr {
+    std::net::SocketAddr::from((LISTEN_IP.parse::<Ipv4Addr>().unwrap(), port))
 }
 
 /// Whether something accepts connections on the proxy's address right now.
@@ -172,16 +290,9 @@ pub fn listener_answers() -> bool {
     answers_at(listen_addr())
 }
 
-/// Waits up to `budget` for the listener to come up. `false` means it did not.
-///
-/// Callers exist because binding is not instant: `run` retries a port that may be
-/// held for a moment by somebody else's ephemeral socket (see `bind_listener`).
-pub fn wait_for_listener(budget: Duration) -> bool {
-    wait_at(listen_addr(), budget)
-}
-
-/// The two above, with the address given: the fixed port is what the product
-/// asks about, and a test needs one nothing else on the machine can be holding.
+/// The check above, with the address given: the product asks about its own port,
+/// and a test needs one nothing else on the machine can be holding. Waiting for
+/// the listener to come up is `wait_for_our_listener`, which re-reads the port.
 ///
 /// A refused connection means no listener and must read as `false`. Spelled out
 /// because the version this replaces answered `true` on its own parse failure, so
@@ -190,6 +301,7 @@ fn answers_at(addr: std::net::SocketAddr) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
 }
 
+#[cfg(test)]
 fn wait_at(addr: std::net::SocketAddr, budget: Duration) -> bool {
     let deadline = Instant::now() + budget;
     loop {
@@ -371,20 +483,26 @@ fn try_direct(mut client: TcpStream, host: &str, port: u16) -> Result<(), TcpStr
     Ok(())
 }
 
-/// The substituted address of a gate host, from the relay's own pool, and the
-/// interface to reach it through. On a build without the DNS layer (Linux) the
-/// system resolver is all there is, and nothing is pinned.
+/// The substituted address of a gate host, from the provider pool, and the
+/// interface to reach it through.
+///
+/// Linux too, although it has no DNS layer: the pool is this process's own
+/// code, not the relay's. It used to take the system resolver there, which on
+/// most machines answers with Google itself - the region gate, from a Russian
+/// address - so once the exits and the relay were benched, "напрямую" was a
+/// route to 400s that the log called «the DNS route».
 fn gate_direct_addrs(host: &str, port: u16) -> Result<(Vec<std::net::SocketAddr>, u32), String> {
-    if !cfg!(target_os = "windows") {
-        let addrs: Vec<_> = (host, port)
-            .to_socket_addrs()
-            .map_err(|e| format!("имя не разрешается: {}", e))?
-            .collect();
-        return Ok((addrs, 0));
-    }
     let if_index = crate::net::pin_interface();
     let (addrs, _, verdict) = crate::resolvers::resolve_a_best(host, if_index)
         .ok_or_else(|| "имя не разрешилось".to_string())?;
+    // With no relay to stand down for a tunnel (D13) and no VPN route of ours,
+    // Google's own address is the gate and nothing else: the next route in the
+    // table takes the connection instead.
+    if !cfg!(target_os = "windows") && verdict != crate::resolvers::Verdict::Substituted {
+        return Err(
+            "сервисы разблокировки не подменили адрес — напрямую будет ошибка 400".to_string(),
+        );
+    }
     // While the relay stands down for a tunnel the answer is genuine Google,
     // reached through that tunnel; pinning it to the ISP link would take it out
     // of the tunnel and into the gate.
@@ -998,37 +1116,119 @@ const BIND_RETRY_WAIT: Duration = Duration::from_secs(3);
 /// of the two it was. Either way the caller must not claim the route: without a
 /// listener the `HTTPS_PROXY` naming it breaks the machine's proxy-aware traffic
 /// (G31), which is why the variable is only set once this has succeeded.
-fn bind_listener() -> Result<TcpListener, String> {
-    let mut last = String::new();
+///
+/// Since `2.15.0_2` a port that cannot be had is diagnosed (`portcheck`) and,
+/// unless the refusal is security software's (which follows this program to any
+/// port), the proxy moves to one outside the dynamic range and records it
+/// (`adopt`), so the variable written after it names the port that answers.
+fn bind_listener() -> Result<TcpListener, crate::gate::Blocker> {
+    bind_from(port(), &FALLBACK_PORTS)
+}
+
+fn bind_from(first: u16, fallbacks: &[u16]) -> Result<TcpListener, crate::gate::Blocker> {
+    let mut failed: Option<(std::io::Error, crate::portcheck::Cause)> = None;
     for attempt in 0..BIND_TRIES {
-        match TcpListener::bind(listen_addr()) {
+        match TcpListener::bind(addr_at(first)) {
             Ok(listener) => {
                 if attempt > 0 {
                     crate::dns_forwarder::log_proxy(&format!(
                         "порт {} освободился с {}-й попытки",
-                        LISTEN_PORT,
+                        first,
                         attempt + 1
                     ));
                 }
+                adopt(first);
                 return Ok(listener);
             }
             Err(e) => {
-                last = e.to_string();
+                // Looked at once: which of the causes it is does not change
+                // between tries, and the look costs a `netsh`.
+                let cause = match failed.take() {
+                    Some((_, cause)) => cause,
+                    None => crate::portcheck::diagnose(addr_at(first), &e),
+                };
+                // A reservation or another program's listener does not go away
+                // in fifteen seconds; a borrowed ephemeral port does.
+                let lasting = matches!(
+                    cause,
+                    crate::portcheck::Cause::Reserved | crate::portcheck::Cause::Held(_)
+                );
+                failed = Some((e, cause));
+                if lasting {
+                    break;
+                }
                 if attempt + 1 < BIND_TRIES {
                     thread::sleep(BIND_RETRY_WAIT);
                 }
             }
         }
     }
-    Err(format!(
-        "не занять {}:{} — {}",
-        LISTEN_IP, LISTEN_PORT, last
-    ))
+    let Some((err, cause)) = failed else {
+        unreachable!("BIND_TRIES is not zero")
+    };
+    if cause.another_port_helps() {
+        for other in fallbacks.iter().copied().filter(|p| *p != first) {
+            if let Ok(listener) = TcpListener::bind(addr_at(other)) {
+                crate::dns_forwarder::log_proxy(&format!(
+                    "порт {} недоступен ({}) — локальный прокси перенесён на {}",
+                    first, err, other
+                ));
+                adopt(other);
+                return Ok(listener);
+            }
+        }
+    }
+    Err(cause.blocker("proxy", addr_at(first), &err))
 }
 
-/// Runs the proxy until the process ends. Never returns while the socket holds.
+/// How often a listener that could not be bound is tried again. A user who adds
+/// the antivirus exception or closes the program holding the port gets the
+/// bypass back within a minute, without a restart (P53).
+pub const REBIND_EVERY: Duration = Duration::from_secs(60);
+
+/// Runs the proxy until the process ends. Never returns while the socket holds;
+/// while it cannot be had, says why (`gate::set_blocker`) and keeps trying.
 pub fn run(if_index: u32) -> Result<(), String> {
-    let listener = bind_listener()?;
+    let mut said: Option<crate::gate::Blocker> = None;
+    let listener = loop {
+        match bind_listener() {
+            Ok(listener) => {
+                if said.is_some() {
+                    crate::dns_forwarder::log_proxy(&format!(
+                        "локальный прокси поднялся на порту {}",
+                        port()
+                    ));
+                    crate::gate::set_blocker("proxy", None);
+                }
+                break listener;
+            }
+            Err(blocker) => {
+                // Logged when the reason changes, not every minute.
+                if said.as_ref() != Some(&blocker) {
+                    crate::dns_forwarder::log_proxy(&format!(
+                        "not started: не занять {} — {} ({})",
+                        blocker.addr,
+                        blocker.error,
+                        match blocker.cause.as_str() {
+                            "held" if !blocker.by.is_empty() =>
+                                format!("порт занят программой {}", blocker.by),
+                            "held" => "порт занят другой программой".to_string(),
+                            "reserved" => "порт зарезервирован Windows".to_string(),
+                            "denied" => "доступ запрещён — антивирус или файрвол".to_string(),
+                            _ => "причина не определена".to_string(),
+                        }
+                    ));
+                    said = Some(blocker.clone());
+                }
+                // Written every try, not only on a change: the record is dropped
+                // as stale after `gate::STALE_AFTER`, and on Linux this is the
+                // only thing that writes it - the card would go while the
+                // problem stayed.
+                crate::gate::set_blocker("proxy", Some(blocker));
+                thread::sleep(REBIND_EVERY);
+            }
+        }
+    };
     PROXY_BOUND.store(true, std::sync::atomic::Ordering::Relaxed);
     // Costs a loopback socket and nothing else: no key is generated, nothing is
     // put in a trust store, and a client that never points at this port never
@@ -1044,6 +1244,24 @@ pub fn run(if_index: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live: what the direct route would dial for each gate host - on Linux the
+    /// provider pool's substituted address, never the system resolver's Google.
+    ///
+    ///     cargo test the_direct_route_dials_a_substituted_address -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs a live network from a gated region; run with --ignored"]
+    fn the_direct_route_dials_a_substituted_address() {
+        for host in [
+            "cloudcode-pa.googleapis.com",
+            "daily-cloudcode-pa.googleapis.com",
+        ] {
+            match gate_direct_addrs(host, 443) {
+                Ok((addrs, pin)) => println!("{host:<36} -> {addrs:?} (pin {pin})"),
+                Err(why) => println!("{host:<36} -> refused: {why}"),
+            }
+        }
+    }
 
     /// The listener check must answer about the socket, and a refused connection
     /// must read as "no listener".
@@ -1270,5 +1488,38 @@ mod tests {
     #[test]
     fn the_proxy_url_is_loopback() {
         assert!(proxy_url().starts_with("http://127.0.0.1:"));
+    }
+
+    /// P26: a port another program listens on is left at once - no fifteen
+    /// seconds of retries for a holder that will not leave - and the proxy
+    /// takes the next one, which becomes the port everything names.
+    #[test]
+    fn a_held_port_moves_the_proxy_to_the_next_one_at_once() {
+        let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+        let held = holder.local_addr().unwrap().port();
+        let free = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let started = Instant::now();
+        let got = bind_from(held, &[free]).expect("moved to the free port");
+        assert_eq!(got.local_addr().unwrap().port(), free);
+        assert_eq!(port(), free);
+        assert!(proxy_url().ends_with(&format!(":{free}")));
+        assert!(started.elapsed() < BIND_RETRY_WAIT, "retried a held port");
+    }
+
+    /// With nowhere to go the failure is reported, naming who holds the port.
+    #[test]
+    fn a_held_port_with_nowhere_to_go_says_who_holds_it() {
+        let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+        let held = holder.local_addr().unwrap().port();
+        let b = bind_from(held, &[]).err().expect("nothing to move to");
+        assert_eq!(b.what, "proxy");
+        if cfg!(windows) {
+            assert_eq!(b.cause, "held");
+        }
+        assert!(b.addr.ends_with(&format!(":{held}")));
     }
 }

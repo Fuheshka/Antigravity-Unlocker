@@ -428,6 +428,18 @@ pub fn open(up: &Upstream, host: &str, port: u16, budget: Duration) -> Result<Tc
         match sock.read(&mut byte) {
             Ok(0) => return Err("прокси закрыл соединение".to_string()),
             Ok(_) => head.push(byte[0]),
+            // The read timeout expiring: `TimedOut` on Windows, `WouldBlock` on
+            // Linux, where it reads «Resource temporarily unavailable (os error
+            // 11)» - which says nothing to a user about a proxy that let us
+            // connect and then never answered the CONNECT.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err("соединение принято, но на запрос прокси не ответил вовремя".to_string())
+            }
             Err(e) => return Err(format!("нет ответа: {}", e)),
         }
     }

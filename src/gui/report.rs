@@ -163,6 +163,31 @@ fn relay_part(out: &mut String, r: &Report) {
         "Гейт-хосты через локальные адреса: {}",
         if r.loopback { "да" } else { "нет" }
     );
+    for b in &r.blockers {
+        let _ = writeln!(out, "Мешает обходу: {}", super::status::blocker_line(b));
+    }
+    if crate::proxy::port() != crate::proxy::DEFAULT_PORT {
+        let _ = writeln!(
+            out,
+            "Порт локального прокси: {} (перенесён со стандартного {})",
+            crate::proxy::port(),
+            crate::proxy::DEFAULT_PORT
+        );
+    }
+    if r.started_at != 0 {
+        let _ = writeln!(
+            out,
+            "Ответ из интернета служба получала: {}",
+            if r.reached_at == 0 {
+                "ни разу с запуска".to_string()
+            } else {
+                format!(
+                    "{} с назад",
+                    crate::gate::now_unix().saturating_sub(r.reached_at)
+                )
+            }
+        );
+    }
     let _ = writeln!(
         out,
         "VPN держит маршрут по умолчанию: {}{}",

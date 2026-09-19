@@ -237,6 +237,26 @@ impl Status {
             Cap::VerifyTls => &self.verify_tls,
         }
     }
+
+    /// The bypass master switch. Derived, never stored: it is on when any part
+    /// of the bypass is, which keeps one truth instead of two.
+    pub fn bypass_on(&self) -> bool {
+        self.dns.is_on() || self.local_proxy.is_on() || self.builtin_exits.is_on()
+    }
+}
+
+/// The parts of the bypass, in the order the master switch sends them.
+///
+/// Not the same in both directions. ON: the relay has to be answering before the
+/// proxy variable may name it (I53) â€” the worker runs these in order, so DNS
+/// finishes first. OFF: the variable comes off *before* the listener it names
+/// goes away, or a sign-in that lands in between dials a dead port (G31).
+pub fn bypass_order(on: bool) -> [Cap; 3] {
+    if on {
+        [Cap::Dns, Cap::LocalProxy, Cap::BuiltinExits]
+    } else {
+        [Cap::LocalProxy, Cap::BuiltinExits, Cap::Dns]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1739,13 +1759,17 @@ fn enable_local_proxy(ctx: &mut Ctx) {
 
     // 4. I53/G31: never name a listener that is not there. A variable pointing
     //    at a dead port takes the sign-in down with it.
-    if !proxy::wait_for_listener(Duration::from_secs(3)) {
+    //    Named by the port that answered, not the one read above: the relay can
+    //    move the proxy while this waits (P26), and a URL for the port it left
+    //    would be a dead one no watchdog takes back off.
+    let Some(port) = proxy::wait_for_our_listener(Duration::from_secs(3)) else {
         ctx.log(
             Level::Err,
             "Локальный прокси не отвечает — сначала включите «Обход через DNS».",
         );
         return;
-    }
+    };
+    let url = proxy::url_at(port);
 
     match endpoint::apply_proxy(&url, "") {
         Ok(_) => ctx.log(Level::Ok, "Локальный прокси включён."),

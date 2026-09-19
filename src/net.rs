@@ -38,6 +38,22 @@ pub fn pin_interface() -> u32 {
     PIN_IF.load(Ordering::Relaxed)
 }
 
+/// Unix time something outside this machine last answered this process: a
+/// resolver, a DoH node, a route's probe. 0 = nothing yet.
+static REACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Called wherever an answer from the internet arrives. The relay publishes it
+/// (`gate::Report::reached_at`): a relay that has run for minutes with nothing
+/// reached is cut off, and when the window - another program on the same
+/// network - is not, something on this machine singles the relay out (P53).
+pub fn note_reached() {
+    REACHED.store(crate::gate::now_unix(), Ordering::Relaxed);
+}
+
+pub fn last_reached() -> u64 {
+    REACHED.load(Ordering::Relaxed)
+}
+
 /// Whether a tunnel holds the default route, as the relay last saw it.
 pub fn tunnel_up() -> bool {
     pin_interface() != 0

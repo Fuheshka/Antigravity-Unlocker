@@ -589,6 +589,50 @@ def _win_to_wsl_path(win_path):
     return "/mnt/%s%s" % (drive.rstrip(":").lower(), rest)
 
 
+# The build machine's paths, out of the shipped binaries.
+#
+# Every panic location a dependency carries - winit, wgpu, ring, naga: hundreds
+# of them - is an absolute path into CARGO_HOME, i.e. into the builder's home
+# directory, and one reached a user's screen inside a winit error ("os error at
+# /home/<builder>/.cargo/registry/src/.../winit-0.30.13/..."). rustc rewrites them
+# at compile time: the home directory becomes ~, the checkout /ag_unlocker, the
+# cargo home /cargo. The last matching rule wins, so the specific ones come last.
+# (`profile.trim-paths` does this in one line, but is unstable in cargo 1.95.)
+def remap_prefix_flags(home, repo, cargo_home):
+    return ["--remap-path-prefix=%s=%s" % (src, dst)
+            for src, dst in ((home, "~"), (repo, "/ag_unlocker"), (cargo_home, "/cargo"))
+            if src]
+
+
+def config_rustflags(triple):
+    """The rustflags .cargo/config.toml gives `triple`. An environment
+    CARGO_ENCODED_RUSTFLAGS *replaces* that list rather than adding to it, so the
+    release build hands it over explicitly - or it would ship without the static
+    CRT, and a clean Windows would refuse the exe before main (VCRUNTIME140.dll)."""
+    import tomllib
+    with open(os.path.join(".cargo", "config.toml"), "rb") as f:
+        return list(tomllib.load(f)["target"][triple]["rustflags"])
+
+
+def check_shipped_binary(path, needles, windows):
+    """Measured, not assumed: warns when the binary still names the build
+    machine, or (Windows) still needs the Visual C++ runtime DLL."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read().lower()
+    except OSError as e:
+        print(f"[WARNING] {path} не прочитан для проверки: {e}")
+        return
+    leaked = [n for n in needles if n and n.lower().encode("utf-8") in data]
+    if leaked:
+        print(f"[WARNING] {os.path.basename(path)} содержит пути сборочной машины: {', '.join(leaked)}")
+    else:
+        print(f"[INFO] {os.path.basename(path)}: путей сборочной машины нет.")
+    if windows and b"vcruntime140.dll" in data:
+        print(f"[WARNING] {os.path.basename(path)} требует VCRUNTIME140.dll - "
+              f"статический CRT не применился (.cargo/config.toml).")
+
+
 # Oldest glibc the Linux bundle has to start on.
 #
 # glibc is backward compatible but not forward, and the baseline is decided by
@@ -601,13 +645,16 @@ def _win_to_wsl_path(win_path):
 # asked for more than GLIBC_2.34.
 #
 # cargo-zigbuild pins the baseline at link time, so this needs no second distro.
-# 2.34 is the floor the code itself sets - it is the highest version any remaining
-# symbol asks for, so linking there costs nothing and is as low as this binary can
-# go without dropping a symbol it actually uses. Covers RHEL 9 and Fedora 35 up,
-# and everything newer (Ubuntu 22.04 = 2.35, Debian 12 = 2.36) by compatibility.
+# 2.17 is Rust std's own floor, and zig ships stubs for it: against them
+# `__libc_start_main`, `dlsym` and the `pthread_*` family link to their pre-2.34
+# homes in libpthread/libdl, so the 2.34 an earlier note called "the floor the
+# code itself sets" was only where a *modern* glibc had moved those symbols.
+# Measured 2026-09-19: a 2.17 build asks for nothing above GLIBC_2.17 and NEEDED
+# holds libc, libm, libpthread, libdl - all glibc. Covers CentOS/RHEL 7, Ubuntu
+# 14.04+, Debian 8+: the old servers the terminal mode is for, not only desktops.
 # Raise it only if a build starts failing to link, never to make a build pass
 # quietly: `linux_glibc_baseline` below is what proves the pin held.
-LINUX_GLIBC = "2.34"
+LINUX_GLIBC = "2.17"
 LINUX_TARGET = "x86_64-unknown-linux-gnu"
 
 # The Linux build's cache, on the WSL distro's own filesystem. It used to be
@@ -692,8 +739,21 @@ def build_linux_bundle(version):
         # that counts. Through `| tail -3` it used to be tail's, so a failed build
         # was noticed only because target-linux had been wiped - over a kept cache
         # it would have shipped the previous ELF.
+        # The paths rewritten are the distro's own ($HOME, CARGO_HOME), and the
+        # checkout as WSL sees it. \x1f-separated, so a space in a path is safe.
+        remap = (
+            'export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$HOME=~"$\'\\x1f\''
+            '"--remap-path-prefix=%s=/ag_unlocker"$\'\\x1f\''
+            '"--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"; '
+        ) % repo_wsl
+        # The full version, build number included, as the Windows build gets it
+        # (build.rs → `update::current_version`). Without it the ELF called itself
+        # plain "2.15.0", so every Linux build - `2.15.0_1` too - showed «новая
+        # версия» for the very release it was, and the TUI title said 2.15.0.
+        full_version = 'export AG_FULL_VERSION="%s"; ' % version
         build_cmd = (
             '. "$HOME/.cargo/env"; cd "%s" || exit 1; T="%s"; mkdir -p "$T" || exit 1; '
+            + remap + full_version +
             'echo "TARGET_DIR=$T"; '
             '%s --target-dir "$T" %s >"$T/messages.json" 2>"$T/build.log"; rc=$?; '
             'if [ $rc -eq 0 ]; then tail -n 3 "$T/build.log"; else tail -n 40 "$T/build.log"; fi; '
@@ -776,6 +836,11 @@ def build_linux_bundle(version):
         with tarfile.open(tar_path, "w:gz") as tar:
             tar.add(bundle, arcname=f"AG_{version}_linux", filter=_exec_bits)
 
+        wsl_home = _wsl_run(distro, 'printf %s "$HOME"')
+        wsl_home = ((wsl_home.stdout or "").strip().splitlines() or [""])[-1].strip() if wsl_home else ""
+        check_shipped_binary(os.path.join(bundle, "ag_unlocker"),
+                             [wsl_home + "/", "/.cargo/registry"], windows=False)
+
         elf_size = os.path.getsize(os.path.join(bundle, "ag_unlocker")) // 1024
         print(f"[УСПЕХ] Linux-бандл: {bundle} (ELF {elf_size} КБ)")
         print(f"        Архив для переноса на машину: {tar_path}")
@@ -816,7 +881,7 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.15.0_1"
+    VERSION = "2.15.0_2"
     version = VERSION
     # env!("CARGO_PKG_VERSION") only sees MAJOR.MINOR.PATCH, so the key salt uses
     # the same trimmed value the binary will compile with.
@@ -1107,6 +1172,12 @@ if __name__ == "__main__":
         print("[INFO] Запуск компиляции (Release mode)...")
         cargo_env = os.environ.copy()
         cargo_env["AG_FULL_VERSION"] = version
+        home = os.path.expanduser("~")
+        cargo_home = os.environ.get("CARGO_HOME") or os.path.join(home, ".cargo")
+        cargo_env.pop("RUSTFLAGS", None)
+        cargo_env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(
+            config_rustflags("x86_64-pc-windows-msvc")
+            + remap_prefix_flags(home, os.getcwd(), cargo_home))
         # Named explicitly so that a CARGO_TARGET_DIR in the environment is ignored:
         # the prune below deletes every unit this build did not use, which in a
         # directory shared with other projects would be all of theirs. In the repo,
@@ -1132,6 +1203,7 @@ if __name__ == "__main__":
         # deps\, which the cache keeps now; moved, the shipped exe would stay one
         # file with the cache's, and whatever touches either touches both.
         shutil.copy2(built_exe, out_path)
+        check_shipped_binary(out_path, [home + "\\", "\\.cargo\\registry"], windows=True)
 
         # Shrink the exe in place; it stays a runnable AG_<ver>.exe.
         if UPX_ENABLED:

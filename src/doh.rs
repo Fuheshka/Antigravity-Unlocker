@@ -291,7 +291,11 @@ fn walk(n: usize, start: usize) -> impl Iterator<Item = usize> {
 /// The rotation and the kept connections do not fight: each address has its
 /// own, so alternating between them costs no handshake.
 pub fn query(ep: &Endpoint, wire: &[u8], budget: Duration) -> Result<Vec<u8>, String> {
-    query_via(&POOL, ep, wire, budget)
+    let answer = query_via(&POOL, ep, wire, budget);
+    if answer.is_ok() {
+        crate::net::note_reached();
+    }
+    answer
 }
 
 /// `query` over a given pool - separate so a test can count what one pool

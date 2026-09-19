@@ -188,6 +188,7 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
 /// Records one measurement of a route. Blended with the previous fresh one, so
 /// a single slow probe does not by itself hand the lead to somebody else.
 pub fn record(kind: Kind, latency: Duration) {
+    crate::net::note_reached();
     let Ok(mut t) = TABLE.lock() else {
         return;
     };

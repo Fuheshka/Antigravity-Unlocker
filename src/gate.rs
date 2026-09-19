@@ -79,7 +79,42 @@ pub struct Report {
     pub routes: Vec<crate::routes::Row>,
     /// The relay generation that wrote this.
     pub version: u32,
+    /// What keeps a listener of the relay from coming up (P53, `portcheck`).
+    /// Empty when both bound. Written the moment a bind fails or succeeds,
+    /// not at the next warm pass: the user is looking at the window then.
+    pub blockers: Vec<Blocker>,
+    /// Unix time something on the internet last answered the relay (a resolver,
+    /// a DoH node, a route probe). 0 = nothing yet.
+    pub reached_at: u64,
+    /// When this relay process started. With `reached_at` it tells a relay that
+    /// is cut off from one that has only just started (`cut_off`).
+    pub started_at: u64,
+    /// The relay's own exe - the file an antivirus exception has to name.
+    pub exe: String,
 }
+
+/// Something on this machine that keeps part of the bypass from running, as the
+/// relay diagnosed it (`portcheck::diagnose`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Blocker {
+    /// `door` (the gate hosts' listeners on `:443`) or `proxy` (the local proxy).
+    pub what: String,
+    /// The address that could not be bound.
+    pub addr: String,
+    /// `held`, `reserved`, `denied` or `other` (`portcheck::Cause::code`).
+    pub cause: String,
+    /// The program listening there, when `held` and its name could be read.
+    pub by: String,
+    /// The OS's own words, for the report.
+    pub error: String,
+}
+
+/// How long a relay may run without anything on the internet answering it
+/// before the window calls it cut off and asks whether *it* can reach anything.
+/// Past two of the route probes' two-minute rounds, and past any DNS the
+/// machine asked in between - a relay that works hears back every few seconds.
+pub const CUT_OFF_AFTER: Duration = Duration::from_secs(4 * 60);
 
 /// A model answer, as the relay saw it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +157,20 @@ impl Report {
         self.age() > STALE_AFTER
     }
 
+    /// The relay has run for `CUT_OFF_AFTER` and nothing outside this machine
+    /// has answered it for as long. Only a warm-looping relay of gen 32 or
+    /// later publishes `reached_at`: an older one, or the Linux proxy (which
+    /// writes this file only to record a blocker), is never called cut off.
+    pub fn cut_off(&self) -> bool {
+        if self.started_at == 0 || self.version < 32 {
+            return false;
+        }
+        let now = now_unix();
+        let limit = CUT_OFF_AFTER.as_secs();
+        now.saturating_sub(self.started_at) >= limit
+            && now.saturating_sub(self.reached_at.max(self.started_at)) >= limit
+    }
+
     /// How much of the forced-substitution window is left. Only ever set with
     /// the loopback door down (D25's fallback, `resolvers::force_substitution`).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -148,6 +197,10 @@ impl Report {
             && self.loopback == other.loopback
             && self.tunnel == other.tunnel
             && self.vpn_exit == other.vpn_exit
+            && self.blockers == other.blockers
+            && self.reached_at == other.reached_at
+            && self.started_at == other.started_at
+            && self.exe == other.exe
     }
 }
 
@@ -186,6 +239,11 @@ fn update(change: impl FnOnce(&mut Report)) {
         let report = guard.get_or_insert_with(Report::default);
         change(report);
         report.at = now_unix();
+        if report.started_at == 0 {
+            // `CURRENT` starts empty in every process, so the first write is
+            // this relay's start.
+            report.started_at = report.at;
+        }
         report.clone()
     };
     // Outside the lock. Nothing here calls back into this module, but a file
@@ -204,8 +262,13 @@ fn update(change: impl FnOnce(&mut Report)) {
     // parse, and is indistinguishable from "the relay is not reporting" - so a
     // one-in-a-hundred-thousand read would put a wrong sentence on screen. A
     // rename is atomic on both platforms and costs nothing at this size.
+    // One temp name per write: the warm pass and a listener thread
+    // (`set_blocker`) can both be here at once, and two writers sharing one temp
+    // file could rename the other's half-written copy into place.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
+    tmp.push(format!(".{seq}.tmp"));
     let tmp = PathBuf::from(tmp);
     if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, &path).is_err() {
         std::fs::remove_file(&tmp).ok();
@@ -236,6 +299,28 @@ pub fn publish(now: Now<'_>) {
         r.vpn_exit = now.vpn_exit.to_string();
         r.routes = now.routes;
         r.version = crate::dns_forwarder::RELAY_VERSION;
+        r.reached_at = crate::net::last_reached();
+        if r.exe.is_empty() {
+            r.exe = std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+        }
+    });
+}
+
+/// Records what keeps `what` (`door` or `proxy`) from binding, or clears it.
+/// Written through at once rather than at the next warm pass.
+pub fn set_blocker(what: &str, blocker: Option<Blocker>) {
+    update(|r| {
+        r.blockers.retain(|b| b.what != what);
+        r.blockers.extend(blocker);
+        // The exception the window may have to ask for names this file, and a
+        // bind fails before the first warm pass would have written it.
+        if r.exe.is_empty() {
+            r.exe = std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+        }
     });
 }
 
@@ -294,6 +379,10 @@ pub struct View {
     pub refused_long: Option<crate::ls_log::Sighting>,
     /// The relay's record, or `None` when there is none or it has gone stale.
     pub relay: Option<Report>,
+    /// Whether this window reaches the internet, asked only while the relay is
+    /// cut off: the difference between "no internet" and "something on this
+    /// machine blocks the relay alone" (P53). `None` = not asked.
+    pub net_ok: Option<bool>,
 }
 
 /// Watcher → window.
@@ -332,6 +421,28 @@ const GAP_IDLE: Duration = Duration::from_secs(5 * 60);
 /// list — but none of them happens on a three-second scale.
 const RELIST_EVERY: Duration = Duration::from_secs(60);
 
+/// How often the window re-asks whether it reaches the internet, while the
+/// relay stays cut off.
+const NET_PROBE_EVERY: Duration = Duration::from_secs(2 * 60);
+
+/// How long the relay must look cut off, to this window, before it asks.
+const CUT_OFF_CONFIRM: Duration = Duration::from_secs(60);
+
+/// Whether this process can open a connection to the internet at all: the
+/// HTTPS port of three public resolvers, Yandex's first because it answers from
+/// inside Russia whatever else is filtered. Plain TCP, no data - the question is
+/// only whether a socket of *this* program gets out.
+fn reaches_internet() -> bool {
+    const TARGETS: [[u8; 4]; 3] = [[77, 88, 8, 8], [8, 8, 8, 8], [1, 1, 1, 1]];
+    TARGETS.iter().any(|ip| {
+        std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from((*ip, 443)),
+            Duration::from_secs(3),
+        )
+        .is_ok()
+    })
+}
+
 pub fn spawn_watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
     std::thread::Builder::new()
         .name("gate".to_string())
@@ -357,6 +468,10 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
     // `ops` takes a VPN measurement on its first snapshot, so the clock starts
     // now rather than at zero.
     let mut measured = Instant::now();
+    // This window's own reach, taken while the relay looks cut off, and since
+    // when it has looked so.
+    let mut net_ok: Option<(bool, Instant)> = None;
+    let mut cut_since: Option<Instant> = None;
 
     loop {
         std::thread::sleep(TICK);
@@ -408,7 +523,24 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
                 (ago <= ANSWER_RECENT).then_some(crate::ls_log::Sighting { ago, ..s })
             }),
             relay: read().filter(|r| !r.is_stale()),
+            net_ok: None,
         };
+        let mut view = view;
+        if view.relay.as_ref().is_some_and(Report::cut_off) {
+            // A minute of it first: a machine back from sleep reads as cut off
+            // until the relay's first answer lands a few seconds later, and a
+            // card about the antivirus for that would be a false alarm.
+            let since = *cut_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= CUT_OFF_CONFIRM
+                && net_ok.is_none_or(|(_, at)| at.elapsed() >= NET_PROBE_EVERY)
+            {
+                net_ok = Some((reaches_internet(), Instant::now()));
+            }
+            view.net_ok = net_ok.map(|(ok, _)| ok);
+        } else {
+            cut_since = None;
+            net_ok = None;
+        }
         let worth = worth_sending(&view, &shown);
         let fresh = view.seen.is_some_and(|s| s.ago <= FRESH);
 
@@ -449,7 +581,7 @@ fn worth_sending(fresh: &View, shown: &View) -> bool {
         (None, None) => false,
         _ => true,
     };
-    if relay_changed {
+    if relay_changed || fresh.net_ok != shown.net_ok {
         return true;
     }
     let newer = |a: Option<crate::ls_log::Sighting>, b: Option<crate::ls_log::Sighting>| match (a, b) {
@@ -482,6 +614,7 @@ mod tests {
             answered: None,
             refused_long: None,
             relay: None,
+            net_ok: None,
         };
         let older = View {
             seen: seen(123, 2),
@@ -552,6 +685,7 @@ mod tests {
             answered: None,
             refused_long: None,
             relay: Some(base),
+            net_ok: None,
         };
         assert!(!worth_sending(
             &View {
@@ -612,5 +746,24 @@ mod tests {
         };
         assert_eq!(over.forced_left(), None);
         assert_eq!(Report::default().forced_left(), None);
+    }
+
+    /// A relay nothing answers is cut off only once it has run long enough to
+    /// have heard back, and only if it is new enough to say when it did.
+    #[test]
+    fn a_relay_is_cut_off_only_after_minutes_of_silence() {
+        let now = now_unix();
+        let long = CUT_OFF_AFTER.as_secs() + 10;
+        let r = Report {
+            version: 32,
+            started_at: now - long,
+            reached_at: 0,
+            ..Report::default()
+        };
+        assert!(r.cut_off());
+        assert!(!Report { reached_at: now - 5, ..r.clone() }.cut_off());
+        assert!(!Report { started_at: now - 30, ..r.clone() }.cut_off());
+        assert!(!Report { version: 31, ..r.clone() }.cut_off());
+        assert!(!Report { started_at: 0, ..r }.cut_off());
     }
 }

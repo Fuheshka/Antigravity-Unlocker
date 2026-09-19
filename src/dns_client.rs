@@ -515,6 +515,7 @@ pub fn query_raw_via(
             _ => false,
         };
         if right_source && right_id {
+            crate::net::note_reached();
             return Ok(buf[..n].to_vec());
         }
         if Instant::now() >= deadline {

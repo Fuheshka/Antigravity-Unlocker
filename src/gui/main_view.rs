@@ -87,72 +87,10 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
 // The status card
 // ---------------------------------------------------------------------------
 
-/// How far *before* a refusal the relay's note may be stamped and still be an
-/// answer to it: the whole-second quantisation both stamps carry, and nothing
-/// more. A note stamped earlier is an answer to something else (I58).
-const EPISODE_SLACK: u64 = 3;
-
-/// Whether the relay's note answers a refusal stamped at `refusal_at`.
-fn answers(episode_at: u64, refusal_at: u64) -> bool {
-    episode_at.saturating_add(EPISODE_SLACK) >= refusal_at
-}
-
 /// Everything the verdict is made of, read off the window's own state.
 fn facts(app: &App) -> Option<status::Facts> {
     let s = app.status.as_ref()?;
-    let aged = |ago: Duration| ago + app.gate_at.elapsed();
-    // Newest over twelve hours, so an old refusal still outranks an older
-    // answer; counted over the last ten minutes, which is what "it keeps
-    // happening" means.
-    let refusal = app
-        .gate
-        .refused_long
-        .map(|x| (aged(x.ago), app.gate.seen.map_or(0, |s| s.count)));
-    let answer = app.gate.answered.map(|x| aged(x.ago));
-    // The relay's record is only worth anything while the relay runs: a record
-    // outlives its writer by up to `STALE_AFTER`, and "обход перехватил" about a
-    // dead service is the worst sentence this card could say (I58).
-    let relay = app.gate.relay.as_ref().filter(|_| s.relay_running);
-    let answered = refusal.and_then(|(ago, _)| {
-        if ago > crate::gate::RECENT {
-            return None;
-        }
-        let refusal_at = crate::gate::now_unix().saturating_sub(ago.as_secs());
-        relay
-            .and_then(|r| r.last_400.as_ref())
-            .filter(|e| answers(e.at, refusal_at))
-            .map(|e| status::Answered {
-                acted: e.acted.clone(),
-                bypassed: e.bypassed,
-            })
-    });
-    // The path of the last answer when the relay saw one recently - and then
-    // exactly that, empty included: an answer no tunnel of ours carried went
-    // around us, and naming the route we would have used instead would be a
-    // claim about traffic that never touched it. Otherwise the route in force.
-    let route = relay.and_then(|r| {
-        let recent_ok = r.last_ok.as_ref().filter(|ok| {
-            crate::gate::now_unix().saturating_sub(ok.at) <= crate::gate::ANSWER_RECENT.as_secs()
-        });
-        match recent_ok {
-            Some(ok) => (!ok.route.is_empty()).then(|| ok.route.clone()),
-            None => (!r.route.is_empty()).then(|| r.route.clone()),
-        }
-    });
-    Some(status::Facts {
-        admin: s.admin || !cfg!(target_os = "windows"),
-        installs_found: s.installs.iter().any(|r| r.path.is_some()),
-        patch_on: s.client_patch.is_on(),
-        bypass_on: s.dns.is_on(),
-        relay_running: s.relay_running,
-        relay_outdated: s.relay_outdated,
-        rules: s.rules || !cfg!(target_os = "windows"),
-        relay_reporting: relay.is_some(),
-        refusal,
-        answer,
-        answered,
-        route,
-    })
+    Some(status::Facts::read(s, &app.gate, app.gate_at.elapsed()))
 }
 
 fn status_card(app: &mut App, ui: &mut egui::Ui) {
@@ -249,13 +187,7 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
 
 fn antigravity_card(app: &mut App, ui: &mut egui::Ui) {
     widgets::card(ui, |ui| {
-        cap_row(
-            app,
-            ui,
-            Cap::ClientPatch,
-            "Вход в аккаунт из-под санкций",
-            "Снимает блокировку входа в Google-аккаунт из санкционного региона.",
-        );
+        cap_row(app, ui, Cap::ClientPatch);
 
         ui.add_space(10.0);
         ui.separator();
@@ -265,13 +197,7 @@ fn antigravity_card(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(8.0);
-        cap_row(
-            app,
-            ui,
-            Cap::Watchdog,
-            "Автопатч",
-            "Сам накладывает патч на найденный Antigravity — сразу после установки и после каждого обновления, которое его стирает.",
-        );
+        cap_row(app, ui, Cap::Watchdog);
 
         ui.add_space(10.0);
         ui.separator();
@@ -289,34 +215,16 @@ fn antigravity_card(app: &mut App, ui: &mut egui::Ui) {
 /// The master switch of the bypass. Derived, never stored: it is on when any
 /// part of the bypass is, which keeps one truth instead of two.
 fn bypass_master(app: &mut App, ui: &mut egui::Ui) {
-    let any_on = app
-        .status
-        .as_ref()
-        .map(|s| s.dns.is_on() || s.local_proxy.is_on() || s.builtin_exits.is_on())
-        .unwrap_or(false);
+    let any_on = app.status.as_ref().is_some_and(|s| s.bypass_on());
     let mut master = any_on;
     let busy = app.is_busy();
     let flipped = widgets::switch_row(ui, &mut master, !busy, |ui| {
-        ui.label(egui::RichText::new("Снять ошибку 400 в чате с ИИ").size(14.0));
-        widgets::hint(
-            ui,
-            "«User location is not supported». Сам находит рабочий путь до серверов Google \
-             и переключается, если путь перестал работать — с VPN и без.",
-        );
+        let (title, hint) = status::BYPASS_TEXT;
+        ui.label(egui::RichText::new(title).size(14.0));
+        widgets::hint(ui, hint);
     });
     if flipped {
-        // Order matters and it is not the same in both directions.
-        // ON: the relay has to be answering before the proxy variable may
-        // name it (I53) — the worker runs these in order, so DNS finishes
-        // first. OFF: the variable comes off *before* the listener it names
-        // goes away, or a sign-in that lands in between dials a dead port
-        // (G31).
-        let order = if master {
-            [Cap::Dns, Cap::LocalProxy, Cap::BuiltinExits]
-        } else {
-            [Cap::LocalProxy, Cap::BuiltinExits, Cap::Dns]
-        };
-        for cap in order {
+        for cap in crate::ops::bypass_order(master) {
             app.worker.send(Cmd::Set(cap, master));
         }
     }
@@ -426,57 +334,20 @@ fn advanced_card(app: &mut App, ui: &mut egui::Ui) {
         widgets::card(ui, |ui| {
             network_facts(app, ui);
 
-            cap_row(
-                app,
-                ui,
-                Cap::Dns,
-                "Обход через DNS",
-                "Служба на этом компьютере отвечает на имена двух серверов Google и держит их \
-                 разрешающимися через сервисы разблокировки. Без неё обход не работает.",
-            );
+            cap_row(app, ui, Cap::Dns);
             providers_list(app, ui);
 
             ui.add_space(10.0);
-            cap_row(
-                app,
-                ui,
-                Cap::LocalProxy,
-                "Локальный прокси",
-                "Соединения Antigravity с этими двумя серверами идут через посредника внутри \
-                 вашего компьютера: он выбирает путь, который реально работает, и переключается \
-                 сам. Содержимое не расшифровывается — посредник только передаёт байты.",
-            );
+            cap_row(app, ui, Cap::LocalProxy);
 
             ui.add_space(10.0);
-            cap_row(
-                app,
-                ui,
-                Cap::BuiltinExits,
-                "Встроенные выходы",
-                // Deliberately says what they are and never which they are: a
-                // free service that gets named publicly stops being free (I46).
-                "Запасной путь до серверов Google — через страну без ограничений.",
-            );
+            cap_row(app, ui, Cap::BuiltinExits);
 
             ui.add_space(10.0);
-            cap_row(
-                app,
-                ui,
-                Cap::VerifyTls,
-                "Сверять TLS",
-                "Адрес от сервиса разблокировки принимается, только если предъявил настоящий \
-                 сертификат Google. Выключать без причины не стоит.",
-            );
+            cap_row(app, ui, Cap::VerifyTls);
 
             ui.add_space(10.0);
-            cap_row(
-                app,
-                ui,
-                Cap::OwnProxy,
-                "Свой HTTP-прокси",
-                "Ваш собственный прокси в разрешённой стране — он всегда пробуется первым. \
-                 Google может не принять прокси из дата-центра даже там.",
-            );
+            cap_row(app, ui, Cap::OwnProxy);
             own_proxy_field(app, ui);
         });
     });
@@ -527,18 +398,6 @@ fn network_facts(app: &App, ui: &mut egui::Ui) {
 /// (`dns-ai.ru` → `DNS-AI.RU`); everything else just gets its first letter.
 /// Presentation only: the stored name is what every switch, the deny-list and
 /// the saved order are keyed by, and it never changes.
-fn display_name(name: &str) -> String {
-    let lead: String = name.chars().take_while(|c| c.is_alphabetic()).collect();
-    if lead.eq_ignore_ascii_case("dns") {
-        return name.to_uppercase();
-    }
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
-}
-
 fn providers_list(app: &mut App, ui: &mut egui::Ui) {
     // Copied out before anything is drawn: the rows below need `&mut app` for
     // the rotation switch, and holding a borrow of `app.status` across that is
@@ -605,7 +464,7 @@ fn providers_list(app: &mut App, ui: &mut egui::Ui) {
                     // Without rotation only the first enabled one is ever asked,
                     // so the rest are drawn as what they are: on, but not in use.
                     let idle = !rotating && p.enabled && first_on != Some(i);
-                    let text = egui::RichText::new(display_name(&p.name)).size(13.0);
+                    let text = egui::RichText::new(status::provider_name(&p.name)).size(13.0);
                     ui.label(if idle { text.color(theme::MUTED) } else { text });
                     if idle {
                         widgets::hint(ui, "— не используется");
@@ -632,15 +491,7 @@ fn providers_list(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.separator();
         ui.add_space(4.0);
-        cap_row(
-            app,
-            ui,
-            Cap::DnsRotation,
-            "Ротация между серверами",
-            "Включено: запрос идёт ко всем включённым серверам, ответ сверяется \
-             с эталонным резолвером. Выключено: используется только первый \
-             включённый в списке, запасных не будет.",
-        );
+        cap_row(app, ui, Cap::DnsRotation);
     });
 
     if let Some((name, on)) = flip {
@@ -698,7 +549,8 @@ fn own_proxy_field(app: &mut App, ui: &mut egui::Ui) {
 
 /// One switch with its title, description and — when the system disagrees with
 /// the switch — the reason.
-fn cap_row(app: &mut App, ui: &mut egui::Ui, cap: Cap, title: &str, hint: &str) {
+fn cap_row(app: &mut App, ui: &mut egui::Ui, cap: Cap) {
+    let (title, hint) = status::switch_text(cap);
     let state = app
         .status
         .as_ref()
@@ -946,32 +798,5 @@ pub fn path_dialog(app: &mut App, ctx: &egui::Context) {
         app.path_dialog = Some(text);
     } else {
         app.path_dialog_error = None;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::display_name;
-
-    #[test]
-    fn an_acronym_stays_an_acronym_and_everything_else_gets_one_capital() {
-        assert_eq!(display_name("dns-ai.ru"), "DNS-AI.RU");
-        assert_eq!(display_name("comss.one"), "Comss.one");
-        assert_eq!(display_name("geohide.ru"), "Geohide.ru");
-        // Must not panic on a name the pool could grow later.
-        assert_eq!(display_name(""), "");
-        assert_eq!(display_name("1.1.1.1"), "1.1.1.1");
-    }
-
-    #[test]
-    fn only_a_note_written_after_the_refusal_answers_it() {
-        use super::answers;
-        assert!(answers(1_000, 1_000));
-        assert!(answers(1_015, 1_000));
-        assert!(answers(998, 1_000));
-        assert!(!answers(940, 1_000));
-        assert!(!answers(0, 1_000));
-        assert!(answers(u64::MAX, 1_000));
-        assert!(!answers(0, u64::MAX));
     }
 }

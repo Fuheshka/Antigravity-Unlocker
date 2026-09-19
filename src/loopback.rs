@@ -81,14 +81,43 @@ pub fn active() -> bool {
     BOUND.load(Ordering::Relaxed) && crate::proxy::bound() && crate::settings::local_proxy_wanted()
 }
 
-/// Binds every listener, then serves them until the process ends. Returns only
-/// when a listener could not be bound.
+/// Binds every listener, then serves them until the process ends. While they
+/// cannot be bound it says why (`gate::set_blocker`, the window turns it into
+/// what to do - P53) and tries again every `proxy::REBIND_EVERY`, so the door
+/// opens by itself once the user has closed the program on `:443` or added the
+/// antivirus exception. Returns only if the listeners stop.
 pub fn run() -> Result<(), String> {
-    let mut listeners = Vec::with_capacity(HOSTS.len());
-    for (host, ip) in HOSTS {
-        let listener = bind(ip)?;
-        listeners.push((host, listener));
-    }
+    let mut said: Option<crate::gate::Blocker> = None;
+    let listeners = loop {
+        match bind_all() {
+            Ok(listeners) => {
+                if said.is_some() {
+                    crate::dns_forwarder::log_proxy("локальные адреса гейт-хостов заняты");
+                    crate::gate::set_blocker("door", None);
+                }
+                break listeners;
+            }
+            Err(blocker) => {
+                if said.as_ref() != Some(&blocker) {
+                    crate::dns_forwarder::log_proxy(&format!(
+                        "локальные адреса гейт-хостов не заняты: не занять {}: {} ({}{})",
+                        blocker.addr,
+                        blocker.error,
+                        blocker.cause,
+                        if blocker.by.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", blocker.by)
+                        }
+                    ));
+                    said = Some(blocker.clone());
+                }
+                // Every try, so the record never goes stale under the card.
+                crate::gate::set_blocker("door", Some(blocker));
+                thread::sleep(crate::proxy::REBIND_EVERY);
+            }
+        }
+    };
     BOUND.store(true, Ordering::Relaxed);
     let mut handles = Vec::new();
     for (host, listener) in listeners {
@@ -106,22 +135,33 @@ pub fn run() -> Result<(), String> {
     Err("слушатели остановились".to_string())
 }
 
+/// Every listener or none: a door open for one gate host and shut for the other
+/// would send half of Antigravity's calls somewhere else.
+fn bind_all() -> Result<Vec<(&'static str, TcpListener)>, crate::gate::Blocker> {
+    let mut listeners = Vec::with_capacity(HOSTS.len());
+    for (host, ip) in HOSTS {
+        listeners.push((host, bind(ip)?));
+    }
+    Ok(listeners)
+}
+
 /// A few tries, because a port held for a moment at logon frees itself.
-fn bind(ip: Ipv4Addr) -> Result<TcpListener, String> {
+fn bind(ip: Ipv4Addr) -> Result<TcpListener, crate::gate::Blocker> {
     let addr = SocketAddr::from((ip, PORT));
-    let mut last = String::new();
+    let mut last = None;
     for attempt in 0..3 {
         match TcpListener::bind(addr) {
             Ok(l) => return Ok(l),
             Err(e) => {
-                last = e.to_string();
+                last = Some(e);
                 if attempt < 2 {
                     thread::sleep(Duration::from_secs(2));
                 }
             }
         }
     }
-    Err(format!("не занять {}: {}", addr, last))
+    let err = last.expect("three attempts were made");
+    Err(crate::portcheck::diagnose(addr, &err).blocker("door", addr, &err))
 }
 
 /// Longest the local proxy may take to pick a route and say `200`. Its routes

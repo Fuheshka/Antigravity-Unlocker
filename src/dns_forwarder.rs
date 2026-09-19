@@ -115,7 +115,13 @@ pub const LISTEN_PORT: u16 = 53;
 ///     on the user having patched once (D27), re-scanning for installs every
 ///     10 s instead of 5 min, the user's own paths included. An older relay
 ///     leaves a newly installed Antigravity unpatched with auto-patch on.
-pub const RELAY_VERSION: u32 = 31;
+/// 32 = says what keeps its listeners down (a program holding the port, a
+///     port Windows reserved, security software refusing it - `portcheck`),
+///     retries them every minute, moves the local proxy off a port it cannot
+///     have (P26), and reports when nothing on the internet answers it
+///     (`gate::Report::{blockers, reached_at, started_at, exe}`, P53). An older
+///     relay leaves a user with `os error 10013` in its log and a 400 on screen.
+pub const RELAY_VERSION: u32 = 32;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -263,7 +269,13 @@ fn log(line: &str) {
         fs::remove_file(&path).ok();
     }
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-        writeln!(f, "{} {}", stamp(), line).ok();
+        // One write per line. `writeln!` with arguments issues a write per
+        // piece, and an append is atomic only per write, so two threads (or two
+        // processes) logging at once interleaved into lines like
+        // «16:48:2616:48:26 PASSTHROUGH … PASSTHROUGH …» - seen in reports from
+        // both platforms.
+        let entry = format!("{} {}\n", stamp(), line);
+        f.write_all(entry.as_bytes()).ok();
     }
 }
 
@@ -832,13 +844,26 @@ pub fn run() -> Result<(), String> {
             Ok(false) => {}
             Err(e) => log_proxy(&format!("прежняя HTTPS_PROXY не снята: {}", e)),
         }
-        if !proxy::wait_for_listener(PROXY_START_BUDGET) {
-            log_proxy(&format!(
-                "{} не выставлена: локальный прокси не поднялся",
-                var
-            ));
-            return;
-        }
+        // The port that answered is the one named: the proxy may have moved
+        // while this waited (P26), and only our own listener counts - not a
+        // program of someone else's answering on the default port.
+        let port = match proxy::wait_for_our_listener(PROXY_START_BUDGET) {
+            Some(port) => port,
+            None => {
+                log_proxy(&format!(
+                    "{} не выставлена: локальный прокси не поднялся",
+                    var
+                ));
+                // It keeps trying (`proxy::run`, P53): an antivirus exception
+                // or a closed program frees the port without a restart, and the
+                // variable follows the listener up - still only once it answers.
+                loop {
+                    if let Some(port) = proxy::wait_for_our_listener(proxy::REBIND_EVERY) {
+                        break port;
+                    }
+                }
+            }
+        };
         // The window's switch, honoured here as well as there. Without it a user
         // who turned the local proxy off got it back at the next relay start -
         // the relay wrote the variable unconditionally - and the switch looked
@@ -848,7 +873,7 @@ pub fn run() -> Result<(), String> {
             log_proxy(&format!("{} не выставлена: выключена в настройках", var));
             return;
         }
-        match crate::endpoint::ensure_proxy_env(&proxy::proxy_url()) {
+        match crate::endpoint::ensure_proxy_env(&proxy::url_at(port)) {
             Ok(crate::endpoint::Outcome::Applied) => {
                 log_proxy(&format!("{} снова указывает на локальный прокси", var))
             }

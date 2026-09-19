@@ -557,10 +557,25 @@ mod unix_impl {
         let exe = installed_exe();
         fs::create_dir_all(&dir).map_err(|e| format!("не создать {}: {}", dir.display(), e))?;
         // Copy self so the unit survives the download folder being moved/removed.
-        if src != exe {
-            fs::copy(&src, &exe).map_err(|e| format!("копия exe: {}", e))?;
+        //
+        // Never *over* the installed copy: Linux will not open a file a process
+        // is executing for writing - ETXTBSY, «Text file busy (os error 26)» -
+        // and that is exactly the state every upgrade finds, the previous
+        // version's unit being up. A new file beside it renamed over the name is
+        // allowed: the running process keeps the old inode, the name now points at
+        // the new one, and the restart below starts it. Skipped when the bytes are
+        // already the same, so switching the bypass on again does not cut the
+        // tunnels a running proxy is carrying.
+        let replaced = src != exe && !same_contents(&src, &exe);
+        if replaced {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&exe, fs::Permissions::from_mode(0o755));
+            let fresh = dir.join(".ag_proxy.new");
+            fs::copy(&src, &fresh).map_err(|e| format!("копия exe: {}", e))?;
+            let _ = fs::set_permissions(&fresh, fs::Permissions::from_mode(0o755));
+            fs::rename(&fresh, &exe).map_err(|e| {
+                let _ = fs::remove_file(&fresh);
+                format!("замена exe: {}", e)
+            })?;
         }
 
         let up = unit_path();
@@ -583,10 +598,30 @@ mod unix_impl {
         fs::write(&up, unit).map_err(|e| format!("не записать юнит: {}", e))?;
 
         systemctl(&["daemon-reload"]);
-        if systemctl(&["enable", "--now", UNIT_NAME]) {
-            Ok(())
-        } else {
-            Err("не удалось запустить systemd-юнит (systemctl --user)".to_string())
+        if !systemctl(&["enable", "--now", UNIT_NAME]) {
+            return Err("не удалось запустить systemd-юнит (systemctl --user)".to_string());
+        }
+        // `enable --now` leaves a unit that is already running alone, so a copy
+        // just replaced would sit unused until the next login.
+        if replaced && !systemctl(&["restart", UNIT_NAME]) {
+            return Err(
+                "новая версия прокси записана, но служба не перезапустилась (systemctl --user)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether two files hold the same bytes. Unreadable counts as different, so
+    /// the copy is attempted and says what went wrong.
+    fn same_contents(a: &std::path::Path, b: &std::path::Path) -> bool {
+        match (fs::metadata(a), fs::metadata(b)) {
+            (Ok(ma), Ok(mb)) if ma.len() == mb.len() => {}
+            _ => return false,
+        }
+        match (fs::read(a), fs::read(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
         }
     }
 

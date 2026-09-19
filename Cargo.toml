@@ -17,12 +17,6 @@ webpki-roots = "1"
 # Decrypts the relay credential baked in by build.rs (owner build only; the
 # private src/relay.rs is the only user).
 aes-gcm = "0.10"
-# The GUI. Immediate mode, pure Rust, one static exe with no runtime to install
-# (no WebView2, no GTK) - that is what makes it drop onto an arbitrary Windows
-# 10/11 machine and still start. eframe 0.36 defaults to the wgpu backend
-# (DirectX 12 on Windows); `glow` is added on top so a machine where wgpu finds
-# no usable adapter can still fall back to plain OpenGL. See gui::run.
-eframe = { version = "0.36", features = ["glow"] }
 # Reading the clipboard (right-click on the licence field pastes into it). Not a
 # new dependency in any real sense: eframe's own clipboard support is arboard, so
 # the crate is already linked in - this only asks it a question egui does not
@@ -34,6 +28,29 @@ arboard = { version = "3.6", default-features = false }
 # connections to the ISP link while a VPN holds the default route (`net.rs`),
 # the same way every UDP resolver query already is (I4). Small, no runtime.
 socket2 = "0.6"
+# The terminal UI (`--tui`; on Linux also any start with no graphical session,
+# e.g. a server over SSH; on Windows also the fallback when no renderer opens a
+# window). Only the crossterm backend - no widgets beyond the core set.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+
+# The GUI. Immediate mode, pure Rust, one static exe with no runtime to install
+# (no WebView2, no GTK) - that is what makes it drop onto an arbitrary Windows
+# 10/11 machine and still start. `glow` (plain OpenGL) is compiled in beside
+# wgpu as the last renderer in the chain. See gui/renderer.rs.
+#
+# On Windows wgpu is built with **DirectX 12 only**. Its default set also has
+# Vulkan and GLES, and wgpu enumerates every compiled-in backend before it picks
+# one - so a machine with a broken Vulkan driver or a stale implicit layer (an
+# uninstalled overlay's registry entry) crashed inside vulkan-1.dll before a
+# window ever opened, whichever adapter would have been chosen. D3D12 and its
+# software rasteriser WARP ship with every Windows 10, so nothing else is needed.
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "links", "wgpu_no_default_features", "glow"] }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "dx12"] }
+
+[target.'cfg(not(windows))'.dependencies]
+# Linux has no DirectX: wgpu's default Vulkan + GL, then glow.
+eframe = { version = "0.36", features = ["glow"] }
 
 [build-dependencies]
 winres = "0.1"

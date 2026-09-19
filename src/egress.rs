@@ -210,7 +210,7 @@ pub fn read() -> Reading {
            '{{0}}|{{1}}|{{2}}|{{3}}|{{4}}' -f $p,$t,$l,$rp,$rt }}",
         glob = CLIENT_PROCESS_GLOB,
         relay = relay_process_name(),
-        port = crate::proxy::LISTEN_PORT,
+        port = crate::proxy::port(),
         listen = crate::proxy::LISTEN_IP,
     );
 
