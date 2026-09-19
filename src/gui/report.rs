@@ -79,15 +79,9 @@ pub fn build(status: Option<&Status>, view: &View) -> String {
     let log = std::fs::read_to_string(crate::dns_forwarder::log_path()).unwrap_or_default();
     let lines: Vec<&str> = log.lines().collect();
     let from = lines.len().saturating_sub(LOG_LINES);
-    // The relay logs the user's own proxy as `user:***@host:port`: their login
-    // and their server, on its way into a public chat. Masked here, once.
     let own = crate::upstream::configured().map(|u| u.display());
     for line in &lines[from..] {
-        let line = match &own {
-            Some(own) if !own.is_empty() => line.replace(own.as_str(), "<ваш прокси>"),
-            _ => line.to_string(),
-        };
-        let _ = writeln!(out, "{line}");
+        let _ = writeln!(out, "{}", mask_addresses(line, own.as_deref()));
     }
     if lines.is_empty() {
         let _ = writeln!(out, "(пусто)");
@@ -235,6 +229,72 @@ fn relay_part(out: &mut String, r: &Report) {
     }
 }
 
+/// One line of the relay's log with the user's own proxy, and any route's exit
+/// address, taken out.
+///
+/// Since `2.15.0_1` the relay no longer writes that address at all, but a log
+/// written by an older build is still in the file after the upgrade, and it did:
+/// `свой прокси user:***@host:port: <why>` - their login and their server, on
+/// the way into a public chat. Matching only the proxy configured *now* missed
+/// every line from one they had before or had since removed, so this goes by
+/// shape: any `…:***@…` credential token, and the address right after
+/// «свой прокси», whatever it is. The configured value is masked too, for any
+/// line that names it some other way.
+fn mask_addresses(line: &str, configured: Option<&str>) -> String {
+    const MASK: &str = "<ваш прокси>";
+    const LABEL: &str = "свой прокси ";
+    let mut out: String = line
+        .split(' ')
+        .map(|token| {
+            if token.contains(":***@") {
+                // Keep the colon that separated the address from the reason.
+                if token.ends_with(':') {
+                    format!("{MASK}:")
+                } else {
+                    MASK.to_string()
+                }
+            } else {
+                token.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    // `свой прокси host:port: why` from before the credential form existed: an
+    // address token is the one that still has a colon inside it (`host:port`).
+    if let Some(at) = out.find(LABEL) {
+        let rest = &out[at + LABEL.len()..];
+        let token = rest.split(' ').next().unwrap_or("");
+        let bare = token.strip_suffix(':').unwrap_or(token);
+        if bare.contains(':') && bare != MASK {
+            let masked = if token.ends_with(':') {
+                format!("{MASK}:")
+            } else {
+                MASK.to_string()
+            };
+            out = format!(
+                "{}{}{}",
+                &out[..at + LABEL.len()],
+                masked,
+                &rest[token.len()..]
+            );
+        }
+    }
+    // Older builds also named a route's exit address when it moved: for the
+    // user's own proxy that is their server, for a built-in exit usually the
+    // exit itself (I46). The country after it stays - it is what the line says.
+    for phrase in ["выходит через ", "сменил выход на "] {
+        if let Some(at) = out.find(phrase) {
+            let start = at + phrase.len();
+            let len = out[start..].find(' ').unwrap_or(out.len() - start);
+            out.replace_range(start..start + len, "<адрес>");
+        }
+    }
+    match configured {
+        Some(own) if !own.is_empty() => out.replace(own, MASK),
+        _ => out,
+    }
+}
+
 fn non_empty(s: &str) -> &str {
     if s.is_empty() {
         "—"
@@ -255,5 +315,72 @@ mod tests {
         let text = super::build(None, &crate::gate::View::default());
         println!("{text}");
         assert!(text.contains("отчёт"));
+    }
+
+    use super::mask_addresses as mask;
+
+    /// A line an older relay wrote about a proxy the user has since changed
+    /// keeps nothing of it: not the login, not the server.
+    #[test]
+    fn an_old_credential_line_is_masked_whatever_is_configured_now() {
+        let line = "12:00:01 proxy        свой прокси ivan:***@my.server.example:3128: недоступен: время вышло";
+        for now in [None, Some("other:***@elsewhere.example:8080")] {
+            let got = mask(line, now);
+            assert!(
+                !got.contains("ivan") && !got.contains("my.server.example"),
+                "{got}"
+            );
+            assert!(
+                got.contains("свой прокси <ваш прокси>: недоступен: время вышло"),
+                "{got}"
+            );
+        }
+    }
+
+    /// The same from before credentials were masked in the display: a bare
+    /// `host:port` after the label.
+    #[test]
+    fn an_old_bare_address_line_is_masked() {
+        let got = mask(
+            "12:00:01 proxy        свой прокси 10.0.0.5:1080: прокси закрыл соединение",
+            None,
+        );
+        assert_eq!(
+            got,
+            "12:00:01 proxy        свой прокси <ваш прокси>: прокси закрыл соединение"
+        );
+    }
+
+    /// Lines about the route by name stay readable: nothing there is an address.
+    #[test]
+    fn route_lines_are_left_alone() {
+        for line in [
+            "12:00:01 proxy        свой прокси -> daily-cloudcode-pa.googleapis.com",
+            "12:00:01 proxy        свой прокси: недоступен: время вышло",
+            "12:00:01 proxy        маршрут гейт-хостов: свой прокси (378 мс), было напрямую (325 мс)",
+            "12:00:01 proxy        встроенный выход #1 не отвечает: недоступен: время вышло",
+        ] {
+            assert_eq!(mask(line, None), line);
+        }
+    }
+
+    /// An older relay's exit-change lines keep the country, lose the address.
+    #[test]
+    fn an_old_exit_address_is_masked_and_the_country_kept() {
+        assert_eq!(
+            mask("12:00:01 proxy        свой прокси выходит через 203.0.113.9 (RU) — это заблокированный регион", None),
+            "12:00:01 proxy        свой прокси выходит через <адрес> (RU) — это заблокированный регион"
+        );
+        assert_eq!(
+            mask("12:00:01 proxy        встроенный выход #1 сменил выход на 203.0.113.9 (NL) — снова используем", None),
+            "12:00:01 proxy        встроенный выход #1 сменил выход на <адрес> (NL) — снова используем"
+        );
+    }
+
+    /// The proxy configured now is masked wherever it appears.
+    #[test]
+    fn the_configured_proxy_is_masked_anywhere() {
+        let got = mask("что-то про 127.0.0.1:1371 и дальше", Some("127.0.0.1:1371"));
+        assert_eq!(got, "что-то про <ваш прокси> и дальше");
     }
 }

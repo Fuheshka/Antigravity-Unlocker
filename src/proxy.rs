@@ -314,7 +314,10 @@ fn try_own_proxy(mut client: TcpStream, host: &str, port: u16) -> Result<(), Tcp
     let upstream_sock = match upstream::open(&up, host, port, upstream::LIVE_OPEN_BUDGET) {
         Ok(sock) => sock,
         Err(why) => {
-            crate::dns_forwarder::log_proxy(&format!("свой прокси {}: {}", up.display(), why));
+            // The route's name, never its address: this log goes into the report
+            // users paste into a public chat, and the address carries their login
+            // and their server. The window shows which proxy it is.
+            crate::dns_forwarder::log_proxy(&format!("свой прокси: {}", why));
             upstream::OWN.health.note(false);
             return Err(client);
         }

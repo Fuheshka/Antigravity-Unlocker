@@ -116,14 +116,17 @@ impl Route {
             return;
         }
         *pinned = Some(ip.to_string());
+        // The country, not the address: for the user's own proxy the exit is
+        // their server, and for a built-in exit it is usually the exit itself -
+        // neither belongs in a log that is pasted into a public chat.
         crate::dns_forwarder::log_proxy(&format!(
-            "{} выходит через {} ({}) — это заблокированный регион, маршрут отключён до смены выхода",
-            self.label, ip, loc
+            "{} выходит в {} — это заблокированный регион, маршрут отключён до смены выхода",
+            self.label, loc
         ));
     }
 
     /// Releases the pin, because the exit moved somewhere usable.
-    fn note_usable_exit(&self, ip: &str, loc: &str) {
+    fn note_usable_exit(&self, _ip: &str, loc: &str) {
         let Ok(mut pinned) = self.bad_exit.lock() else {
             return;
         };
@@ -132,8 +135,8 @@ impl Route {
         }
         *pinned = None;
         crate::dns_forwarder::log_proxy(&format!(
-            "{} сменил выход на {} ({}) — снова используем",
-            self.label, ip, loc
+            "{} теперь выходит в {} — снова используем",
+            self.label, loc
         ));
     }
 
