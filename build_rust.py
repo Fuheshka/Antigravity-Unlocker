@@ -1,5 +1,7 @@
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -84,6 +86,378 @@ def record_canary(version, token, exe_path):
     return ledger
 
 
+# Build caches.
+#
+# The release profile is the slow part - fat LTO over ~300 crates into a single
+# codegen unit - and this script used to end every run with `cargo clean`, so
+# every build started from nothing. The caches are kept now, and pruned so they
+# cannot grow: whatever the next build can reuse stays, whatever it cannot goes.
+#
+# A release cache - target\release for Windows, LINUX_CACHE for the Linux build -
+# is pruned right after a build that SUCCEEDED, down to exactly the units that
+# build used. Liveness is read, not guessed: timestamps cannot say it, because cargo
+# touches nothing it finds fresh. cargo's JSON messages can - they report every
+# unit the build used, fresh or rebuilt, and name its files, which carry the same
+# 16-hex unit hash as the unit's build/ and .fingerprint/ directories. That naming
+# is cargo's internals rather than a promise, so it is checked on every run: if
+# any unit the build just used has no .fingerprint directory under its hash,
+# nothing is deleted. A cache that stops shrinking is a nuisance; one pruned wrong
+# makes every next build cold again, which is the thing this exists to prevent.
+# A failed or interrupted build prunes nothing - half a build proves nothing about
+# what is dead.
+CARGO_JSON = "--message-format=json-render-diagnostics"
+
+# `libregex-<hash>.rlib`, `build/regex-<hash>/`, `.fingerprint/regex-<hash>/`.
+_UNIT_HASH = re.compile(r"-([0-9a-f]{16})(?=\.|$)")
+
+# The rest of target\ belongs to cargo test, cargo check and rust-analyzer; a unit
+# none of them has used for this long is deleted (prune_dev_cache).
+DEV_CACHE_KEEP_DAYS = 14
+
+
+def _unit_hash(name):
+    found = _UNIT_HASH.findall(name)
+    return found[-1] if found else None
+
+
+def _package_name(package_id):
+    """`path+file:///D:/x/Unlocker#ag_unlocker@2.13.0` -> `ag_unlocker`. The spec
+    leaves the name out when it matches the directory (`.../ag_unlocker#2.13.0`)."""
+    url, _, fragment = package_id.partition("#")
+    if "@" in fragment:
+        return fragment.split("@", 1)[0]
+    return url.rstrip("/").rsplit("/", 1)[-1]
+
+
+class BuildReport:
+    """What cargo's JSON messages say about one build: the units it used, fresh or
+    rebuilt, per profile directory, and where it put the executables."""
+
+    def __init__(self, lines):
+        self.finished = False       # cargo's own build-finished {"success": true}
+        self.live = {}              # profile dir -> hashes of the units used there
+        self.executables = {}       # bin target name -> the uplifted executable
+        self.own_packages = set()   # this repo's packages...
+        self.own_stems = set()      # ...and their targets' file stems
+        for line in lines:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            reason = msg.get("reason")
+            if reason == "build-finished":
+                self.finished = bool(msg.get("success"))
+            elif reason == "compiler-artifact":
+                if str(msg.get("package_id", "")).startswith("path+"):
+                    self.own_packages.add(_package_name(msg["package_id"]))
+                    self.own_stems.add(msg["target"]["name"].replace("-", "_"))
+                if msg.get("executable"):
+                    self.executables[msg["target"]["name"]] = msg["executable"]
+                for path in msg.get("filenames") or []:
+                    self._note(path)
+            elif reason == "build-script-executed" and msg.get("out_dir"):
+                self._note(msg["out_dir"])
+
+    def _note(self, path):
+        # <profile>/deps/<file>, <profile>/build/<pkg>-<hash>/<file>, or .../out.
+        # The executable uplifted beside deps/ carries no hash and is not noted.
+        parts = re.split(r"[\\/]", path)
+        n = len(parts)
+        for i in (n - 2, n - 3):
+            if i > 0 and (parts[i] == "deps" and i == n - 2 or parts[i] == "build"):
+                unit = _unit_hash(parts[i + 1])
+                if unit:
+                    profile = os.path.normpath(os.sep.join(parts[:i]))
+                    self.live.setdefault(profile, set()).add(unit)
+                return
+
+
+def cargo_build(args, env=None):
+    """check_call() for a cargo build, plus its JSON messages: progress and
+    diagnostics still render on the console, the messages are read off stdout."""
+    proc = subprocess.Popen(args + [CARGO_JSON], stdout=subprocess.PIPE, env=env,
+                            text=True, encoding="utf-8", errors="replace")
+    report = BuildReport(proc.stdout)
+    if proc.wait() != 0:
+        raise subprocess.CalledProcessError(proc.returncode, args)
+    return report
+
+
+def _entries(path):
+    try:
+        return list(os.scandir(path))
+    except OSError:
+        return []
+
+
+def _tree_size(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _remove(path):
+    """Deletes a file or a whole tree; returns the bytes that went. Whatever is
+    held open by some process stays, and the next prune tries it again."""
+    if os.path.isdir(path) and not os.path.islink(path):
+        before = _tree_size(path)
+        shutil.rmtree(path, ignore_errors=True)
+        return before - (_tree_size(path) if os.path.exists(path) else 0)
+    try:
+        size = os.lstat(path).st_size
+        os.remove(path)
+        return size
+    except OSError:
+        return 0
+
+
+def _mb(size):
+    return ("%.1f МБ" if size < 10 * 1048576 else "%.0f МБ") % (size / 1048576)
+
+
+def _remove_units(profile, units):
+    """Deletes these units from one profile directory: their .fingerprint/ and
+    build/ directories and every file in deps/ that carries their hash."""
+    freed = 0
+    for sub in (".fingerprint", "build", "deps"):
+        for entry in _entries(os.path.join(profile, sub)):
+            if _unit_hash(entry.name) in units:
+                freed += _remove(entry.path)
+    return freed
+
+
+def prune_release_cache(target_dir, report, whole_dir):
+    """Leaves in a release cache exactly the units the build in `report` used.
+    `whole_dir`: the directory holds nothing but these builds, so a profile or a
+    target triple the build did not touch goes too. Returns (bytes freed, bytes
+    kept), or a string saying why nothing was deleted."""
+    if not report.finished:
+        return "cargo не подтвердил, что сборка завершилась"
+    root = os.path.normcase(os.path.abspath(target_dir))
+    profiles = {}
+    for profile, units in report.live.items():
+        path = os.path.abspath(profile)
+        try:
+            inside = (os.path.commonpath([os.path.normcase(path), root]) == root
+                      and os.path.normcase(path) != root)
+        except ValueError:
+            inside = False
+        fingerprints = {_unit_hash(e.name) for e in _entries(os.path.join(path, ".fingerprint"))}
+        if not inside or not units <= fingerprints:
+            return "раскладка кэша не совпала с тем, что сообщил cargo"
+        profiles[path] = set(units)
+    if not profiles:
+        return "cargo не сообщил ни одного модуля"
+
+    freed = 0
+    for profile, live in profiles.items():
+        # Our own executable's unit is in no message: its report names only the
+        # copy uplifted beside deps/. Where the file in deps/ carries a hash (not
+        # on MSVC), it is that same file - cargo hardlinks the two - which is how
+        # it is told apart from a previous generation's. If no file matches, every
+        # file named after our own targets stays.
+        own = set()
+        for exe in report.executables.values():
+            if os.path.normcase(os.path.dirname(os.path.abspath(exe))) == os.path.normcase(profile):
+                try:
+                    st = os.stat(exe)
+                    own.add((st.st_dev, st.st_ino))
+                except OSError:
+                    pass
+        ours, matched = set(), False
+        for entry in _entries(os.path.join(profile, "deps")):
+            unit = _unit_hash(entry.name)
+            stem = entry.name.split(".", 1)[0]
+            if unit:
+                stem = stem[:-len(unit) - 1]
+            if stem.startswith("lib") and stem[3:] in report.own_stems:
+                stem = stem[3:]
+            if stem not in report.own_stems:
+                continue
+            try:
+                st = os.stat(entry.path)
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) in own:
+                matched = True
+                if unit:
+                    live.add(unit)
+            elif unit:
+                ours.add(unit)
+        if not matched:
+            live |= ours
+
+        dead = set()
+        for sub in (".fingerprint", "build", "deps"):
+            for entry in _entries(os.path.join(profile, sub)):
+                unit = _unit_hash(entry.name)
+                if not unit or unit in live:
+                    continue
+                # Our executable's fingerprint has a hash no message names (on
+                # MSVC not even its file in deps/ has one). A few KB; kept.
+                if sub == ".fingerprint" and entry.name[:-len(unit) - 1] in report.own_packages:
+                    continue
+                dead.add(unit)
+        freed += _remove_units(profile, dead)
+
+    if not whole_dir:
+        return freed, sum(_tree_size(p) for p in profiles)
+    # Whole directories none of this build's units live in: another profile or
+    # target triple (the native Linux fallback's layout after a zigbuild, or the
+    # other way round).
+    kept_profiles = {os.path.normcase(p) for p in profiles}
+    ancestors = {root}
+    for profile in kept_profiles:
+        # Every profile was checked to lie inside root, so this walks up the
+        # directories between the two and stops at root.
+        parent = os.path.dirname(profile)
+        while parent != root and len(parent) > len(root):
+            ancestors.add(parent)
+            parent = os.path.dirname(parent)
+    for directory in ancestors:
+        for entry in _entries(directory):
+            path = os.path.normcase(entry.path)
+            if (entry.is_dir(follow_symlinks=False)
+                    and path not in kept_profiles and path not in ancestors):
+                freed += _remove(entry.path)
+    return freed, _tree_size(target_dir)
+
+
+def _stat_times(path):
+    # os.stat, not the directory listing's copy of the times: NTFS updates the
+    # access time kept in a directory's index lazily.
+    try:
+        st = os.stat(path)
+    except OSError:
+        return 0
+    return max(st.st_atime, st.st_mtime)
+
+
+def _last_use(path, depth):
+    """Latest access or modification time among the files `depth` levels into
+    `path`."""
+    latest = 0
+    for entry in _entries(path):
+        if entry.is_dir(follow_symlinks=False):
+            if depth > 1:
+                latest = max(latest, _last_use(entry.path, depth - 1))
+        else:
+            latest = max(latest, _stat_times(entry.path))
+    return latest
+
+
+def _unit_last_use(unit_dir):
+    """When cargo last looked at a unit: the times of its fingerprint hash file
+    (`lib-regex`, beside `lib-regex.json`), which every build with the unit in its
+    graph reads, fresh or not. One stat per unit - this runs over a whole test
+    cache, and the repo may be on a slow disk."""
+    names = {entry.name for entry in _entries(unit_dir)}
+    return max([_stat_times(os.path.join(unit_dir, name))
+                for name in names if name + ".json" in names] or [0])
+
+
+def _profile_dirs(target_dir):
+    """target/<profile> and target/<triple>/<profile>: whatever holds a .fingerprint."""
+    found = []
+    for entry in _entries(target_dir):
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        for candidate in [entry] + _entries(entry.path):
+            if (candidate.is_dir(follow_symlinks=False)
+                    and os.path.isdir(os.path.join(candidate.path, ".fingerprint"))):
+                found.append(candidate.path)
+    return found
+
+
+def prune_dev_cache(target_dir, release_profile):
+    """The rest of target\\ - cargo test, cargo check, rust-analyzer - keeps every
+    unit used in the last DEV_CACHE_KEEP_DAYS days. Nothing reports what those
+    builds use, so the evidence here is the access time of each unit's
+    .fingerprint files, which cargo reads for every unit of every build, fresh or
+    not. If no unit at all shows a use inside the window, this disk is not keeping
+    access times (or nothing was built here lately), and nothing is deleted.
+    `release_profile` is prune_release_cache's and is left alone.
+    Returns the bytes freed."""
+    cutoff = time.time() - DEV_CACHE_KEEP_DAYS * 86400
+    skip = os.path.normcase(os.path.abspath(release_profile))
+    profiles = [p for p in _profile_dirs(target_dir)
+                if os.path.normcase(os.path.abspath(p)) != skip]
+    stale, recent = {}, False
+    for profile in profiles:
+        for entry in _entries(os.path.join(profile, ".fingerprint")):
+            unit = _unit_hash(entry.name)
+            if not unit:
+                continue
+            if _unit_last_use(entry.path) >= cutoff:
+                recent = True
+            else:
+                stale.setdefault(profile, set()).add(unit)
+    if not recent:
+        return 0
+    freed = 0
+    for profile in profiles:
+        if profile in stale:
+            freed += _remove_units(profile, stale[profile])
+            if not _entries(os.path.join(profile, ".fingerprint")):
+                # Nothing of this profile is in use: its leftovers in deps/, its
+                # incremental state, all of it.
+                freed += _remove(profile)
+                continue
+        # Incremental state is named by rustc, not by cargo's unit hash, and read
+        # only when its crate is compiled again.
+        for entry in _entries(os.path.join(profile, "incremental")):
+            if entry.is_dir(follow_symlinks=False) and _last_use(entry.path, depth=2) < cutoff:
+                freed += _remove(entry.path)
+    return freed
+
+
+def prune_old_releases(release_dir, version):
+    """Deletes other versions' build outputs from release/ - the .exe, the Linux
+    bundle directory and its .tar.gz - and nothing else: the release notes and
+    scripts kept beside them are not the build's to delete. Every published
+    version is on GitHub Releases; the others were test builds.
+    Returns (entries removed, bytes freed)."""
+    output = re.compile(r"^AG_(.+?)(\.exe|_linux\.tar\.gz|_linux)$")
+    removed = freed = 0
+    for entry in _entries(release_dir):
+        m = output.match(entry.name)
+        if not m or m.group(1) == version:
+            continue
+        if entry.is_dir(follow_symlinks=False) != (m.group(2) == "_linux"):
+            continue
+        freed += _remove(entry.path)
+        if not os.path.exists(entry.path):
+            removed += 1
+    return removed, freed
+
+
+def print_prune(label, target_dir, result):
+    if isinstance(result, str):
+        print(f"[i] Кэш {label}-сборки не почищен: {result}. На сборку это не влияет.")
+        return
+    freed, kept = result
+    line = f"[INFO] Кэш {label}-сборки: {_mb(kept)} в {target_dir}"
+    if freed:
+        line += f", удалено устаревшего {_mb(freed)}"
+    print(line + ".")
+
+
+def prune_linux_cache(target_dir):
+    """Run by python3 inside WSL (build_linux_bundle), where the cache is local."""
+    with open(os.path.join(target_dir, "messages.json"), encoding="utf-8",
+              errors="replace") as f:
+        report = BuildReport(f)
+    print_prune("Linux", target_dir, prune_release_cache(target_dir, report, whole_dir=True))
+
+
 # UPX packing is OFF (owner, `_4`). A packed exe is the single biggest source of
 # antivirus false positives here, and a user who cannot start the tool at all is a
 # worse outcome than a file three times the size. The packer below is deliberately
@@ -160,14 +534,27 @@ PREFERRED_WSL_DISTROS = ("Ubuntu-26.04", "Ubuntu", "Ubuntu-24.04", "Ubuntu-22.04
 
 def _wsl_run(distro, bash_cmd, capture=True):
     """Runs a bash command inside a WSL distro (login shell, so ~/.cargo/env is
-    reachable via the explicit source below). Returns CompletedProcess."""
-    args = ["wsl.exe", "-d", distro, "--", "bash", "-lc", bash_cmd]
-    return subprocess.run(
+    reachable via the explicit source below). Returns CompletedProcess.
+
+    `-e`, not `--`: after `--` wsl.exe hands the whole line to the distro's default
+    shell first, which expands every `$VAR` before bash sees the command - `$HOME`
+    survives that, but a variable the command sets itself arrives empty, and
+    `exit $rc` arrives as `exit`, i.e. 0.
+
+    WSL_UTF8: wsl.exe's own notices ("A localhost proxy configuration was detected
+    ...", printed on some runs and not others) are UTF-16 otherwise, and their NUL
+    bytes land at the start of the next line of the command's output."""
+    args = ["wsl.exe", "-d", distro, "-e", "bash", "-lc", bash_cmd]
+    res = subprocess.run(
         args,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.STDOUT if capture else None,
         text=True, encoding="utf-8", errors="replace",
+        env=dict(os.environ, WSL_UTF8="1"),
     )
+    if res.stdout:
+        res.stdout = res.stdout.replace("\x00", "")  # a WSL too old for WSL_UTF8
+    return res
 
 
 def find_wsl_distro():
@@ -202,6 +589,50 @@ def _win_to_wsl_path(win_path):
     return "/mnt/%s%s" % (drive.rstrip(":").lower(), rest)
 
 
+# The build machine's paths, out of the shipped binaries.
+#
+# Every panic location a dependency carries - winit, wgpu, ring, naga: hundreds
+# of them - is an absolute path into CARGO_HOME, i.e. into the builder's home
+# directory, and one reached a user's screen inside a winit error ("os error at
+# /home/<builder>/.cargo/registry/src/.../winit-0.30.13/..."). rustc rewrites them
+# at compile time: the home directory becomes ~, the checkout /ag_unlocker, the
+# cargo home /cargo. The last matching rule wins, so the specific ones come last.
+# (`profile.trim-paths` does this in one line, but is unstable in cargo 1.95.)
+def remap_prefix_flags(home, repo, cargo_home):
+    return ["--remap-path-prefix=%s=%s" % (src, dst)
+            for src, dst in ((home, "~"), (repo, "/ag_unlocker"), (cargo_home, "/cargo"))
+            if src]
+
+
+def config_rustflags(triple):
+    """The rustflags .cargo/config.toml gives `triple`. An environment
+    CARGO_ENCODED_RUSTFLAGS *replaces* that list rather than adding to it, so the
+    release build hands it over explicitly - or it would ship without the static
+    CRT, and a clean Windows would refuse the exe before main (VCRUNTIME140.dll)."""
+    import tomllib
+    with open(os.path.join(".cargo", "config.toml"), "rb") as f:
+        return list(tomllib.load(f)["target"][triple]["rustflags"])
+
+
+def check_shipped_binary(path, needles, windows):
+    """Measured, not assumed: warns when the binary still names the build
+    machine, or (Windows) still needs the Visual C++ runtime DLL."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read().lower()
+    except OSError as e:
+        print(f"[WARNING] {path} не прочитан для проверки: {e}")
+        return
+    leaked = [n for n in needles if n and n.lower().encode("utf-8") in data]
+    if leaked:
+        print(f"[WARNING] {os.path.basename(path)} содержит пути сборочной машины: {', '.join(leaked)}")
+    else:
+        print(f"[INFO] {os.path.basename(path)}: путей сборочной машины нет.")
+    if windows and b"vcruntime140.dll" in data:
+        print(f"[WARNING] {os.path.basename(path)} требует VCRUNTIME140.dll - "
+              f"статический CRT не применился (.cargo/config.toml).")
+
+
 # Oldest glibc the Linux bundle has to start on.
 #
 # glibc is backward compatible but not forward, and the baseline is decided by
@@ -214,14 +645,22 @@ def _win_to_wsl_path(win_path):
 # asked for more than GLIBC_2.34.
 #
 # cargo-zigbuild pins the baseline at link time, so this needs no second distro.
-# 2.34 is the floor the code itself sets - it is the highest version any remaining
-# symbol asks for, so linking there costs nothing and is as low as this binary can
-# go without dropping a symbol it actually uses. Covers RHEL 9 and Fedora 35 up,
-# and everything newer (Ubuntu 22.04 = 2.35, Debian 12 = 2.36) by compatibility.
+# 2.17 is Rust std's own floor, and zig ships stubs for it: against them
+# `__libc_start_main`, `dlsym` and the `pthread_*` family link to their pre-2.34
+# homes in libpthread/libdl, so the 2.34 an earlier note called "the floor the
+# code itself sets" was only where a *modern* glibc had moved those symbols.
+# Measured 2026-09-19: a 2.17 build asks for nothing above GLIBC_2.17 and NEEDED
+# holds libc, libm, libpthread, libdl - all glibc. Covers CentOS/RHEL 7, Ubuntu
+# 14.04+, Debian 8+: the old servers the terminal mode is for, not only desktops.
 # Raise it only if a build starts failing to link, never to make a build pass
 # quietly: `linux_glibc_baseline` below is what proves the pin held.
-LINUX_GLIBC = "2.34"
+LINUX_GLIBC = "2.17"
 LINUX_TARGET = "x86_64-unknown-linux-gnu"
+
+# The Linux build's cache, on the WSL distro's own filesystem. It used to be
+# target-linux\ beside the sources, where every file rustc wrote crossed the 9P
+# bridge onto the Windows drive - and was deleted after every build anyway.
+LINUX_CACHE = "${XDG_CACHE_HOME:-$HOME/.cache}/ag_unlocker/target-linux"
 
 
 def _version_tuple(v):
@@ -248,7 +687,8 @@ def linux_glibc_baseline(distro, elf_wsl_path):
     )
     if not res or res.returncode != 0:
         return None
-    found = (res.stdout or "").strip()
+    # The last line: wsl.exe may print a notice of its own ahead of it.
+    found = ((res.stdout or "").strip().splitlines() or [""])[-1].strip()
     return found[len("GLIBC_"):] if found.startswith("GLIBC_") else None
 
 
@@ -256,8 +696,10 @@ def build_linux_bundle(version):
     """Builds the Linux ELF in WSL and assembles release/AG_<ver>_linux/ (+ .tar.gz)
     with the double-click launcher assets. Best-effort; returns the bundle dir or
     None. Never raises - the Windows build must not depend on it."""
-    import shutil
     import tarfile
+
+    # Where the Linux target dir lived before LINUX_CACHE.
+    shutil.rmtree("target-linux", ignore_errors=True)
 
     try:
         distro = find_wsl_distro()
@@ -275,13 +717,10 @@ def build_linux_bundle(version):
         )
         has_zigbuild = bool(probe and probe.returncode == 0 and "OK" in (probe.stdout or ""))
 
-        # Separate target dir so it never collides with the Windows target/.
         if has_zigbuild:
-            cargo_cmd = (
-                "cargo zigbuild --release --bin ag_unlocker "
-                "--target %s.%s --target-dir target-linux" % (LINUX_TARGET, LINUX_GLIBC)
-            )
-            elf = os.path.join("target-linux", LINUX_TARGET, "release", "ag_unlocker")
+            cargo_cmd = "cargo zigbuild --release --bin ag_unlocker --target %s.%s" % (
+                LINUX_TARGET, LINUX_GLIBC)
+            elf_in_cache = "%s/release/ag_unlocker" % LINUX_TARGET
         else:
             # Still build - the bundle is better than no bundle - but say plainly
             # what the fallback costs, because the damage is invisible in the
@@ -291,27 +730,55 @@ def build_linux_bundle(version):
                   f"на дистрибутивах старше неё.")
             print("          Поставить: pip3 install --user --break-system-packages ziglang "
                   "&& cargo install cargo-zigbuild")
-            cargo_cmd = "cargo build --release --bin ag_unlocker --target-dir target-linux"
-            elf = os.path.join("target-linux", "release", "ag_unlocker")
+            cargo_cmd = "cargo build --release --bin ag_unlocker"
+            elf_in_cache = "release/ag_unlocker"
 
-        build_cmd = 'set -e; . "$HOME/.cargo/env"; cd "%s"; %s 2>&1 | tail -3' % (
-            repo_wsl, cargo_cmd,
-        )
+        # cargo's JSON messages go to a file in the cache, for the prune below to
+        # read there; its console output goes to a log beside them, and only the
+        # log's tail comes back here. No pipe: cargo's own exit status is the one
+        # that counts. Through `| tail -3` it used to be tail's, so a failed build
+        # was noticed only because target-linux had been wiped - over a kept cache
+        # it would have shipped the previous ELF.
+        # The paths rewritten are the distro's own ($HOME, CARGO_HOME), and the
+        # checkout as WSL sees it. \x1f-separated, so a space in a path is safe.
+        remap = (
+            'export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$HOME=~"$\'\\x1f\''
+            '"--remap-path-prefix=%s=/ag_unlocker"$\'\\x1f\''
+            '"--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"; '
+        ) % repo_wsl
+        # The full version, build number included, as the Windows build gets it
+        # (build.rs → `update::current_version`). Without it the ELF called itself
+        # plain "2.15.0", so every Linux build - `2.15.0_1` too - showed «новая
+        # версия» for the very release it was, and the TUI title said 2.15.0.
+        full_version = 'export AG_FULL_VERSION="%s"; ' % version
+        build_cmd = (
+            '. "$HOME/.cargo/env"; cd "%s" || exit 1; T="%s"; mkdir -p "$T" || exit 1; '
+            + remap + full_version +
+            'echo "TARGET_DIR=$T"; '
+            '%s --target-dir "$T" %s >"$T/messages.json" 2>"$T/build.log"; rc=$?; '
+            'if [ $rc -eq 0 ]; then tail -n 3 "$T/build.log"; else tail -n 40 "$T/build.log"; fi; '
+            'exit $rc'
+        ) % (repo_wsl, LINUX_CACHE, cargo_cmd, CARGO_JSON)
         res = _wsl_run(distro, build_cmd, capture=True)
-        if res.stdout:
-            print(res.stdout.rstrip())
-        if res.returncode != 0:
+        lines = [l.rstrip() for l in (res.stdout or "").splitlines() if l.strip()]
+        marker = [l.strip() for l in lines if l.strip().startswith("TARGET_DIR=")]
+        target_dir = marker[0][len("TARGET_DIR="):] if marker else None
+        shown = "\n".join(l for l in lines if not l.strip().startswith("TARGET_DIR="))
+        if shown:
+            print(shown)
+        if res.returncode != 0 or not target_dir:
             print("[WARNING] Linux-сборка не удалась (см. вывод выше) - отгружён только .exe.")
             return None
 
-        if not os.path.exists(elf):
+        elf = "%s/%s" % (target_dir, elf_in_cache)
+        if _wsl_run(distro, 'test -f "%s"' % elf).returncode != 0:
             print(f"[WARNING] ELF не найден по пути {elf} - Linux-бандл не собран.")
             return None
 
         # Report the baseline that was actually produced, and complain when it is
         # not the one asked for - the whole point of pinning it is lost if nobody
         # checks (that is how the GLIBC_2.39 bundle shipped).
-        baseline = linux_glibc_baseline(distro, f"{repo_wsl}/{elf.replace(os.sep, '/')}")
+        baseline = linux_glibc_baseline(distro, elf)
         if baseline is None:
             print("[i] Планку glibc проверить нечем (нет objdump в WSL).")
         elif has_zigbuild and _version_tuple(baseline) > _version_tuple(LINUX_GLIBC):
@@ -325,8 +792,12 @@ def build_linux_bundle(version):
             shutil.rmtree(bundle, ignore_errors=True)
         os.makedirs(bundle, exist_ok=True)
 
-        # The ELF, plus the launcher assets from linux/.
-        shutil.copy2(elf, os.path.join(bundle, "ag_unlocker"))
+        # The ELF - on the distro's filesystem, so WSL copies it across - plus the
+        # launcher assets from linux/.
+        copied = _wsl_run(distro, 'cp "%s" "%s/ag_unlocker"' % (elf, _win_to_wsl_path(bundle)))
+        if copied.returncode != 0:
+            print(f"[WARNING] ELF не скопирован в бандл: {(copied.stdout or '').strip()}")
+            return None
         for name in ("launch.sh", "install.sh", "Antigravity-Unlocker.desktop", "README.md"):
             src = os.path.join("linux", name)
             if os.path.exists(src):
@@ -365,9 +836,29 @@ def build_linux_bundle(version):
         with tarfile.open(tar_path, "w:gz") as tar:
             tar.add(bundle, arcname=f"AG_{version}_linux", filter=_exec_bits)
 
+        wsl_home = _wsl_run(distro, 'printf %s "$HOME"')
+        wsl_home = ((wsl_home.stdout or "").strip().splitlines() or [""])[-1].strip() if wsl_home else ""
+        check_shipped_binary(os.path.join(bundle, "ag_unlocker"),
+                             [wsl_home + "/", "/.cargo/registry"], windows=False)
+
         elf_size = os.path.getsize(os.path.join(bundle, "ag_unlocker")) // 1024
         print(f"[УСПЕХ] Linux-бандл: {bundle} (ELF {elf_size} КБ)")
         print(f"        Архив для переноса на машину: {tar_path}")
+
+        # The bundle is assembled; only now is it known what the cache must keep.
+        # python3 inside the distro, where the cache's files are local.
+        pruned = _wsl_run(
+            distro,
+            'python3 -B -c "import sys; sys.path.insert(0, sys.argv[1]); '
+            'import build_rust; build_rust.prune_linux_cache(sys.argv[2])" "%s" "%s"'
+            % (repo_wsl, target_dir),
+        )
+        said = (pruned.stdout or "").strip().splitlines()
+        if pruned.returncode == 0:
+            print("\n".join(said))
+        else:
+            print("[i] Кэш Linux-сборки не почищен (нужен python3 в WSL): %s"
+                  % (said[-1] if said else "нет ответа"))
         return bundle
     except Exception as e:
         print(f"[WARNING] Linux-сборка пропущена из-за ошибки: {e}")
@@ -390,7 +881,7 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.13.0_1"
+    VERSION = "2.15.0_2"
     version = VERSION
     # env!("CARGO_PKG_VERSION") only sees MAJOR.MINOR.PATCH, so the key salt uses
     # the same trimmed value the binary will compile with.
@@ -681,18 +1172,38 @@ if __name__ == "__main__":
         print("[INFO] Запуск компиляции (Release mode)...")
         cargo_env = os.environ.copy()
         cargo_env["AG_FULL_VERSION"] = version
-        subprocess.check_call(["cargo", "build", "--release", "--bin", "ag_unlocker"], env=cargo_env)
+        home = os.path.expanduser("~")
+        cargo_home = os.environ.get("CARGO_HOME") or os.path.join(home, ".cargo")
+        cargo_env.pop("RUSTFLAGS", None)
+        cargo_env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(
+            config_rustflags("x86_64-pc-windows-msvc")
+            + remap_prefix_flags(home, os.getcwd(), cargo_home))
+        # Named explicitly so that a CARGO_TARGET_DIR in the environment is ignored:
+        # the prune below deletes every unit this build did not use, which in a
+        # directory shared with other projects would be all of theirs. In the repo,
+        # not on a faster system drive: measured, the same cold build ran within 3%
+        # on the owner's HDD and NVMe - rustc is CPU-bound once the OS caches files.
+        target_dir = os.path.abspath("target")
+        build = cargo_build(
+            ["cargo", "build", "--release", "--bin", "ag_unlocker", "--target-dir", target_dir],
+            env=cargo_env,
+        )
+        built_exe = build.executables.get("ag_unlocker")
+        if not built_exe or not os.path.isfile(built_exe):
+            raise RuntimeError("cargo не сообщил, где собранный exe")
 
-        import shutil
         os.makedirs("release", exist_ok=True)
         out_path = os.path.abspath(os.path.join("release", f"AG_{version}.exe"))
         # Terminate any running instance of the previous exe to avoid PermissionError
         subprocess.run(["taskkill", "/F", "/IM", f"AG_{version}.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.5)
-        # Move (not copy) so target/release/ag_unlocker.exe is not left behind.
         if os.path.exists(out_path):
             os.remove(out_path)
-        shutil.move(r"target\release\ag_unlocker.exe", out_path)
+        # Copy, never move. The exe cargo uplifts is a hardlink to its copy in
+        # deps\, which the cache keeps now; moved, the shipped exe would stay one
+        # file with the cache's, and whatever touches either touches both.
+        shutil.copy2(built_exe, out_path)
+        check_shipped_binary(out_path, [home + "\\", "\\.cargo\\registry"], windows=True)
 
         # Shrink the exe in place; it stays a runnable AG_<ver>.exe.
         if UPX_ENABLED:
@@ -716,9 +1227,21 @@ if __name__ == "__main__":
         print(f"    Записано в {ledger}. Проверить любой файл/бинарник:")
         print(f"    python tools\\canary_check.py <путь>")
 
+        # The exe is in release\; only now is it known what the cache must keep.
+        print()
+        print_prune("Windows", target_dir, prune_release_cache(target_dir, build, whole_dir=False))
+
         # Linux bundle, built via WSL alongside the exe. Best-effort: a machine
         # without WSL/cargo still ships the Windows build above.
         build_linux_bundle(version)
+
+        removed, freed = prune_old_releases("release", version)
+        if removed:
+            print(f"[INFO] release\\: удалены сборки прошлых версий ({removed} шт., {_mb(freed)}).")
+        freed = prune_dev_cache(target_dir, os.path.join(target_dir, "release"))
+        if freed:
+            print(f"[INFO] target\\ (cargo test, rust-analyzer): удалено {_mb(freed)} того, "
+                  f"что не использовалось {DEV_CACHE_KEEP_DAYS} дней.")
 
         if is_owner:
             print(f"Ваш генератор ключей для этой версии: {dist_keygen_path}")
@@ -727,28 +1250,16 @@ if __name__ == "__main__":
             print("    понадобится новый ключ из t.me/nova_txt.")
             # Auto-generate some keys for convenience.
             print(f"\n5 ключей для версии {cargo_version}:")
-            subprocess.check_call(["python", "-c", "import dist_keygen; [print(dist_keygen.generate_key()) for _ in range(5)]"])
+            # -B: no __pycache__ left beside the sources for one import.
+            subprocess.check_call(["python", "-B", "-c", "import dist_keygen; [print(dist_keygen.generate_key()) for _ in range(5)]"])
         else:
             print("\nДля работы необходим ключ - получить его можно бесплатно в группе t.me/nova_txt")
 
     except subprocess.CalledProcessError as e:
+        # No cache is pruned after a failed build: see "Build caches" above.
         print(f"\n[ОШИБКА] Сборка завершилась с ошибкой: {e}")
     except Exception as e:
         print(f"\n[ОШИБКА] Непредвиденная ошибка сборки: {e}")
-    finally:
-        # Clean the target folder to save space and keep the repo clean.
-        print("\n[INFO] Очистка временных файлов сборки (cargo clean)...")
-        try:
-            subprocess.run(["cargo", "clean"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-        # The Linux build uses a separate target dir (target-linux) so it never
-        # collides with the Windows one; remove it too.
-        try:
-            import shutil
-            shutil.rmtree("target-linux", ignore_errors=True)
-        except Exception:
-            pass
 
 if __name__ == "__main__":
     main()

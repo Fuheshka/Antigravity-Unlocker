@@ -13,9 +13,9 @@
 
 use eframe::egui;
 
-const ICON_W: u32 = 64;
-const ICON_H: u32 = 64;
-const ICON_RGBA: &[u8] = include_bytes!("../../assets/icon_64.rgba");
+const ICON_W: u32 = 256;
+const ICON_H: u32 = 256;
+const ICON_RGBA: &[u8] = include_bytes!("../../assets/icon_256.rgba");
 
 /// The window icon, or `None` if the baked asset is not the size it claims.
 ///

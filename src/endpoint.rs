@@ -313,7 +313,7 @@ pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
 /// after every reboot they re-set it. Our `HTTPS_PROXY` sitting beside it is the
 /// evidence that the pair was written by an older build of this tool.
 fn legacy_removals(https: Option<&str>, no_proxy: Option<&str>, url: &str) -> (bool, bool) {
-    let drop_proxy = https.is_some_and(|v| is_our_proxy_value(v, url));
+    let drop_proxy = https.is_some_and(|v| is_ours_on_any_port(v, url));
     (drop_proxy, drop_proxy && no_proxy == Some(NO_PROXY_VALUE))
 }
 
@@ -442,7 +442,7 @@ pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
         let ours = if name.eq_ignore_ascii_case(NO_PROXY_ENV_VAR) {
             removed && value == NO_PROXY_VALUE
         } else {
-            is_our_proxy_value(value, url)
+            is_ours_on_any_port(value, url)
         };
         if !ours {
             continue;
@@ -640,7 +640,7 @@ pub struct ForeignProxy {
 pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
     for scope in ["User", "Machine"] {
         if let Some(value) = current_env_in(LEGACY_PROXY_ENV_VAR, scope) {
-            if !is_our_proxy_value(&value, ours) {
+            if !is_ours_on_any_port(&value, ours) {
                 return Some(ForeignProxy {
                     value,
                     found_in: format!("переменная среды {} ({})", LEGACY_PROXY_ENV_VAR, scope),
@@ -684,7 +684,7 @@ pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
     for name in [LEGACY_PROXY_ENV_VAR, "https_proxy"] {
         if let Ok(value) = std::env::var(name) {
             let value = value.trim().to_string();
-            if !value.is_empty() && !is_our_proxy_value(&value, ours) {
+            if !value.is_empty() && !is_ours_on_any_port(&value, ours) {
                 return Some(ForeignProxy {
                     value,
                     found_in: format!("переменная среды {}", name),
@@ -718,7 +718,7 @@ fn session_manager_proxy(ours: &str) -> Option<ForeignProxy> {
         else {
             continue;
         };
-        if !value.is_empty() && !is_our_proxy_value(value, ours) {
+        if !value.is_empty() && !is_ours_on_any_port(value, ours) {
             return Some(ForeignProxy {
                 value: value.to_string(),
                 found_in: format!("{} в сессии systemd --user", name),
@@ -749,7 +749,7 @@ fn antigravity_proxy_setting(ours: &str) -> Option<ForeignProxy> {
             continue;
         };
         if let Some(value) = proxy_setting_in(&text) {
-            if !is_our_proxy_value(&value, ours) {
+            if !is_ours_on_any_port(&value, ours) {
                 return Some(ForeignProxy {
                     value,
                     found_in: format!(
@@ -885,6 +885,15 @@ fn current_env_in(name: &str, scope: &str) -> Option<String> {
 /// Safe because the address is loopback and a fixed port that only this tool
 /// listens on: a proxy the user chose for themselves never names it. Their own
 /// value is left alone, which matters more than removing ours.
+/// Ours at all: the listener's current address, or the default port it had
+/// before the relay had to move it (`proxy::port`). For "is it someone else's"
+/// and "may we take it off" - a value naming the old port is still ours to
+/// remove, never a foreign proxy to stand aside for. "Is it ours *and still
+/// current*" is `is_our_proxy_value`.
+fn is_ours_on_any_port(value: &str, url: &str) -> bool {
+    is_our_proxy_value(value, url) || is_our_proxy_value(value, &crate::proxy::default_url())
+}
+
 fn is_our_proxy_value(value: &str, url: &str) -> bool {
     let strip = |s: &str| {
         s.trim()

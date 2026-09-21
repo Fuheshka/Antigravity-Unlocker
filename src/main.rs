@@ -2,7 +2,6 @@
 // on screen behind it. The CLI flags that still print (--about/--version) and
 // the background modes attach to the parent console instead - see attach_console.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
-
 // The Windows build is the shipping platform and is fully linted. The Linux port
 // is partial (phase 1: the client patch; the NRPT/relay/systemd layer is stubbed,
 // P7 phase 5), so a large Windows-only surface is legitimately dead code there.
@@ -32,14 +31,18 @@ mod gate;
 mod gui;
 mod health;
 mod hosts_pin;
+mod loopback;
 mod ls_log;
+mod net;
 mod ops;
 mod patch_binary;
 mod patch_ide;
+mod portcheck;
 mod proxy;
 mod resolvers;
 mod routes;
 mod settings;
+mod tui;
 mod update;
 mod upstream;
 mod utils;
@@ -569,9 +572,6 @@ pub fn remove_legacy_ca_quiet() -> bool {
     true
 }
 
-
-
-
 /// Which product an install directory is, for the progress line.
 ///
 /// A guess from the layout rather than the name `process_install` returns,
@@ -626,7 +626,40 @@ fn main() {
 
     canary::handle_cli_flags();
 
+    if tui::requested() {
+        run_tui(None);
+        return;
+    }
+    // A server over SSH: a terminal, and nothing to draw a window into.
+    #[cfg(not(target_os = "windows"))]
+    if tui::only_terminal() {
+        run_tui(None);
+        return;
+    }
+
     if let Err(e) = gui::run() {
+        // No renderer opened a window. The terminal UI carries every switch the
+        // window does, so it is offered instead of a dead end: on Windows in a
+        // console of its own, on Linux only when started from a terminal (a
+        // double-clicked launcher has none, and gets the message instead).
+        let note = format!("Окно не открылось ({e}) — работаю в терминале.");
+        #[cfg(target_os = "windows")]
+        run_tui(Some(note));
+        #[cfg(not(target_os = "windows"))]
+        {
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() {
+                run_tui(Some(note));
+            } else {
+                utils::message_box("Antigravity Unlocker", &e);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn run_tui(note: Option<String>) {
+    if let Err(e) = tui::run(note) {
         utils::message_box("Antigravity Unlocker", &e);
         std::process::exit(1);
     }

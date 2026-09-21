@@ -305,6 +305,14 @@ pub fn clipboard_text() -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
+/// Puts `text` on the clipboard; false when there is no clipboard to reach (a
+/// Linux box with no X11 or Wayland session).
+pub fn set_clipboard_text(text: &str) -> bool {
+    arboard::Clipboard::new()
+        .and_then(|mut cb| cb.set_text(text.to_string()))
+        .is_ok()
+}
+
 /// Starts this exe again through the shell's `runas` verb, i.e. behind a UAC
 /// prompt, and reports whether the new process was actually launched.
 ///
@@ -314,6 +322,12 @@ pub fn clipboard_text() -> Option<String> {
 /// UAC dialog gets `false` here and keeps the window they had.
 #[cfg(target_os = "windows")]
 pub fn relaunch_elevated() -> bool {
+    relaunch_elevated_with("")
+}
+
+/// The same, with `params` as the new process's command line (after the exe).
+#[cfg(target_os = "windows")]
+pub fn relaunch_elevated_with(params: &str) -> bool {
     #[link(name = "shell32")]
     extern "system" {
         fn ShellExecuteW(
@@ -333,6 +347,7 @@ pub fn relaunch_elevated() -> bool {
         return false;
     };
     let op = wide("runas");
+    let params_w = wide(params);
     let file = wide(&exe.to_string_lossy());
     let dir = exe
         .parent()
@@ -347,7 +362,11 @@ pub fn relaunch_elevated() -> bool {
             std::ptr::null_mut(),
             op.as_ptr(),
             file.as_ptr(),
-            std::ptr::null(),
+            if params.is_empty() {
+                std::ptr::null()
+            } else {
+                params_w.as_ptr()
+            },
             dir.as_ptr(),
             SW_SHOWNORMAL,
         )

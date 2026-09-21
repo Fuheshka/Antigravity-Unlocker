@@ -10,7 +10,8 @@ use crate::patch_binary::{self, RepatchOutcome};
 use crate::patch_ide;
 use crate::utils::mask_path;
 
-// Keeping the patch alive across Antigravity's own auto-updates.
+// Keeping Antigravity patched: after its own auto-updates, and from the moment
+// it is installed.
 //
 // The auto-updater silently replaces language_server.exe (and, on the IDE,
 // main.js), which reverts the rename and the region gate comes back - the user
@@ -18,6 +19,14 @@ use crate::utils::mask_path;
 // running inside the DNS relay (a byte copy of this build, so it already
 // contains every patch routine), notices the replaced file and re-applies the
 // patch in the background.
+//
+// A fresh install is the same case to this code - an unpatched binary nobody
+// asked it to leave alone - and since D27 it is treated the same way. It was
+// not before: the watcher also waited for the user to have patched once, so a
+// Desktop installed or restored after that point stayed unpatched with
+// auto-patch on, and an unpatched Desktop 2.15.0 can take longer to come up than
+// its window waits for the page (30 s) - a black window. The only thing that
+// stops it is the user having switched the patch off by hand (`patch_declined`).
 //
 // The one firm rule: if the signature is GONE - a build new or broken enough
 // that this patcher does not recognise it - do nothing. Leave the app exactly
@@ -36,10 +45,16 @@ use crate::utils::mask_path;
 /// before the app talks to CloudCode again.
 const POLL: Duration = Duration::from_secs(2);
 
-/// Re-scan the standard install locations this often (~5 min). Uses only
-/// filesystem checks - never the PowerShell registry scan - so it is safe to
-/// run on a timer inside a background process.
-const REDISCOVER_EVERY: u32 = 150;
+/// Re-scan the standard install locations (and the user's own paths) this
+/// often, in polls: 5 x 2 s = 10 s. Uses only filesystem checks - never the
+/// PowerShell registry scan - so it is safe to run on a timer inside a
+/// background process, and cheap enough to run this often.
+///
+/// Was five minutes, when the only case was an update to an install already on
+/// the list. A fresh install is a new root, and Antigravity's installer starts
+/// the app the moment it finishes: every second of discovery is a second the app
+/// runs unpatched, and it is found locked in use when the patch does arrive.
+const REDISCOVER_EVERY: u32 = 5;
 
 const LOG_LIMIT_BYTES: u64 = 64 * 1024;
 
@@ -107,11 +122,12 @@ fn run() {
         // while the switch is off, so the setting is what has to take effect
         // immediately. Cached with a short TTL, so this is not a file read per
         // two seconds.
-        // Both switches, not just the auto-patch one. `client_patch` off means
-        // the user asked for the patch to be *gone*; a watchdog that only reads
-        // `auto_patch` would treat the unpatched binary as an update and put the
-        // patch straight back.
-        if crate::settings::auto_patch_enabled() && crate::settings::client_patch_enabled() {
+        // Auto-patch, minus a patch the user switched off by hand: a watchdog
+        // that read `auto_patch` alone would treat the unpatched binary as an
+        // update and put the patch straight back (G38). Not `client_patch`
+        // either - that is false on every machine that has not patched *yet*,
+        // which is the fresh install this is also for (D27).
+        if crate::settings::auto_patch_wanted() {
             for inst in &installs {
                 for target in targets(inst) {
                     inspect(&target, states.entry(target.clone()).or_default());
@@ -219,11 +235,7 @@ fn inspect(target: &Path, st: &mut FileState) {
             st.handled = stat(target).or(Some(cur));
         }
         RepatchOutcome::Repatched(n) => {
-            log(&format!(
-                "re-patched after update: {} ({})",
-                show(target),
-                n
-            ));
+            log(&format!("patched: {} ({})", show(target), n));
             st.blocked = 0;
             st.blocked_for = None;
             // The rename is same-length, so len is unchanged and only mtime
@@ -324,8 +336,44 @@ fn targets(inst: &Path) -> Vec<PathBuf> {
     list
 }
 
+/// Patches every file of one install now, the way the watcher does once a file
+/// has settled: both renames in one write per native binary, the IDE's
+/// `main.js`, and a process holding a binary closed only if the write actually
+/// meets its lock (D22 - Desktop restarts its language server by itself and
+/// reloads the window). An already-patched file is read and left alone.
+///
+/// The window's half of auto-patch (D27). The watcher runs inside the relay,
+/// which a user without admin rights never installed and which may still be an
+/// older build after an upgrade; the window is running either way.
+pub fn patch_now(inst: &Path) -> Vec<(PathBuf, RepatchOutcome)> {
+    targets(inst)
+        .into_iter()
+        .map(|target| {
+            let outcome = repatch(&target);
+            if let RepatchOutcome::Repatched(n) = &outcome {
+                log(&format!(
+                    "patched from the window: {} ({})",
+                    show(&target),
+                    n
+                ));
+            }
+            (target, outcome)
+        })
+        .collect()
+}
+
+/// The standard locations plus every path the user pointed the window at: an
+/// install they had to find by hand is exactly the one no scan knows about.
 fn discover() -> Vec<PathBuf> {
-    crate::discover_installs_fast()
+    let mut installs = crate::discover_installs_fast();
+    for manual in crate::settings::manual_paths() {
+        if let Some(root) = crate::resolve_install_root(&manual) {
+            if !installs.contains(&root) {
+                installs.push(root);
+            }
+        }
+    }
+    installs
 }
 
 fn stat(p: &Path) -> Option<(u64, SystemTime)> {
@@ -340,7 +388,15 @@ fn show(p: &Path) -> String {
 /// Its own log next to the relay's, so an "it stopped surviving updates" report
 /// has somewhere to look. Truncated rather than rotated - nothing here is worth
 /// keeping across sessions.
+///
+/// Stamped, like the relay's: an unstamped «patched» cannot be lined up against
+/// the moment a file changed, and that is the one question this log is read for.
+/// Never from a test - the file is the *installed* watchdog's, and the wiring
+/// tests below used to append their temp paths to it (G51's twin).
 fn log(line: &str) {
+    if cfg!(test) {
+        return;
+    }
     let dir = dns_forwarder::log_dir();
     let path = dir.join("watchdog.log");
     fs::create_dir_all(&dir).ok();
@@ -348,7 +404,8 @@ fn log(line: &str) {
         fs::remove_file(&path).ok();
     }
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-        writeln!(f, "{}", line).ok();
+        let stamp = crate::utils::local_clock().map_or_else(String::new, |c| c.hms());
+        writeln!(f, "{} {}", stamp, line).ok();
     }
 }
 

@@ -7,6 +7,9 @@
 mod icon;
 mod license;
 mod main_view;
+pub(crate) mod renderer;
+pub(crate) mod report;
+pub(crate) mod status;
 mod theme;
 mod widgets;
 
@@ -85,6 +88,12 @@ pub struct App {
     providers_reordering: bool,
     path_dialog: Option<String>,
     path_dialog_error: Option<String>,
+    /// When «Скопировать отчёт» was last pressed, for the few seconds the card
+    /// says so.
+    report_copied_at: Option<std::time::Instant>,
+    /// Frames drawn so far, up to the few it takes to call the renderer proven
+    /// (`renderer::confirm`).
+    frames: u8,
 }
 
 impl App {
@@ -114,8 +123,14 @@ impl App {
         // from here on — two writers each saving the whole thing meant whichever
         // saved last silently reverted the other.
         let settings = Settings::load();
+        let screen = first_screen();
+        // A debug build told to skip the key never passes the licence screen,
+        // which is where `Unlocked` is otherwise sent from.
+        if matches!(screen, Screen::Main) {
+            worker.send(Cmd::Unlocked);
+        }
         Self {
-            screen: Screen::License,
+            screen,
             key_input: String::new(),
             key_rejected: false,
             key_needs_focus: true,
@@ -138,6 +153,8 @@ impl App {
             providers_reordering: false,
             path_dialog: None,
             path_dialog_error: None,
+            report_copied_at: None,
+            frames: 0,
         }
     }
 
@@ -225,6 +242,19 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // By the third pass two frames have been presented, which is where a
+        // renderer that was going to fail at the swap chain has failed. egui
+        // would otherwise sleep after the first one, so it is asked for more.
+        if self.frames < 3 {
+            if self.frames == 1 {
+                renderer::dev_break_frame();
+            }
+            self.frames += 1;
+            ui.ctx().request_repaint();
+        } else if self.frames == 3 {
+            self.frames += 1;
+            renderer::confirm();
+        }
         self.drain_events();
 
         // The root `Ui` eframe hands over carries no margin and no background of
@@ -272,15 +302,14 @@ impl eframe::App for App {
 
 /// Opens the window. Returns only when the user closes it.
 ///
-/// Two renderers are compiled in and tried in order. wgpu goes first because on
-/// Windows it lands on DirectX 12, which ships with the OS and needs no vendor
-/// OpenGL driver — the case that breaks a fresh install still on the Basic
-/// Display Adapter. wgpu also probes Vulkan on its own, so the glow retry is
-/// only for a machine old enough that plain WGL is all it has. Falling back
-/// costs nothing at runtime and is the difference between "it starts on other
-/// PCs" and a support thread.
+/// Renderers are tried down `renderer::CHAIN` — on Windows DirectX 12, then
+/// DirectX 12 on the software rasteriser, then OpenGL — starting from whatever
+/// the last start on this machine learned (`renderer::first`). An error moves
+/// to the next one in this process; a panic or a crash inside a driver moves to
+/// it on the next start (see `renderer`). Falling back costs nothing at runtime
+/// and is the difference between "it starts on other PCs" and a support thread.
 pub fn run() -> Result<(), String> {
-    fn options(renderer: eframe::Renderer) -> eframe::NativeOptions {
+    fn options(kind: renderer::Kind) -> eframe::NativeOptions {
         eframe::NativeOptions {
             viewport: {
                 let mut vp = egui::ViewportBuilder::default()
@@ -294,28 +323,83 @@ pub fn run() -> Result<(), String> {
                 }
                 vp
             },
-            renderer,
+            renderer: kind.renderer(),
+            wgpu_options: kind.wgpu_options(),
             ..Default::default()
         }
     }
 
-    let primary = eframe::run_native(
-        &title(),
-        options(eframe::Renderer::Wgpu),
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    );
-
-    match primary {
-        Ok(()) => Ok(()),
-        Err(first) => eframe::run_native(
+    renderer::install();
+    let mut failures: Vec<String> = Vec::new();
+    let mut kind = Some(renderer::first());
+    while let Some(k) = kind {
+        renderer::attempting(k);
+        match eframe::run_native(
             &title(),
-            options(eframe::Renderer::Glow),
+            options(k),
             Box::new(|cc| Ok(Box::new(App::new(cc)))),
-        )
-        .map_err(|second| format!("не удалось открыть окно (DirectX: {first}; OpenGL: {second})")),
+        ) {
+            Ok(()) => return Ok(()),
+            // No display to open a window on at all: no X server or Wayland
+            // compositor, or one this user may not use (`sudo` — "Authorization
+            // required"). Not a renderer's failure, so the next one would fail
+            // the same way, and winit would refuse it anyway: an event loop
+            // cannot be created twice in one process ("EventLoop can't be
+            // recreated", which is all the second attempt used to report).
+            Err(e @ eframe::Error::WinitEventLoop(_)) => {
+                renderer::forget();
+                return Err(format!(
+                    "нет доступа к графическому дисплею: {}",
+                    without_source_location(&e.to_string())
+                ));
+            }
+            Err(e) => failures.push(format!("{}: {e}", k.label())),
+        }
+        kind = k.next();
     }
+    // Nothing opened, and every renderer said why rather than crashing: that
+    // says more about this start (a session with no desktop) than about the
+    // machine, so the next start gets the whole chain again.
+    renderer::forget();
+    Err(format!("не удалось открыть окно ({})", failures.join("; ")))
+}
+
+/// winit's `os error at <file>.rs:<line>: <what>` is for its own developers;
+/// the user gets `<what>`.
+fn without_source_location(msg: &str) -> &str {
+    msg.find(".rs:")
+        .and_then(|i| msg[i..].find(": ").map(|j| &msg[i + j + 2..]))
+        .unwrap_or(msg)
+}
+
+/// The licence screen, always - except in a *debug* build started with
+/// `AG_UNLOCKER_DEV_SKIP_KEY` set, so the main screen can be looked at while it
+/// is being worked on. Compiled out of every release build (`build_rust.py`
+/// builds release), so a shipped exe has no way past the key.
+fn first_screen() -> Screen {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some() {
+        return Screen::Main;
+    }
+    Screen::License
 }
 
 fn title() -> String {
     format!("Antigravity Unlocker 2 v{}", update::current_version())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::without_source_location;
+
+    #[test]
+    fn a_winit_error_loses_the_build_machine_path_and_keeps_what_happened() {
+        assert_eq!(
+            without_source_location(
+                "os error at /cargo/registry/src/index.crates.io-1949cf8c6b5b557f/winit-0.30.13/src/platform_impl/linux/mod.rs:788: Failed to open connection to X server"
+            ),
+            "Failed to open connection to X server"
+        );
+        assert_eq!(without_source_location("no display"), "no display");
+    }
 }

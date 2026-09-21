@@ -7,7 +7,9 @@ Comment=Разблокировать Antigravity 2.0 / IDE / CLI
 # it is found wherever the folder is unpacked. Only the %k field code is used (no
 # other % sequences, which a .desktop Exec parser would mangle); a file:// prefix
 # is stripped. Keep the folder path free of spaces, or use install.sh instead.
-Exec=bash -c 'p="%k"; p="${p#file://}"; exec "$(dirname "$p")/launch.sh"'
+# `bash launch.sh`, not `launch.sh`: runs whether or not the unpacking kept the
+# script's executable bit.
+Exec=bash -c 'p="%k"; p="${p#file://}"; exec bash "$(dirname "$p")/launch.sh"'
 Icon=security-high
 # The tool is a window since 2.12.2, not a numbered console menu. Left at `true`
 # the desktop opens an empty terminal behind it for the whole session.

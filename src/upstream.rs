@@ -116,14 +116,17 @@ impl Route {
             return;
         }
         *pinned = Some(ip.to_string());
+        // The country, not the address: for the user's own proxy the exit is
+        // their server, and for a built-in exit it is usually the exit itself -
+        // neither belongs in a log that is pasted into a public chat.
         crate::dns_forwarder::log_proxy(&format!(
-            "{} выходит через {} ({}) — это заблокированный регион, маршрут отключён до смены выхода",
-            self.label, ip, loc
+            "{} выходит в {} — это заблокированный регион, маршрут отключён до смены выхода",
+            self.label, loc
         ));
     }
 
     /// Releases the pin, because the exit moved somewhere usable.
-    fn note_usable_exit(&self, ip: &str, loc: &str) {
+    fn note_usable_exit(&self, _ip: &str, loc: &str) {
         let Ok(mut pinned) = self.bad_exit.lock() else {
             return;
         };
@@ -132,8 +135,8 @@ impl Route {
         }
         *pinned = None;
         crate::dns_forwarder::log_proxy(&format!(
-            "{} сменил выход на {} ({}) — снова используем",
-            self.label, ip, loc
+            "{} теперь выходит в {} — снова используем",
+            self.label, loc
         ));
     }
 
@@ -394,6 +397,15 @@ pub fn open(up: &Upstream, host: &str, port: u16, budget: Duration) -> Result<Tc
     sock.set_read_timeout(Some(left())).ok();
     sock.set_write_timeout(Some(left())).ok();
 
+    // A proxy on this machine or the LAN (v2rayN, Privoxy, a router's proxy)
+    // resolves the name itself, usually through the system resolver - which,
+    // with the loopback door up, answers a gate host with *our* address. The
+    // proxy would then dial us, we would dial it, and so on: an avalanche of
+    // connections with no end (found in review before 2.14.0_1 shipped). Such a
+    // proxy is handed Google's address instead of the name; the client's own
+    // TLS still names the host, so nothing else changes.
+    let target = crate::proxy::connect_target(up.host.as_str(), host);
+    let host = target.as_str();
     let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
     if let Some(a) = &up.auth {
         req.push_str(&format!("Proxy-Authorization: Basic {}\r\n", basic(a)));
@@ -416,6 +428,18 @@ pub fn open(up: &Upstream, host: &str, port: u16, budget: Duration) -> Result<Tc
         match sock.read(&mut byte) {
             Ok(0) => return Err("прокси закрыл соединение".to_string()),
             Ok(_) => head.push(byte[0]),
+            // The read timeout expiring: `TimedOut` on Windows, `WouldBlock` on
+            // Linux, where it reads «Resource temporarily unavailable (os error
+            // 11)» - which says nothing to a user about a proxy that let us
+            // connect and then never answered the CONNECT.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err("соединение принято, но на запрос прокси не ответил вовремя".to_string())
+            }
             Err(e) => return Err(format!("нет ответа: {}", e)),
         }
     }
@@ -632,7 +656,11 @@ fn trace_direct(host: &'static str) -> Option<(String, String)> {
 /// Regions where a proxy is pointless, because they are the ones being blocked.
 /// Not a complete list and not meant to be - it exists to catch the common case
 /// of someone pointing this at a VPN that surfaces next door.
-const BLOCKED_REGIONS: &[&str] = &["RU", "BY"];
+/// Where the gate refuses. Russia and Belarus are the ones measured; the rest are
+/// the countries Google lists no Gemini service for at all, which is the same
+/// refusal for the same reason - and a VPN or proxy exiting in one of them must
+/// not be offered as a way around it.
+const BLOCKED_REGIONS: &[&str] = &["RU", "BY", "CN", "HK", "MO", "IR", "KP", "SY", "CU"];
 
 pub fn region_is_blocked(loc: &str) -> bool {
     BLOCKED_REGIONS.iter().any(|r| r.eq_ignore_ascii_case(loc))

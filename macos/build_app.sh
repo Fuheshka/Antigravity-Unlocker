@@ -6,6 +6,15 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$DIR"
 
+# Определение полной версии релиза
+if grep -q 'VERSION = "' "$DIR/build_rust.py" 2>/dev/null; then
+    VERSION=$(grep 'VERSION = "' "$DIR/build_rust.py" | head -n1 | cut -d '"' -f2)
+else
+    VERSION=$(grep '^version =' "$DIR/Cargo.toml" | head -n1 | cut -d '"' -f2)
+fi
+export AG_FULL_VERSION="$VERSION"
+echo "==> Версия приложения: $VERSION (AG_FULL_VERSION=$AG_FULL_VERSION)"
+
 echo "==> Сборка релизного бинарника для macOS (Apple Silicon / Intel)..."
 cargo build --release
 
@@ -29,7 +38,7 @@ if [ -f "$DIR/macos/AppIcon.icns" ]; then
 fi
 
 # Создание Info.plist
-cat > "$CONTENTS/Info.plist" << 'EOF'
+cat > "$CONTENTS/Info.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -45,9 +54,9 @@ cat > "$CONTENTS/Info.plist" << 'EOF'
     <key>CFBundleIdentifier</key>
     <string>com.antigravity.unlocker</string>
     <key>CFBundleVersion</key>
-    <string>2.13.0</string>
+    <string>$VERSION</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.13.0</string>
+    <string>$VERSION</string>
     <key>CFBundleExecutable</key>
     <string>ag_unlocker</string>
     <key>CFBundleIconFile</key>

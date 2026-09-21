@@ -105,22 +105,17 @@ pub const PROVIDERS: &[Provider] = &[
         v6: &["2a0c:9300:0:54::1"],
         transport: Transport::Udp,
     },
-    // Last on purpose (owner). It returns genuine Google for the two gate hosts
-    // (kb/routes.md), so it never wins a race as `Substituted` and its place at
-    // the back costs the pool nothing; and its resolver is a third party's, so
-    // leaning on it least is the same "considerate guest" rule the relay now
-    // follows. It stays in the pool - it still recognises an unsubstituted answer
-    // - but sits at the tail of the compiled default order (rotation-off single
-    // choice, the window's list, and tie-break preference all follow from this).
-    Provider {
-        name: "xbox-dns.ru",
-        v4: &["111.88.96.50", "111.88.96.51"],
-        v6: &["2a00:ab00:1233:26::50", "2a00:ab00:1233:26::51"],
-        transport: Transport::Udp,
-    },
+    // xbox-dns.ru is not here any more (owner, 2.14.0_1). Measured over the ISP
+    // link on 2026-09-18, both its resolvers answer both gate hosts with genuine
+    // Google (`172.217.x`, the set 8.8.8.8 gives) and substitute only
+    // `generativelanguage`, which is not ours to route (D18). It never won a race
+    // for either name, so all it contributed was a third party seeing the query,
+    // and a row in the window promising something it does not do. Its patcher
+    // reaches the gate hosts through its credentialed CONNECT relay instead, and
+    // that path is already a route of its own (`routes::Kind::Relay`).
 ];
 
-/// Addresses are the two `dns.dns-ai.ru` resolves to, hardcoded so the relay can
+/// Addresses are the three `dns.dns-ai.ru` resolves to, hardcoded so the relay can
 /// reach it before anything else resolves. Safe because the certificate still has
 /// to prove the name (`*.dns-ai.ru`, verified live), so a stale or poisoned
 /// address fails the handshake instead of becoming a silent man-in-the-middle.
@@ -135,14 +130,19 @@ pub const PROVIDERS: &[Provider] = &[
 /// of a core while its sibling sat at 15 %, because the certificate check meant a
 /// dead address failed safely and therefore failed *quietly*.
 ///
-/// Both entries below are live and were verified answering `200` on
-/// `/dns-query` before being written here. When re-checking (P14), check the
-/// ADDRESSES too, not only whether the provider still substitutes: a hardcoded
-/// address is a measurement with an expiry date.
+/// Every entry below is live and was verified answering on `/dns-query` before
+/// being written here. The third, `94.232.43.149`, joined 2026-09-18 at the
+/// service's own request: it was already in the public A record, and measured
+/// the same day it proves the name, speaks h2 (nginx in front, where the other
+/// two run dnsdist) and substitutes both gate names. The walk spreads queries
+/// evenly across all three - which is the point of listing a node at all (G43).
+/// When re-checking (P14), check the ADDRESSES too, not only whether the
+/// provider still substitutes: a hardcoded address is a measurement with an
+/// expiry date.
 pub static DNS_AI: crate::doh::Endpoint = crate::doh::Endpoint {
     host: "dns.dns-ai.ru",
     path: "/dns-query",
-    addrs: &["192.144.59.14", "186.246.49.127"],
+    addrs: &["192.144.59.14", "186.246.49.127", "94.232.43.149"],
 };
 
 /// Resolvers used only to recognise an unsubstituted answer. They must be
@@ -908,12 +908,26 @@ fn only_provider() -> Option<&'static str> {
 /// touched keeps its compiled position at the end, so a provider added in a later
 /// release still appears instead of being silently dropped by a saved order that
 /// predates it.
+/// The owner's own service leads the pool by default (owner, 2.15.0): it is the
+/// one resolver that substitutes *both* gate names, over DoH, and it is his to
+/// run. It is shown in the provider list with its own switch, so this is a
+/// disclosed default, not a lock: a user can turn it off, and if they place it
+/// somewhere themselves in `provider_order`, that explicit choice is kept. Only
+/// when they have NOT placed it — the common case, and every fresh install — is
+/// it pulled to the front, so `dns-ai` leads without silently overriding a
+/// deliberate reorder.
+const LEAD_PROVIDER: &str = "dns-ai.ru";
+
 fn in_user_order() -> Vec<&'static Provider> {
     let wanted = crate::settings::provider_order_cached();
-    if wanted.is_empty() {
-        return PROVIDERS.iter().collect();
-    }
     let mut out: Vec<&'static Provider> = Vec::new();
+    // Lead with the owner's service unless the user placed it themselves.
+    let user_placed_lead = wanted.iter().any(|n| n.eq_ignore_ascii_case(LEAD_PROVIDER));
+    if !user_placed_lead {
+        if let Some(p) = PROVIDERS.iter().find(|p| p.name == LEAD_PROVIDER) {
+            out.push(p);
+        }
+    }
     for name in &wanted {
         if let Some(p) = PROVIDERS.iter().find(|p| p.name.eq_ignore_ascii_case(name)) {
             if !out.iter().any(|q| q.name == p.name) {
@@ -921,6 +935,8 @@ fn in_user_order() -> Vec<&'static Provider> {
             }
         }
     }
+    // Anything not named in the saved order keeps its compiled position after the
+    // listed ones, so a provider added in a later release is never dropped.
     for p in PROVIDERS {
         if !out.iter().any(|q| q.name == p.name) {
             out.push(p);
@@ -1045,9 +1061,6 @@ static VPN_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// a flag: the tunnel may be replaced by a permitted one, and when the window
 /// closes the stand-down logic is back in charge until the log says otherwise.
 static FORCE_SUBSTITUTE_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
-
-/// How long one sighting of the region 400 keeps substitution forced on.
-pub const FORCE_SUBSTITUTE_FOR: Duration = Duration::from_secs(30 * 60);
 
 pub fn set_vpn_active(active: bool) {
     VPN_ACTIVE.store(active, Ordering::Relaxed);
@@ -1648,11 +1661,82 @@ pub fn resolve_a_best(name: &str, if_index: u32) -> Option<(Vec<Ipv4Addr>, &'sta
     Some((addrs, provider, verdict))
 }
 
+/// Genuine Google for `name`, as the routing table's own path resolves it: the
+/// reference resolvers asked over the **default route**, i.e. through the
+/// user's VPN when one holds it, so the edge is the one that tunnel's exit is
+/// served from. What the `Vpn` route connects to.
+///
+/// Cached for a minute: it is asked once per gate connection on that route, and
+/// Google's edge for a name does not move on that scale.
+pub fn genuine_a(name: &str) -> Vec<Ipv4Addr> {
+    const TTL: Duration = Duration::from_secs(60);
+    const BUDGET: Duration = Duration::from_secs(2);
+    static CACHE: Mutex<Option<HashMap<String, (Vec<Ipv4Addr>, Instant)>>> = Mutex::new(None);
+
+    let key = name.trim_end_matches('.').to_ascii_lowercase();
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((addrs, at)) = guard.as_ref().and_then(|m| m.get(&key)) {
+            if at.elapsed() < TTL && !addrs.is_empty() {
+                return addrs.clone();
+            }
+        }
+    }
+    let query = dns_client::build_query(&key, 0x7A7A);
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+    for server in REFERENCE_V4 {
+        let Ok(ip) = server.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        if let Ok(reply) = dns_client::query_raw_via(&query, ip, 0, BUDGET) {
+            out = dns_client::answer_addrs(&reply)
+                .into_iter()
+                .filter_map(|a| match a {
+                    IpAddr::V4(v4) if is_public_v4(v4) => Some(v4),
+                    _ => None,
+                })
+                .collect();
+            if !out.is_empty() {
+                break;
+            }
+        }
+    }
+    if !out.is_empty() {
+        if let Ok(mut guard) = CACHE.lock() {
+            guard
+                .get_or_insert_with(HashMap::new)
+                .insert(key, (out.clone(), Instant::now()));
+        }
+    }
+    out
+}
+
+/// An address Google could actually be at. Not the DPI's stubs, and not the
+/// ranges a tunnel's "fake IP" DNS hands out (198.18.0.0/15) or anything
+/// private: connecting there hands the name back to whatever answered it, and
+/// that can resolve it through us again.
+fn is_public_v4(v4: Ipv4Addr) -> bool {
+    let o = v4.octets();
+    !(REFERENCE_STUBS.contains(&v4)
+        || v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || o[0] == 0
+        || (o[0] == 100 && (64..128).contains(&o[1]))
+        || (o[0] == 198 && (18..20).contains(&o[1]))
+        || o[0] >= 224)
+}
+
 /// Index of the first reply with exactly `want`, in rotated provider order.
 fn pick(replies: &[(usize, Vec<u8>)], reference: &[IpAddr], want: Verdict) -> Option<usize> {
     let start = ROTATION.load(Ordering::Relaxed);
     let mut best: Option<usize> = None;
-    for i in 0..replies.len() {
+    // Every provider index, not `replies.len()` of them: walking only as many
+    // slots as there were replies skipped any reply whose provider sat outside
+    // that rotated window, so a lone substitution from the last provider could
+    // go unseen.
+    for i in 0..PROVIDERS.len() {
         // Rotate over provider indices so a tie does not always go to the same
         // provider, then map back to the position in `replies`.
         let wanted_provider = (start + i) % PROVIDERS.len();
@@ -1680,7 +1764,11 @@ fn best_of(replies: &[(usize, Vec<u8>)], reference: &[IpAddr]) -> usize {
     let start = ROTATION.fetch_add(1, Ordering::Relaxed);
     let mut best = 0usize;
     let mut best_rank = 0u8;
-    for i in 0..replies.len() {
+    let mut seen = false;
+    // Every provider index (see `pick`). This one mattered more: with two replies
+    // in a pool of four, a rotated window of two slots could miss the empty AAAA
+    // answer entirely and hand back the other one - Google's own IPv6.
+    for i in 0..PROVIDERS.len() {
         let wanted_provider = (start + i) % PROVIDERS.len();
         let Some(pos) = replies.iter().position(|(idx, _)| *idx == wanted_provider) else {
             continue;
@@ -1690,7 +1778,8 @@ fn best_of(replies: &[(usize, Vec<u8>)], reference: &[IpAddr]) -> usize {
             reference,
             &known_proxy_addrs(wanted_provider),
         ));
-        if r > best_rank {
+        if !seen || r > best_rank {
+            seen = true;
             best_rank = r;
             best = pos;
         }

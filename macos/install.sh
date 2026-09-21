@@ -30,6 +30,12 @@ xattr -dr com.apple.quarantine "$DEST_APP" 2>/dev/null || true
 # Повторная ad-hoc подпись после копирования
 codesign --force --deep -s - "$DEST_APP" 2>/dev/null || true
 
+# Обновление LaunchServices и сброс кэша иконок Dock
+echo "==> Обновление системного кэша иконок..."
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEST_APP" 2>/dev/null || true
+touch "$DEST_APP"
+killall Dock 2>/dev/null || true
+
 echo
 echo "============================================================"
 echo " Установка Antigravity Unlocker на macOS успешно завершена!"

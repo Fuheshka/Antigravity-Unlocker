@@ -25,7 +25,7 @@ Type=Application
 Version=1.0
 Name=Antigravity Unlocker
 Comment=Разблокировать Antigravity 2.0 / IDE / CLI
-Exec=$APP_DIR/launch.sh
+Exec=bash "$APP_DIR/launch.sh"
 $ICON_LINE
 Terminal=false
 Categories=Utility;Development;

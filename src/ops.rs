@@ -57,8 +57,9 @@ pub enum Cap {
     BuiltinExits,
     /// Whether the DNS pool rotates, or only its first enabled member answers.
     DnsRotation,
-    /// Whether a VPN carrying Antigravity makes the DNS layer stand down.
-    VpnDetect,
+    // `VpnDetect` is gone (D25): the layer no longer stands down for a tunnel,
+    // so there is nothing left for that switch to decide. `settings.vpn_detect`
+    // stays in the file so an older build reading it still finds the field.
     /// Whether a substituted address must present a valid Google certificate.
     VerifyTls,
 }
@@ -74,13 +75,12 @@ impl Cap {
     pub fn title(self) -> &'static str {
         match self {
             Cap::ClientPatch => "Разблокировать вход в аккаунт",
-            Cap::Watchdog => "Автопатч после обновления Antigravity",
+            Cap::Watchdog => "Автопатч Antigravity",
             Cap::Dns => "Обход через DNS",
             Cap::LocalProxy => "Локальный прокси",
             Cap::OwnProxy => "Свой HTTP-прокси",
             Cap::BuiltinExits => "Встроенные выходы",
             Cap::DnsRotation => "Ротация DNS-серверов",
-            Cap::VpnDetect => "Определять VPN",
             Cap::VerifyTls => "Сверять TLS",
         }
     }
@@ -198,7 +198,6 @@ pub struct Status {
     pub own_proxy: State,
     pub builtin_exits: State,
     pub dns_rotation: State,
-    pub vpn_detect: State,
     pub verify_tls: State,
     /// What the last measurement saw. `None` means it has not been taken yet;
     /// taking it spawns PowerShell, so it is not done on every refresh.
@@ -210,16 +209,11 @@ pub struct Status {
     /// has to say "there is nobody to catch the next 400" without re-deriving it
     /// from a string meant for a switch.
     pub relay_running: bool,
+    /// Whether our NRPT rules are in. The raw fact, beside `relay_running`, for
+    /// the same reason: a running service with no rules is a bypass nobody's
+    /// queries ever reach, and the status card has to be able to say so.
+    pub rules: bool,
     pub providers: Vec<ProviderRow>,
-    /// The language-server binaries, for the one thing the window needs their
-    /// full paths for: telling a VPN which executable to leave out of its
-    /// tunnel.
-    pub client_exes: Vec<PathBuf>,
-    /// The installed relay, when there is one. With the local-proxy route on it
-    /// is *this* process that opens the connection to Google, so it is the one a
-    /// split-tunnelling list has to name — excluding the language server there
-    /// changes nothing at all.
-    pub relay_exe: Option<PathBuf>,
     /// Where **our own** service's connections leave. `None` when there was
     /// nothing to read, or no tunnel to read it against.
     ///
@@ -240,9 +234,28 @@ impl Status {
             Cap::OwnProxy => &self.own_proxy,
             Cap::BuiltinExits => &self.builtin_exits,
             Cap::DnsRotation => &self.dns_rotation,
-            Cap::VpnDetect => &self.vpn_detect,
             Cap::VerifyTls => &self.verify_tls,
         }
+    }
+
+    /// The bypass master switch. Derived, never stored: it is on when any part
+    /// of the bypass is, which keeps one truth instead of two.
+    pub fn bypass_on(&self) -> bool {
+        self.dns.is_on() || self.local_proxy.is_on() || self.builtin_exits.is_on()
+    }
+}
+
+/// The parts of the bypass, in the order the master switch sends them.
+///
+/// Not the same in both directions. ON: the relay has to be answering before the
+/// proxy variable may name it (I53) â€” the worker runs these in order, so DNS
+/// finishes first. OFF: the variable comes off *before* the listener it names
+/// goes away, or a sign-in that lands in between dials a dead port (G31).
+pub fn bypass_order(on: bool) -> [Cap; 3] {
+    if on {
+        [Cap::Dns, Cap::LocalProxy, Cap::BuiltinExits]
+    } else {
+        [Cap::LocalProxy, Cap::BuiltinExits, Cap::Dns]
     }
 }
 
@@ -266,8 +279,10 @@ pub enum Event {
 
 /// UI → worker.
 pub enum Cmd {
-    /// Re-read the system. Cheap parts only.
-    Refresh,
+    /// The key was accepted and the main screen is up. Auto-patch may act from
+    /// here on, never before: the first scan runs under the licence screen, and
+    /// patching from there would hand the patch to anyone without a key.
+    Unlocked,
     /// Ask the system again where the client's traffic leaves.
     ///
     /// Its own command because it is the one measurement that goes stale on its
@@ -299,6 +314,13 @@ pub enum Cmd {
     SetProvider(String, bool),
     /// The whole pool in the order the user dragged it into.
     ReorderProviders(Vec<String>),
+    /// Everything on, in the order that works: the patch, auto-patch, then the
+    /// bypass. The one button a user who is not a programmer needs.
+    EnableAll,
+    /// Puts the service back the way the switches say it should be: reinstalls
+    /// the relay when it is missing, stopped or older than this build, rewrites
+    /// the rules, restores the proxy variable.
+    Repair,
     #[allow(dead_code)]
     Stop,
 }
@@ -424,6 +446,7 @@ fn run_worker(
         dns_probe: (false, false),
     };
 
+    settle_decline(&mut ctx);
     startup_housekeeping(&mut ctx);
 
     // The first snapshot is deep: the window opens on the licence screen, so
@@ -434,7 +457,16 @@ fn run_worker(
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Cmd::Stop => return,
-            Cmd::Refresh => push_status(&mut ctx, Scan::System),
+            Cmd::Unlocked => {
+                // The first snapshot was taken while the licence screen was up;
+                // a fresh one either way, deep when auto-patch just wrote.
+                if auto_patch_found(&mut ctx) {
+                    push_status(&mut ctx, Scan::Deep);
+                } else {
+                    push_status(&mut ctx, Scan::System);
+                }
+                ctx.busy(None);
+            }
             // Off the queue, not on it. The measurement drives PowerShell and
             // takes seconds; on the queue, a user flipping a switch in the
             // middle of one would watch it snap back until it finished — G42's
@@ -493,6 +525,12 @@ fn run_worker(
                 apply(&mut ctx, cap, on);
                 ctx.settings.save();
                 push_status(&mut ctx, scan_after(cap));
+                // Turning auto-patch on is asking for Antigravity to be patched;
+                // waiting for the watchdog's next poll would show the switch on
+                // and the install still grey.
+                if cap == Cap::Watchdog && on && auto_patch_found(&mut ctx) {
+                    push_status(&mut ctx, Scan::Deep);
+                }
                 ctx.busy(None);
             }
             Cmd::AddPath(p) => {
@@ -502,6 +540,10 @@ fn run_worker(
                 }
                 ctx.busy(Some("Проверка установок"));
                 push_status(&mut ctx, Scan::Deep);
+                // The path the user just pointed at is an install found at last.
+                if auto_patch_found(&mut ctx) {
+                    push_status(&mut ctx, Scan::Deep);
+                }
                 ctx.busy(None);
             }
             Cmd::ForgetPath(p) => {
@@ -512,6 +554,20 @@ fn run_worker(
             Cmd::SetOwnProxy(text) => {
                 ctx.busy(Some("Проверка прокси"));
                 set_own_proxy(&mut ctx, &text);
+                ctx.settings.save();
+                push_status(&mut ctx, Scan::System);
+                ctx.busy(None);
+            }
+            Cmd::EnableAll => {
+                ctx.busy(Some("Включаю"));
+                enable_all(&mut ctx);
+                ctx.settings.save();
+                push_status(&mut ctx, Scan::Deep);
+                ctx.busy(None);
+            }
+            Cmd::Repair => {
+                ctx.busy(Some("Чиню службу обхода"));
+                repair(&mut ctx);
                 ctx.settings.save();
                 push_status(&mut ctx, Scan::System);
                 ctx.busy(None);
@@ -647,7 +703,7 @@ fn scan_after(cap: Cap) -> Scan {
         Cap::Watchdog | Cap::Dns | Cap::LocalProxy | Cap::OwnProxy | Cap::DnsRotation => {
             Scan::System
         }
-        Cap::BuiltinExits | Cap::VerifyTls | Cap::VpnDetect => Scan::Settings,
+        Cap::BuiltinExits | Cap::VerifyTls => Scan::Settings,
     }
 }
 
@@ -694,7 +750,7 @@ fn push_status(ctx: &mut Ctx, scan: Scan) {
 ///
 /// The DNS row is included because it is settings-derived *in part*: whether a
 /// measured tunnel blocks it depends on `vpn_detect`. It is rebuilt from the raw
-/// pair the last system scan kept, so flipping «Определять VPN» updates the row
+/// pair the last system scan kept, so a settings-only flip updates the row
 /// it governs without going near a scheduled task.
 fn settings_only_status(ctx: &Ctx, prev: Status) -> Status {
     let (rules, relay) = ctx.dns_probe;
@@ -704,6 +760,7 @@ fn settings_only_status(ctx: &Ctx, prev: Status) -> Status {
         // and a row carried forward from the last system scan would say a relay
         // that died an hour ago is still running.
         relay_running: relay,
+        rules,
         own_proxy_text: upstream::configured()
             .map(|u| u.display())
             .unwrap_or_else(|| ctx.settings.own_proxy.clone()),
@@ -721,7 +778,6 @@ impl Status {
     /// a switch that answers differently depending on which path drew it.
     fn with_settings_switches(mut self, s: &Settings) -> Self {
         self.builtin_exits = on_off(s.builtin_exits);
-        self.vpn_detect = on_off(s.vpn_detect);
         self.verify_tls = if s.verify_tls {
             State::On
         } else {
@@ -827,19 +883,14 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
         own_proxy,
         own_proxy_text,
         builtin_exits: State::Off,
-        vpn_detect: State::Off,
         verify_tls: State::Off,
         vpn: ctx.vpn,
         dns_rotation: State::Off,
         relay_outdated,
         relay_running: dns_probe.1,
-        relay_exe: {
-            let exe = background::installed_exe();
-            exe.exists().then_some(exe)
-        },
+        rules: dns_probe.0,
         relay_egress: ctx.relay_egress,
         providers: Vec::new(),
-        client_exes: client_exes(&installs),
         installs,
     }
     .with_settings_switches(&ctx.settings)
@@ -883,9 +934,7 @@ fn vpn_change_line(now: VpnSeen) -> Option<&'static str> {
         VpnSeen::CarryingClient => Some(
             "Antigravity пошёл через VPN — снятие ошибки 400 теперь зависит от вашего сервера.",
         ),
-        VpnSeen::NotCarryingClient => {
-            Some("Трафик Antigravity идёт мимо VPN — обход применяется.")
-        }
+        VpnSeen::NotCarryingClient => Some("Трафик Antigravity идёт мимо VPN — обход применяется."),
         VpnSeen::ViaLocalProxy => Some(
             "Antigravity ходит через локальный прокси — до серверов Google \
              соединение открывает служба обхода, а не он сам.",
@@ -925,20 +974,10 @@ fn dns_state(
     vpn: Option<VpnSeen>,
     detect_on: bool,
 ) -> State {
-    // Said before anything else, because it is the one reason the switch can be
-    // off while everything about the setup is right.
-    if detect_on && vpn == Some(VpnSeen::CarryingClient) {
-        if !rules {
-            return State::Blocked("Antigravity идёт через VPN — обход не применяется".to_string());
-        }
-        // Rules *are* in — installed before the client went into the tunnel, and
-        // only an elevated run takes them off again (`refresh_pinned_hosts`).
-        // They resolve to our relay, and the relay stands down for a tunnel it
-        // measures the client inside of, so they are in place and doing nothing.
-        // Drawing that as a plain "on" is the window and the layer disagreeing
-        // about the same measurement.
-        return State::Partial("правила стоят, но Antigravity в туннеле".to_string());
-    }
+    // No VPN branch any more (D25): the layer does not stand down for a tunnel,
+    // so a client measured inside one says nothing about whether the rules are
+    // doing their job. The parameters stay so the callers keep one signature.
+    let _ = (vpn, detect_on);
     match (rules, relay) {
         (true, true) => State::On,
         // The rules name the relay first (I5). Rules without it resolve through
@@ -978,29 +1017,6 @@ fn read_own_proxy() -> State {
     } else {
         State::Off
     }
-}
-
-/// Every language server found, by full path.
-///
-/// `language_server*` only — never `agy.exe` and never the Electron shell. The
-/// same set `egress::CLIENT_PROCESS_GLOB` counts sockets for, and for the same
-/// reason: the shell carries no gated call, so excluding it from a tunnel would
-/// change nothing and excluding the CLI is a separate decision the user can make
-/// for themselves.
-fn client_exes(installs: &[InstallRow]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for root in installs.iter().filter_map(|i| i.path.as_ref()) {
-        for bin in patch_binary::binary_targets(root) {
-            let is_ls = bin
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("language_server"));
-            if is_ls && !out.contains(&bin) {
-                out.push(bin);
-            }
-        }
-    }
-    out
 }
 
 /// The three kinds, in the order the window lists them.
@@ -1093,17 +1109,49 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
 
     match (cap, on) {
         (Cap::ClientPatch, true) => {
+            // From the click, unlike the line below: the user wants the patch
+            // whether or not an install was found to take it, and auto-patch
+            // puts it on whatever turns up later (D27).
+            ctx.settings.patch_declined = false;
             // Set from the result, not from the click: a run that found no
             // install patched nothing, and persisting `true` there would leave
             // the switch reading On for ever on a machine with no Antigravity.
             ctx.settings.client_patch = enable_client_patch(ctx);
+            // Switching the patch off took the watchdog task down with it. The
+            // relay's own watchdog thread acts again the moment the decline is
+            // gone, so without the task back the switch would read off while
+            // patching went on. Only with the relay wanted: `set_watchdog`
+            // installs the relay if it is missing.
+            if is_admin()
+                && ctx.settings.dns
+                && ctx.settings.auto_patch_wanted()
+                && !background::is_watchdog_enabled()
+            {
+                set_watchdog(ctx, true);
+            }
         }
         (Cap::ClientPatch, false) => {
             ctx.settings.client_patch = false;
+            // The one wish auto-patch has to respect (G38). Saved before
+            // anything is unpatched, so a watchdog reading the file mid-run
+            // already sees it.
+            ctx.settings.patch_declined = true;
+            if !ctx.settings.save() {
+                ctx.log(
+                    Level::Warn,
+                    "Настройки не сохранились (файл занят?) — автопатч может вернуть патч. Выключите и «Автопатч».",
+                );
+            }
             disable_client_patch(ctx);
         }
         (Cap::Watchdog, on) => {
             ctx.settings.auto_patch = on;
+            // Auto-patch switched on is the newer wish, and it means "keep
+            // Antigravity patched" - a patch declined earlier would otherwise
+            // leave the switch on and the watchdog doing nothing.
+            if on {
+                ctx.settings.patch_declined = false;
+            }
             set_watchdog(ctx, on);
         }
         (Cap::Dns, on) => {
@@ -1171,23 +1219,6 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
                 },
             );
         }
-        (Cap::VpnDetect, on) => {
-            ctx.settings.vpn_detect = on;
-            ctx.log(
-                Level::Ok,
-                if on {
-                    "Определение VPN включено: если Antigravity ходит через туннель, правила DNS ставиться не будут."
-                } else {
-                    "Определение VPN выключено: правила DNS будут ставиться даже поверх активного VPN."
-                },
-            );
-            // Deliberately *not* re-measured here. The measurement answers
-            // "do the client's own sockets leave through a tunnel" — a fact
-            // about the machine that this switch does not touch; it only
-            // changes what the layer does about it, and the indicator already
-            // reads the switch. Re-measuring cost a PowerShell round trip per
-            // flip to be told the same thing.
-        }
         (Cap::BuiltinExits, on) => {
             ctx.settings.builtin_exits = on;
             ctx.log(
@@ -1202,7 +1233,193 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
     }
 }
 
+// --- the two buttons --------------------------------------------------------
+
+/// «Включить всё». Each part only if it is not on already, and in the order the
+/// switches themselves need: the patch first (it closes Antigravity, so nothing
+/// is holding a file), then the relay (I5 - the rules name it), the proxy
+/// variable only once something answers on its port (I53), and auto-patch last,
+/// because it runs out of the relay's install directory.
+fn enable_all(ctx: &mut Ctx) {
+    let admin = is_admin() || !cfg!(target_os = "windows");
+    // "Everything" includes the patch on installs that do not exist yet.
+    ctx.settings.patch_declined = false;
+    // Only when it is not already on everywhere: patching closes Antigravity,
+    // and closing it for a no-op is exactly the kind of surprise this button
+    // must not have.
+    if !patch_is_on(ctx) {
+        apply(ctx, Cap::ClientPatch, true);
+    }
+    // Nothing but a line in settings.json, so it needs nobody's permission.
+    if !ctx.settings.builtin_exits {
+        apply(ctx, Cap::BuiltinExits, true);
+    }
+    let dns_on =
+        dns::is_nrpt_applied() && background::is_running() && !background::relay_is_outdated();
+    if !dns_on {
+        if !admin {
+            // Said only when it is actually missing: the card offers this button
+            // for a patch that is off too, with the bypass already running.
+            ctx.log(
+                Level::Warn,
+                "Обход ошибки 400 не включён: нужны права администратора. Нажмите «Перезапустить от имени администратора».",
+            );
+            return;
+        }
+        apply(ctx, Cap::Dns, true);
+    }
+    // A proxy the user set up themselves stays theirs (G33): `enable_local_proxy`
+    // says so and leaves ours off, which also keeps the loopback door shut.
+    if !endpoint::proxy_env_is_ours() {
+        apply(ctx, Cap::LocalProxy, true);
+    }
+    // Whether or not the patch found anything to patch: auto-patch is what
+    // patches the Antigravity installed after this click (D27).
+    if admin && !background::is_watchdog_enabled() {
+        apply(ctx, Cap::Watchdog, true);
+    }
+    ctx.log(
+        Level::Ok,
+        "Готово. Откройте Antigravity и напишите что-нибудь в чат — здесь появится подтверждение, что модель ответила.",
+    );
+}
+
+fn patch_is_on(ctx: &Ctx) -> bool {
+    ctx.last
+        .as_ref()
+        .is_some_and(|s| s.client_patch == State::On)
+}
+
+/// «Починить». The service is the part that can stop on its own - a crash the
+/// task's restart policy gave up on, a relay older than this build, an antivirus
+/// that ate the copy in `%ProgramData%` - and every one of those is fixed by
+/// installing it again and putting its rules and variable back.
+fn repair(ctx: &mut Ctx) {
+    if cfg!(target_os = "windows") && !is_admin() {
+        ctx.log(
+            Level::Err,
+            "Нужны права администратора. Нажмите «Перезапустить от имени администратора».",
+        );
+        return;
+    }
+    ctx.settings.dns = true;
+    // `ensure_running` reinstalls only a copy that differs from this build;
+    // a relay that is merely stopped or outdated needs the full `enable`.
+    if let Err(e) = background::enable() {
+        ctx.log(Level::Err, format!("Служба обхода не запустилась: {}", e));
+        return;
+    }
+    ctx.log(Level::Ok, "Служба обхода переустановлена и запущена.");
+    enable_dns(ctx);
+}
+
 // --- client patch ----------------------------------------------------------
+
+/// Settles `patch_declined` for a settings file an older build wrote (D27).
+///
+/// Before D27 a patch switched off by hand left two traces: `client_patch`
+/// false, and the standalone watchdog task removed (`disable_client_patch`).
+/// `parse` could only read the first and so took every patch-off file as
+/// declined. The task is the second trace, and only this side can ask for it:
+/// with it still registered the user saw auto-patch *on*, and it may act -
+/// which is the owner's own machine (G55). Written back at once, so the relay
+/// reads the settled answer and this runs once per machine.
+fn settle_decline(ctx: &mut Ctx) {
+    if !ctx.settings.decline_unrecorded {
+        return;
+    }
+    ctx.settings.patch_declined = !ctx.settings.client_patch && !background::is_watchdog_enabled();
+    ctx.settings.decline_unrecorded = false;
+    ctx.settings.save();
+}
+
+/// Auto-patch from the window (D27): every install the last deep scan found
+/// unpatched is patched now, without a click, while auto-patch is on and the
+/// patch was not switched off by hand. True when something was written, so the
+/// caller knows the dots need a deep re-read.
+///
+/// The watchdog's own primitive, not `enable_client_patch`: that one closes
+/// every Antigravity process up front, which is right for a button the user
+/// pressed and wrong for something nobody asked for this second. This one
+/// closes a process only when a binary it holds cannot be written otherwise -
+/// and Desktop restarts its language server by itself and reloads the window,
+/// which is what brings a black window back to life.
+fn auto_patch_found(ctx: &mut Ctx) -> bool {
+    // Only while the switch is drawn on («при включенной опции»). Its state is
+    // the standalone task, which a user without admin rights cannot have and
+    // which `disable_dns` takes down with the relay («вернётся вместе с
+    // обходом»); patching behind a switch that reads off is the surprise the
+    // switch exists to rule out.
+    let switch_on = ctx.last.as_ref().is_some_and(|s| s.watchdog.is_on());
+    if !switch_on || !ctx.settings.auto_patch_wanted() {
+        return false;
+    }
+    let found: Vec<(&'static str, PathBuf)> = ctx
+        .last
+        .as_ref()
+        .map(|s| {
+            s.installs
+                .iter()
+                .filter(|r| r.patched == Some(false))
+                .filter_map(|r| Some((r.label, r.path.clone()?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if found.is_empty() {
+        return false;
+    }
+
+    ctx.busy(Some("Автопатч"));
+    let mut wrote = false;
+    for (label, inst) in found {
+        let mut patched = 0usize;
+        let mut unknown = 0usize;
+        let mut failed: Option<String> = None;
+        for (_, outcome) in crate::watchdog::patch_now(&inst) {
+            match outcome {
+                patch_binary::RepatchOutcome::Repatched(_) => patched += 1,
+                patch_binary::RepatchOutcome::AlreadyPatched => {}
+                patch_binary::RepatchOutcome::SignatureMissing => unknown += 1,
+                patch_binary::RepatchOutcome::Failed(e) => failed = Some(e),
+            }
+        }
+        let where_ = crate::utils::mask_path(&inst.display().to_string());
+        if patched > 0 {
+            wrote = true;
+            ctx.log(
+                Level::Ok,
+                format!("Автопатч: {} — патч наложен ({})", label, where_),
+            );
+        }
+        if let Some(e) = failed {
+            ctx.log(
+                Level::Warn,
+                format!(
+                    "Автопатч: {} — не удалось записать ({}). Закройте Antigravity и нажмите «Включить всё».",
+                    label, e
+                ),
+            );
+        } else if unknown > 0 && patched == 0 {
+            // The watchdog's rule (I19): a build this patcher does not know is
+            // left exactly as it is, so Antigravity shows its own error.
+            ctx.log(
+                Level::Warn,
+                format!(
+                    "Автопатч: {} — эта сборка Antigravity анлокеру ещё не знакома, файлы не тронуты. Нужна новая версия анлокера.",
+                    label
+                ),
+            );
+        }
+    }
+    if wrote {
+        // What the switch falls back to before the next deep read, and what an
+        // older build reading this file takes as the user's wish.
+        ctx.settings.client_patch = true;
+        ctx.settings.save();
+    }
+    // Left raised: every caller re-reads the installs next and lowers it after.
+    wrote
+}
 
 fn enable_client_patch(ctx: &mut Ctx) -> bool {
     ctx.log(Level::Step, "Патч клиента Antigravity");
@@ -1284,11 +1501,14 @@ fn disable_client_patch(ctx: &mut Ctx) {
     // that runs inside the relay — and are restored below to whatever the user
     // still has switched on.
     // The relay comes back if the user still wants the DNS bypass. The watchdog
-    // does NOT: `client_patch` is false by the time this runs, and a watchdog is
-    // a process whose whole job is to put the patch back. Restoring it here undid
-    // the unpatch about four seconds later and flipped the switch on again.
-    // `settings.auto_patch` keeps its value, so the watchdog returns the moment
-    // the patch does.
+    // does NOT: a watchdog is a process whose whole job is to put the patch back.
+    // Restoring it here undid the unpatch about four seconds later and flipped
+    // the switch on again. The relay's own watchdog thread comes back with the
+    // relay and stays idle, because `patch_declined` is already on disk - the
+    // caller saved it before calling this, and the relay reads the file fresh
+    // when it starts (a save after the relay was up would lose the race to its
+    // first two polls). `settings.auto_patch` keeps its value, so the watchdog
+    // returns the moment the patch does.
     let want_relay = ctx.settings.dns;
     background::disable_watchdog();
     if let Err(e) = background::disable() {
@@ -1420,7 +1640,7 @@ fn enable_dns(ctx: &mut Ctx) {
     if ctx.settings.local_proxy && !endpoint::proxy_env_is_ours() {
         enable_local_proxy(ctx);
     }
-    if ctx.settings.auto_patch && ctx.settings.client_patch && !background::is_watchdog_enabled() {
+    if ctx.settings.auto_patch_wanted() && !background::is_watchdog_enabled() {
         set_watchdog(ctx, true);
     }
 }
@@ -1539,13 +1759,17 @@ fn enable_local_proxy(ctx: &mut Ctx) {
 
     // 4. I53/G31: never name a listener that is not there. A variable pointing
     //    at a dead port takes the sign-in down with it.
-    if !proxy::wait_for_listener(Duration::from_secs(3)) {
+    //    Named by the port that answered, not the one read above: the relay can
+    //    move the proxy while this waits (P26), and a URL for the port it left
+    //    would be a dead one no watchdog takes back off.
+    let Some(port) = proxy::wait_for_our_listener(Duration::from_secs(3)) else {
         ctx.log(
             Level::Err,
             "Локальный прокси не отвечает — сначала включите «Обход через DNS».",
         );
         return;
-    }
+    };
+    let url = proxy::url_at(port);
 
     match endpoint::apply_proxy(&url, "") {
         Ok(_) => ctx.log(Level::Ok, "Локальный прокси включён."),
@@ -1726,11 +1950,9 @@ mod tests {
     fn the_cheap_refresh_and_the_full_one_agree_about_the_settings_switches() {
         let mut s = Settings::default();
         s.verify_tls = false;
-        s.vpn_detect = false;
         let a = blank_status().with_settings_switches(&s);
         let b = blank_status().with_settings_switches(&s);
         assert_eq!(a.verify_tls, b.verify_tls);
-        assert_eq!(a.vpn_detect, b.vpn_detect);
         assert_eq!(a.dns_rotation, b.dns_rotation);
         assert_eq!(a.providers.len(), crate::resolvers::provider_names().len());
     }
@@ -1740,7 +1962,6 @@ mod tests {
     #[test]
     fn only_the_switches_that_touch_the_system_pay_for_a_system_scan() {
         assert_eq!(scan_after(Cap::VerifyTls), Scan::Settings);
-        assert_eq!(scan_after(Cap::VpnDetect), Scan::Settings);
         assert_eq!(scan_after(Cap::BuiltinExits), Scan::Settings);
         assert_eq!(scan_after(Cap::Dns), Scan::System);
         assert_eq!(scan_after(Cap::LocalProxy), Scan::System);
@@ -1798,15 +2019,13 @@ mod tests {
             own_proxy: State::Off,
             builtin_exits: State::Off,
             dns_rotation: State::Off,
-            vpn_detect: State::Off,
             verify_tls: State::Off,
             vpn: None,
             own_proxy_text: String::new(),
             relay_outdated: false,
             relay_running: false,
+            rules: false,
             providers: Vec::new(),
-            client_exes: Vec::new(),
-            relay_exe: None,
             relay_egress: None,
         }
     }
@@ -1837,9 +2056,10 @@ mod tests {
             dns_state(true, true, true, Some(VpnSeen::Unmeasured), true),
             State::On
         );
-        assert!(matches!(
-            dns_state(true, false, true, Some(VpnSeen::CarryingClient), true),
-            State::Blocked(_)
-        ));
+        // A client in a tunnel no longer blocks the row either (D25).
+        assert_eq!(
+            dns_state(true, true, true, Some(VpnSeen::CarryingClient), true),
+            State::On
+        );
     }
 }

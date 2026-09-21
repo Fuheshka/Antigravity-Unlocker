@@ -120,8 +120,9 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
                     // into view - which reads as the window jumping on its own.
                     ui.ctx().memory_mut(|m| m.surrender_focus(resp.id));
                     // The first snapshot was taken while this screen was up; ask for
-                    // a fresh one now in case anything changed in between.
-                    app.worker.send(crate::ops::Cmd::Refresh);
+                    // a fresh one now in case anything changed in between - and let
+                    // auto-patch act, which it may only do from here on (D27).
+                    app.worker.send(crate::ops::Cmd::Unlocked);
                 } else {
                     app.key_rejected = true;
                 }

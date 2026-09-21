@@ -1,0 +1,10 @@
+# The C runtime linked into the exe, not loaded from VCRUNTIME140.dll.
+#
+# Rust's MSVC target links the CRT dynamically by default, and VCRUNTIME140.dll
+# is not part of Windows: it comes with the Visual C++ Redistributable, which a
+# clean Windows 10 does not have. There the exe did not start at all - Windows'
+# loader refuses it before `main` with "VCRUNTIME140.dll was not found", a
+# dialog that names none of our code. `+crt-static` puts the runtime inside the
+# exe (UCRT included), so the only DLLs it needs are the ones Windows ships.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

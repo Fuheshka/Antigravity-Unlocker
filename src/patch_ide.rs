@@ -40,10 +40,13 @@ fn backup_once(target: &Path) {
 /// Windows and POSIX). A crash or power loss leaves either the old file or the
 /// new one, never a half-written 15 MB `main.js`.
 fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".agtmp");
-    let tmp = PathBuf::from(tmp);
-    fs::write(&tmp, content)?;
+    // Per process, for the reason `patch_binary::temp_path` gives.
+    crate::patch_binary::sweep_stale_temps(path);
+    let tmp = crate::patch_binary::temp_path(path);
+    if let Err(e) = fs::write(&tmp, content) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     match fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -590,9 +593,8 @@ mod tests {
         fs::write(&target, "old").unwrap();
         write_atomic(&target, "new content").unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "new content");
-        let mut tmp = target.as_os_str().to_os_string();
-        tmp.push(".agtmp");
-        assert!(!std::path::Path::new(&tmp).exists(), "temp cleaned up");
+        let tmp = crate::patch_binary::temp_path(&target);
+        assert!(!tmp.exists(), "temp cleaned up");
         fs::remove_dir_all(&dir).ok();
     }
 

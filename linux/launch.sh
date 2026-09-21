@@ -13,7 +13,15 @@
 # would put an empty black window behind the real one, and on a box with no
 # terminal emulator installed the old fallback ("hope stdout is visible") left
 # the user with nothing at all. What it does instead is check that there is a
-# graphical session to draw into, and say so plainly when there is not.
+# graphical session to draw into. With none, a terminal still gets the whole
+# program as the terminal UI (the binary picks it by itself - `--tui` is only
+# said here to be plain about it); with neither, it says so.
+
+# Started as `sh launch.sh`: on Debian/Ubuntu sh is dash, which stops at the
+# first bash-only line below. POSIX up to here, so dash can hand over.
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
 set -u
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -38,19 +46,54 @@ say_error() {
     fi
 }
 
-if [ ! -x "$BIN" ]; then
-    say_error "Не найден исполняемый файл: $BIN
-
-Если папка лежит на общей шаре VM (/mnt/hgfs, /media/sf_*), скопируйте её
-в домашнюю папку — оттуда запуск невозможен (монтируется с noexec)."
+# As the user, never through sudo. Root has no key to the user's X/Wayland
+# session («Authorization required, but no authorization protocol specified»),
+# and everything this tool touches - the installs under ~/.local/share, the
+# systemd user unit, ~/.config/environment.d - is the user's: as root it would
+# look for Antigravity in root's home and set the proxy up for root. A server
+# where root *is* the user (no SUDO_USER) is fine.
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+    say_error "Запускайте без sudo: bash launch.sh
+Под root программа не видит ваш рабочий стол и искала бы Antigravity
+в домашней папке root, а не $SUDO_USER. Права root ей не нужны."
     exit 1
 fi
 
-# No X11 and no Wayland means no window. Better to say that than to let the
-# binary fail somewhere inside winit with a message nobody sees.
+if [ ! -f "$BIN" ]; then
+    say_error "Не найден файл программы: $BIN
+Распакуйте архив целиком и запустите launch.sh из распакованной папки."
+    exit 1
+fi
+
+# A folder the program cannot run from: a VM share or a Windows (NTFS/FAT)
+# drive mounted noexec, or an archive unpacked by something that dropped the
+# permissions - chmod cannot help on the first two, and asking the user for a
+# command is what this script is for avoiding. Run a copy from the home folder
+# instead, where both always work. `--version` answers and exits at once.
+if ! "$BIN" --version >/dev/null 2>&1; then
+    HOME_BIN="${XDG_DATA_HOME:-$HOME/.local/share}/agunlocker/ag_unlocker"
+    if mkdir -p "$(dirname "$HOME_BIN")" \
+        && cp -f "$BIN" "$HOME_BIN.new" \
+        && chmod +x "$HOME_BIN.new" \
+        && mv -f "$HOME_BIN.new" "$HOME_BIN" \
+        && "$HOME_BIN" --version >/dev/null 2>&1; then
+        BIN="$HOME_BIN"
+    else
+        say_error "Программа не запускается ни отсюда, ни из домашней папки: $BIN
+Нужен 64-битный Linux (x86-64)."
+        exit 1
+    fi
+fi
+
+# No X11 and no Wayland means no window. In a terminal (a server over SSH) the
+# same program runs as a terminal UI; double-clicked with neither, say so rather
+# than let the binary fail somewhere inside winit with a message nobody sees.
 if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    if [ -t 0 ] && [ -t 1 ]; then
+        exec "$BIN" --tui "$@"
+    fi
     say_error "Нет графической сессии (не заданы DISPLAY и WAYLAND_DISPLAY).
-Antigravity Unlocker — это окно; запустите его из графического сеанса."
+Запустите из терминала: $BIN --tui"
     exit 1
 fi
 
