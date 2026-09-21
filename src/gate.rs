@@ -308,7 +308,20 @@ pub fn publish(now: Now<'_>) {
     });
 }
 
-/// Records what keeps `what` (`door` or `proxy`) from binding, or clears it.
+/// Writes the record the moment the relay starts, before anything it does has
+/// had time to succeed or fail.
+///
+/// The window decides whether the relay is alive from this file's age: the
+/// watchdog is a separate process of the same image name, so the task list
+/// cannot tell the two apart (P54). Without a write at start there would be a
+/// window after every install where a perfectly live relay has published
+/// nothing yet and would read as dead.
+pub fn note_started() {
+    update(|_| {});
+}
+
+/// Records what keeps `what` (`dns`, `door` or `proxy`) from binding, or clears
+/// it.
 /// Written through at once rather than at the next warm pass.
 pub fn set_blocker(what: &str, blocker: Option<Blocker>) {
     update(|r| {

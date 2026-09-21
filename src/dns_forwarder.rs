@@ -1,6 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::net::UdpSocket;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
@@ -121,7 +121,24 @@ pub const LISTEN_PORT: u16 = 53;
 ///     have (P26), and reports when nothing on the internet answers it
 ///     (`gate::Report::{blockers, reached_at, started_at, exe}`, P53). An older
 ///     relay leaves a user with `os error 10013` in its log and a 400 on screen.
-pub const RELAY_VERSION: u32 = 32;
+/// 33 = its own UDP `:53` is retried and diagnosed like the other two listeners
+///     instead of killing the process (`serve_dns_forever`), so a machine where
+///     something holds port 53 still gets the door, the proxy, the exits and
+///     the auto-patch; a refusal no longer benches - or even disconnects - a
+///     route that carried a model answer in the last ninety seconds
+///     (`routes::Blamed::Proven`), the first bench is two minutes rather than
+///     ten, a region bench orders a route instead of removing it from the table
+///     for every kind alike, and a route that fails its probe is kept back
+///     until one succeeds. An older relay drops the working route mid-answer
+///     and thrashes between benched ones.
+/// 37 = a refusal the table declines to hold against a route no longer costs it
+///     its place in the order either (`routes::bad_at` split from
+///     `refused_at`, G76), the connection a refusal arrived on is named in the
+///     log and closed when it is not the one carrying the answer, and the log
+///     says which host was refused and how many answers were held back. An
+///     older relay swaps the gate route away from the one that is answering
+///     every fifteen seconds and cannot say whether a route half-works.
+pub const RELAY_VERSION: u32 = 37;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -256,9 +273,13 @@ fn stamp() -> String {
 fn log(line: &str) {
     // Never from a test. The file is the *installed* relay's log, and a unit test
     // exercising `health` or `routes` used to append lines like «тест отложен на
-    // 5 мин» to it on the developer's machine - which the window's «Скопировать
-    // отчёт» now pastes into a support message (G18's other half).
+    // 5 мин» to it on the developer's machine - which the window's «Сохранить
+    // отчёт» now puts in a support file (G18's other half).
     if cfg!(test) {
+        return;
+    }
+    let (note, write_line) = collapse_repeat(line);
+    if note.is_none() && !write_line {
         return;
     }
     let path = log_path();
@@ -274,9 +295,59 @@ fn log(line: &str) {
         // processes) logging at once interleaved into lines like
         // «16:48:2616:48:26 PASSTHROUGH … PASSTHROUGH …» - seen in reports from
         // both platforms.
-        let entry = format!("{} {}\n", stamp(), line);
+        let at = stamp();
+        let mut entry = String::new();
+        if let Some(note) = note {
+            entry.push_str(&format!("{} {}\n", at, note));
+        }
+        if write_line {
+            entry.push_str(&format!("{} {}\n", at, line));
+        }
         f.write_all(entry.as_bytes()).ok();
     }
+}
+
+/// How long a line has to repeat within to be counted rather than written.
+const REPEAT_WINDOW: Duration = Duration::from_secs(30);
+/// …and how many repeats are counted before the tally is written anyway, so a
+/// problem repeating forever is never silent.
+const REPEAT_RUN: u32 = 50;
+
+/// Collapses a run of one identical line into a count.
+///
+/// The log holds 64 KB and the report shows its last 60 lines, so a burst of
+/// one message costs exactly the minutes a report is about: a field report
+/// (2026-09-21) spent fifteen of its sixty visible lines on the same
+/// «напрямую …: имя не разрешается» inside a single second, and the route
+/// switch that followed was off the top of it.
+///
+/// Returns the tally line to write first, if any, and whether `line` itself is
+/// written. The *first* of a run always goes out at once - the news is that it
+/// happened, and a delayed first line is a log that lies about when.
+fn collapse_repeat(line: &str) -> (Option<String>, bool) {
+    static RUN: Mutex<Option<(String, u32, Instant)>> = Mutex::new(None);
+    let tally = |n: u32| format!("↑ то же самое ещё {} раз", n);
+    let Ok(mut g) = RUN.lock() else {
+        return (None, true);
+    };
+    let same = g
+        .as_ref()
+        .is_some_and(|(prev, _, at)| prev == line && at.elapsed() < REPEAT_WINDOW);
+    if same {
+        let mut flush = None;
+        if let Some((_, n, at)) = g.as_mut() {
+            *n += 1;
+            *at = Instant::now();
+            if *n >= REPEAT_RUN {
+                flush = Some(tally(*n));
+                *n = 0;
+            }
+        }
+        return (flush, false);
+    }
+    let held = g.as_ref().map_or(0, |(_, n, _)| *n);
+    *g = Some((line.to_string(), 0, Instant::now()));
+    ((held > 0).then(|| tally(held)), true)
 }
 
 /// The only way a failed start can be reported: the console is gone by then.
@@ -650,9 +721,16 @@ fn answer_log(hits: &[(std::path::PathBuf, ls_log::Tally)]) {
             .file_name()
             .map_or_else(String::new, |f| f.to_string_lossy().into_owned());
         if t.refusals > 0 {
+            // The host, when the log named one: a refusal about a name we do
+            // not route at all is a different story from one on a gate host,
+            // and the line said neither (three field reports, 2026-09-21).
             log_proxy(&format!(
-                "region-400 x{} в {} — Antigravity упёрся в гейт",
-                t.refusals, file
+                "region-400 x{} в {}{} — Antigravity упёрся в гейт",
+                t.refusals,
+                file,
+                t.refused_host
+                    .as_deref()
+                    .map_or_else(String::new, |h| format!(" ({h})"))
             ));
         }
         refusals += t.refusals;
@@ -700,30 +778,133 @@ fn newest(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
     }
 }
 
+/// One line about the connection a refusal came in on: the fact that decides
+/// whether changing the route could possibly help.
+///
+/// Same connection as the one carrying an answer → the backend is turning
+/// single requests down and every road leads to the same place. A sibling →
+/// this is one pooled connection that went bad while another works, and closing
+/// it is what makes the client dial a fresh one (D26). The log could not tell
+/// the two apart, and three field reports (2026-09-21) turn on exactly that:
+/// a route answering and refusing in the same minute, over and over.
+fn connection_note(kind: routes::Kind, id: u64, shape: Option<routes::Shape>) -> String {
+    let Some(s) = shape else {
+        return format!("region-400 по соединению #{} «{}»", id, kind.label());
+    };
+    let open = routes::open_counts();
+    let others: Vec<String> = routes::ALL
+        .iter()
+        .zip(open)
+        .filter(|(_, n)| *n > 0)
+        .map(|(k, n)| format!("{} {}", k.label(), n))
+        .collect();
+    let what = match s.answered_ago {
+        Some(ago) => format!(
+            "то же соединение, по которому шёл ответ ({} с назад, {} КБ)",
+            ago.as_secs(),
+            s.to_client / 1024
+        ),
+        None => format!(
+            "ответов не нёс, открыто {} с, {} КБ",
+            s.age.as_secs(),
+            s.to_client / 1024
+        ),
+    };
+    format!(
+        "region-400 по соединению #{} «{}»: {}; открыто: {}",
+        id,
+        kind.label(),
+        what,
+        others.join(", ")
+    )
+}
+
 fn on_refusals(count: usize, at: Instant, host: Option<&str>) {
-    let carried = routes::attribute(at, host);
+    let carried = routes::attribute_tunnel(at, host);
     let mut acted: Vec<String> = Vec::new();
     match carried {
-        Some(kind) => match routes::blame(kind) {
-            Some(penalty) => {
-                log_proxy(&format!(
-                    "маршрут «{}» нёс region-400 — отложен на {}, его соединения закрыты",
-                    kind.label(),
-                    human_minutes(penalty)
-                ));
-                acted.push(format!(
-                    "маршрут «{}» отложен на {}, следующее соединение пойдёт другим",
-                    kind.label(),
-                    human_minutes(penalty)
-                ));
+        Some((kind, tunnel)) => {
+            let shape = routes::tunnel_shape(tunnel);
+            log_proxy(&connection_note(kind, tunnel, shape));
+            match routes::blame(kind) {
+                routes::Blamed::Benched(penalty) => {
+                    log_proxy(&format!(
+                        "маршрут «{}» нёс region-400 — отложен на {}, его соединения закрыты",
+                        kind.label(),
+                        human_minutes(penalty)
+                    ));
+                    acted.push(format!(
+                        "маршрут «{}» отложен на {}, следующее соединение пойдёт другим",
+                        kind.label(),
+                        human_minutes(penalty)
+                    ));
+                }
+                // The route answered a moment ago, so the refusal is about the
+                // request or about a connection the client made without us -
+                // not about the road. Leaving its sockets alone is the point:
+                // an answer arrives as a stream, and cutting them is how a user
+                // loses one halfway through.
+                routes::Blamed::Proven(ago) => {
+                    log_proxy(&format!(
+                        "маршрут «{}» нёс region-400, но ответ модели был {} с назад — оставлен как есть",
+                        kind.label(),
+                        ago.as_secs()
+                    ));
+                    acted.push(format!(
+                        "по «{}» модель отвечала {} с назад — маршрут и его соединения не тронуты",
+                        kind.label(),
+                        ago.as_secs()
+                    ));
+                }
+                routes::Blamed::AlreadyBenched => {
+                    acted.push(format!(
+                        "соединения через «{}» закрыты — повтор пойдёт другим путём",
+                        kind.label()
+                    ));
+                }
+                // A tunnel that carried an answer is still open on this route,
+                // so the answer is still coming through it. The route is not
+                // touched at all, and nothing is on a clock: it ends when the
+                // client closes (D32).
+                routes::Blamed::Streaming { idle, to_client } => {
+                    log_proxy(&format!(
+                        "маршрут «{}» нёс region-400, но по нему идёт ответ модели ({} КБ, байты {} с назад) — не тронут",
+                        kind.label(),
+                        to_client / 1024,
+                        idle.as_secs()
+                    ));
+                    // The route is protected, and so is the connection carrying
+                    // the answer. The connection the refusal actually arrived
+                    // on is protected only when it is that same one. For a
+                    // sibling D26 still holds, narrowed to it alone: closing it
+                    // makes the client dial again, and the new connection is
+                    // offered the table afresh, while the answer in flight
+                    // never notices.
+                    let same = shape.is_some_and(|s| s.answered_ago.is_some());
+                    if same {
+                        acted.push(format!(
+                            "ошибка 400 пришла по тому же соединению, по которому идёт ответ модели («{}»): отказывают отдельные запросы, а не маршрут — смена маршрута тут не поможет",
+                            kind.label()
+                        ));
+                    } else if routes::cut_tunnel(tunnel) {
+                        log_proxy(&format!(
+                            "соединение #{} закрыто — по «{}» ответ модели идёт по другому, его не трогаем",
+                            tunnel,
+                            kind.label()
+                        ));
+                        acted.push(format!(
+                            "по «{}» идёт ответ модели — маршрут не тронут; отказавшее соединение закрыто, следующий запрос пойдёт по новому",
+                            kind.label()
+                        ));
+                    } else {
+                        acted.push(format!(
+                            "по «{}» сейчас идёт ответ модели — маршрут и его соединения не тронуты",
+                            kind.label()
+                        ));
+                    }
+                }
             }
-            None => {
-                acted.push(format!(
-                    "соединения через «{}» закрыты — повтор пойдёт другим путём",
-                    kind.label()
-                ));
-            }
-        },
+        }
         // The client reached Google without us, from inside a tunnel the relay
         // was standing down for: that tunnel exits somewhere blocked, so the
         // substituted address is sent back through it for a while (D15's rule,
@@ -748,13 +929,20 @@ fn on_refusals(count: usize, at: Instant, host: Option<&str>) {
             );
         }
     }
-    gate::record_episode(count as u32, acted.join("; "), carried.map(|k| k.label()));
+    gate::record_episode(
+        count as u32,
+        acted.join("; "),
+        carried.map(|(k, _)| k.label()),
+    );
 }
 
 fn on_answers(count: usize, at: Instant, host: Option<&str>) {
-    let carried = routes::attribute(at, host);
-    if let Some(kind) = carried {
+    let carried = routes::attribute_tunnel(at, host);
+    if let Some((kind, tunnel)) = carried {
         routes::credit(kind);
+        // The tunnel as well as the route: while *it* is open the answer is
+        // still arriving, and nothing is allowed to bench or cut it (D32).
+        routes::credit_tunnel(tunnel);
         // A model answer is the one thing that settles whether the relay works,
         // so it clears the relay's dud streak and lifts any bench: a client fans
         // out several gate tunnels and the short ancillary ones the relay closes
@@ -765,26 +953,43 @@ fn on_answers(count: usize, at: Instant, host: Option<&str>) {
         }
     }
     // One line a minute at most: a user in a long session produces an answer
-    // every few seconds, and the log is 64 KB.
-    static LAST_LINE: Mutex<Option<Instant>> = Mutex::new(None);
-    let due = LAST_LINE
-        .lock()
-        .map(|mut g| {
-            let due = g.is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
-            if due {
-                *g = Some(Instant::now());
-            }
-            due
-        })
-        .unwrap_or(false);
-    if due {
-        log_proxy(&format!(
-            "модель ответила (x{}) — маршрут «{}»",
-            count,
-            carried.map_or("не наш", |k| k.label())
-        ));
+    // every few seconds, and the log is 64 KB. What is held back is *counted*,
+    // not dropped - a report showing one answer a minute while the user was
+    // getting a dozen made the refusals look like the whole story - and a
+    // change of route always prints, because that is the event worth seeing.
+    struct AnswerLine {
+        at: Option<Instant>,
+        held: usize,
+        route: Option<&'static str>,
     }
-    gate::record_answer(carried.map(|k| k.label()));
+    static LAST_LINE: Mutex<AnswerLine> = Mutex::new(AnswerLine {
+        at: None,
+        held: 0,
+        route: None,
+    });
+    let label = carried.map_or("не наш", |(k, _)| k.label());
+    let mut lines: Vec<(usize, &'static str)> = Vec::new();
+    if let Ok(mut g) = LAST_LINE.lock() {
+        // A change of route ends the old line first: what was held back came
+        // through the route it came through, and printing it under the new one
+        // would credit a road that carried none of it.
+        if let Some(prev) = g.route.filter(|prev| *prev != label) {
+            if g.held > 0 {
+                lines.push((std::mem::take(&mut g.held), prev));
+            }
+            g.at = None;
+        }
+        g.held += count;
+        if g.at.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+            g.at = Some(Instant::now());
+            lines.push((std::mem::take(&mut g.held), label));
+        }
+        g.route = Some(label);
+    }
+    for (held, route) in lines {
+        log_proxy(&format!("модель ответила (x{}) — маршрут «{}»", held, route));
+    }
+    gate::record_answer(carried.map(|(k, _)| k.label()));
 }
 
 /// How long one refusal through a tunnel the relay stood down for keeps
@@ -805,18 +1010,27 @@ fn human_minutes(d: Duration) -> String {
 /// absent. Covers `proxy::bind_listener`'s own retries (15 s) with room to spare.
 const PROXY_START_BUDGET: Duration = Duration::from_secs(30);
 
-/// Runs until killed. Never returns `Ok` - the only way out is a bind failure,
-/// which is worth reporting because it means something else holds the address.
+/// Runs until killed, and never returns.
+///
+/// The DNS listener is started **last and separately** (`serve_dns_forever`),
+/// and a port it cannot take is no longer the end of the process. It used to
+/// be: `run` bound `127.0.0.53:53` first and returned the error, `main` logged
+/// it as fatal and exited 1. A field report (2026-09-20) showed what that costs
+/// - something on that machine had held UDP `:53` for a day, so every start
+/// died within seconds, and with it went the gate hosts' door, the local proxy,
+/// the built-in exits, the route table, the region-400 watch and the auto-patch
+/// watchdog. Not one of those needs port 53. That user had a working bypass
+/// available the whole time and got nothing.
 pub fn run() -> Result<(), String> {
-    let sock = UdpSocket::bind((LISTEN_IP, LISTEN_PORT))
-        .map_err(|e| format!("не удалось занять {}:{} — {}", LISTEN_IP, LISTEN_PORT, e))?;
-    log(&format!("start: {}:{}", LISTEN_IP, LISTEN_PORT));
     // Detect once up front. Otherwise the first query pays for a cold probe,
     // which is long enough that Windows gives up on us and falls back to the
     // direct resolvers - and then caches that unsubstituted answer for its full
     // TTL, so one slow startup is felt for minutes.
     log(&format!("egress: if{}", isp_interface()));
     record_version();
+    // Before any listener is tried: from here on the window can tell this
+    // process from its own watchdog by the age of what it writes (P54).
+    gate::note_started();
     thread::spawn(warm_forever);
     // The proxy variable is user-wide and must never outlive the listener it
     // names, so the watchdog takes it off when the listener is dead for a while
@@ -847,38 +1061,62 @@ pub fn run() -> Result<(), String> {
         // The port that answered is the one named: the proxy may have moved
         // while this waited (P26), and only our own listener counts - not a
         // program of someone else's answering on the default port.
-        let port = match proxy::wait_for_our_listener(PROXY_START_BUDGET) {
-            Some(port) => port,
-            None => {
-                log_proxy(&format!(
-                    "{} не выставлена: локальный прокси не поднялся",
-                    var
-                ));
+        // The window's switch, honoured here as well as there - and honoured
+        // for as long as this process lives, not once at start. Both halves are
+        // the same bug (G74): a single pass meant a user who turned the local
+        // proxy back on had no variable until the next start, and a `return` on
+        // the off branch meant a variable that was already set stayed set while
+        // this process had decided not to write it - which is exactly what let
+        // the window draw «вкл» over a service logging «выключена в
+        // настройках». Now the two converge, and steady state is silent:
+        // `AlreadySet` says nothing, and a variable already gone is nothing to
+        // remove. The legacy-pair removal above stays unconditional: that is
+        // cleanup, not a route.
+        let mut waiting_said = false;
+        loop {
+            // The port that answered is the one named: the proxy may have moved
+            // while this waited (P26), and only our own listener counts - not a
+            // program of someone else's answering on the default port.
+            let Some(port) = proxy::wait_for_our_listener(PROXY_START_BUDGET) else {
                 // It keeps trying (`proxy::run`, P53): an antivirus exception
                 // or a closed program frees the port without a restart, and the
                 // variable follows the listener up - still only once it answers.
-                loop {
-                    if let Some(port) = proxy::wait_for_our_listener(proxy::REBIND_EVERY) {
-                        break port;
+                // Said once per outage, not once a minute: this log is 64 KB.
+                if !waiting_said {
+                    log_proxy(&format!(
+                        "{} не выставлена: локальный прокси не поднялся",
+                        var
+                    ));
+                    waiting_said = true;
+                }
+                continue;
+            };
+            waiting_said = false;
+            let url = proxy::url_at(port);
+            if crate::settings::local_proxy_wanted() {
+                // `ensure_proxy_env` asks `foreign_proxy` first, so a proxy the
+                // user set themselves still outranks ours (D19, I52, G33).
+                match crate::endpoint::ensure_proxy_env(&url) {
+                    Ok(crate::endpoint::Outcome::Applied) => {
+                        log_proxy(&format!("{} снова указывает на локальный прокси", var))
                     }
+                    Ok(crate::endpoint::Outcome::AlreadySet) => {}
+                    Err(e) => log_proxy(&format!("{} не восстановлена: {}", var, e)),
+                }
+            } else if crate::endpoint::proxy_env_is_ours() {
+                // Off in the settings and still set. `remove_proxy` judges each
+                // variable on its own: `PROXY_ENV_VAR` is a name only this tool
+                // writes, and the legacy pair is removed by value, so a proxy of
+                // the user's own is never taken off here.
+                match crate::endpoint::remove_proxy(&url, "") {
+                    Ok(()) => log_proxy(&format!(
+                        "{} снята: локальный прокси выключен в настройках",
+                        var
+                    )),
+                    Err(e) => log_proxy(&format!("{} не снята: {}", var, e)),
                 }
             }
-        };
-        // The window's switch, honoured here as well as there. Without it a user
-        // who turned the local proxy off got it back at the next relay start -
-        // the relay wrote the variable unconditionally - and the switch looked
-        // like it had simply not worked. The legacy-pair removal above stays
-        // unconditional: that is cleanup, not a route.
-        if !crate::settings::local_proxy_wanted() {
-            log_proxy(&format!("{} не выставлена: выключена в настройках", var));
-            return;
-        }
-        match crate::endpoint::ensure_proxy_env(&proxy::url_at(port)) {
-            Ok(crate::endpoint::Outcome::Applied) => {
-                log_proxy(&format!("{} снова указывает на локальный прокси", var))
-            }
-            Ok(crate::endpoint::Outcome::AlreadySet) => {}
-            Err(e) => log_proxy(&format!("{} не восстановлена: {}", var, e)),
+            thread::sleep(proxy::REBIND_EVERY);
         }
     });
 
@@ -902,11 +1140,111 @@ pub fn run() -> Result<(), String> {
     });
     thread::spawn(watch_client_logs);
 
+    serve_dns_forever()
+}
+
+/// Where the NRPT rules send their queries, as an address to bind and to
+/// diagnose. `LISTEN_IP` is a literal and always parses; the fallback only
+/// exists so a typo in it could never panic the relay.
+fn listen_addr() -> SocketAddr {
+    SocketAddr::from((
+        LISTEN_IP.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::LOCALHOST),
+        LISTEN_PORT,
+    ))
+}
+
+/// How many `recv_from` failures in a row mean the socket is gone rather than
+/// one exchange having gone wrong.
+///
+/// Windows surfaces an ICMP port-unreachable for an answer we already sent as
+/// `WSAECONNRESET` on the *next* receive, so single errors are ordinary and are
+/// skipped, as they always were. Sixty-four of them with not one query in
+/// between is a socket worth dropping and taking again.
+const RECV_ERRORS_BEFORE_REBIND: u32 = 64;
+
+/// Holds `127.0.0.53:53` and answers on it, for as long as the process lives.
+///
+/// A port that cannot be had is diagnosed (`portcheck`), published for the
+/// window's card (`gate::set_blocker`) and tried again every minute, the same
+/// way the local proxy and the door already do. Unlike those two it cannot move
+/// to another port: the NRPT rules name an address and Windows sends DNS to
+/// port 53 or nowhere. Meanwhile the NRPT rules list this address *first* and
+/// the substituting providers after it, so a Windows client falls through to
+/// them on its own - the layer degrades to slow rather than to nothing.
+fn serve_dns_forever() -> ! {
+    let addr = listen_addr();
+    let mut said: Option<crate::gate::Blocker> = None;
+    loop {
+        let sock = match UdpSocket::bind(addr) {
+            Ok(sock) => {
+                if said.take().is_some() {
+                    log("порт DNS-релея освободился");
+                    gate::set_blocker("dns", None);
+                }
+                sock
+            }
+            Err(e) => {
+                let blocker =
+                    crate::portcheck::diagnose_on(addr, &e, crate::portcheck::Proto::Udp)
+                        .blocker("dns", addr, &e);
+                // Once per distinct cause: the retry is a minute, the log is 64 KB.
+                if said.as_ref() != Some(&blocker) {
+                    log(&format!(
+                        "не занять {} — {} ({}{})",
+                        blocker.addr,
+                        blocker.error,
+                        blocker.cause,
+                        if blocker.by.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", blocker.by)
+                        }
+                    ));
+                    said = Some(blocker.clone());
+                }
+                // Every try, so the record never goes stale under the card.
+                gate::set_blocker("dns", Some(blocker));
+                thread::sleep(proxy::REBIND_EVERY);
+                continue;
+            }
+        };
+        log(&format!("start: {}:{}", LISTEN_IP, LISTEN_PORT));
+        // A client that was running before us is on answers that predate our
+        // rules, and nothing else tells it otherwise (G75). Here and not a line
+        // earlier: the socket is bound, so a re-ask reaches us.
+        if crate::dns::flush_client_cache() {
+            log("кэш DNS-клиента по гейт-именам сброшен — клиент спросит заново");
+        }
+        let up = Instant::now();
+        serve_queries(&sock);
+        drop(sock);
+        log("DNS-сокет перестал принимать запросы — занимаем заново");
+        // Never in a tight loop: a socket that did not last a minute is not one
+        // an immediate retry will fix, so it waits out the same clock a failed
+        // bind does.
+        if up.elapsed() < proxy::REBIND_EVERY {
+            thread::sleep(proxy::REBIND_EVERY);
+        }
+    }
+}
+
+/// Answers queries on `sock` until it stops taking them.
+fn serve_queries(sock: &UdpSocket) {
     let mut buf = [0u8; 4096];
+    let mut misses = 0u32;
     loop {
         let (n, from) = match sock.recv_from(&mut buf) {
-            Ok(v) => v,
-            Err(_) => continue,
+            Ok(v) => {
+                misses = 0;
+                v
+            }
+            Err(_) => {
+                misses += 1;
+                if misses >= RECV_ERRORS_BEFORE_REBIND {
+                    return;
+                }
+                continue;
+            }
         };
         // Anything shorter than a header is not a query worth relaying.
         if n < 12 {
@@ -1052,6 +1390,44 @@ mod tests {
     #[test]
     fn warming_runs_more_often_than_an_answer_goes_stale() {
         assert!(WARM_EVERY < resolvers::ANSWER_TTL);
+    }
+
+    /// A burst of one message must not eat the sixty lines a report shows.
+    /// The first of a run goes out at once; the rest are counted and the count
+    /// is written the moment anything else is logged.
+    #[test]
+    fn a_run_of_one_line_is_collapsed_into_a_count() {
+        let line = "напрямую X: имя не разрешается";
+        // The first is written, with nothing held back before it.
+        assert_eq!(collapse_repeat(line), (None, true));
+        for _ in 0..14 {
+            assert_eq!(collapse_repeat(line), (None, false), "a repeat was written");
+        }
+        // Something else ends the run and carries the tally.
+        let (note, write) = collapse_repeat("что-то другое");
+        assert!(write);
+        assert_eq!(note.as_deref(), Some("↑ то же самое ещё 14 раз"));
+        // …and the next line after that has nothing to report.
+        assert_eq!(collapse_repeat("третья"), (None, true));
+
+        // And a run that never ends is never silent: the tally is written every
+        // `REPEAT_RUN`, so a problem repeating for an hour is still visible.
+        // One test and not two: `collapse_repeat` keeps one run per process,
+        // and two tests would race for it.
+        let line = "бесконечное";
+        assert_eq!(collapse_repeat(line), (None, true));
+        for _ in 0..(REPEAT_RUN - 1) {
+            assert_eq!(collapse_repeat(line), (None, false));
+        }
+        let (note, write) = collapse_repeat(line);
+        assert!(!write, "the repeat itself is still not written");
+        assert_eq!(note.as_deref(), Some("↑ то же самое ещё 50 раз"));
+        // The counter restarted, so the next line ends a fresh run.
+        assert_eq!(collapse_repeat(line), (None, false));
+        assert_eq!(
+            collapse_repeat("иное").0.as_deref(),
+            Some("↑ то же самое ещё 1 раз")
+        );
     }
 
     #[test]

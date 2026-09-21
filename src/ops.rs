@@ -831,7 +831,7 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
             let installs = scope.spawn(move || collect_installs(settings, deep, patched_seen));
             let watchdog = scope.spawn(move || read_watchdog(admin));
             let dns_probe = scope.spawn(probe_dns);
-            let local_proxy = scope.spawn(read_local_proxy);
+            let local_proxy = scope.spawn(move || read_local_proxy(settings));
             let own_proxy = scope.spawn(read_own_proxy);
             let own_proxy_text = scope.spawn(move || {
                 upstream::configured()
@@ -963,8 +963,24 @@ fn read_watchdog(admin: bool) -> State {
 /// from the last measurement instead of asking Windows again (`Scan::Settings`).
 fn probe_dns() -> (bool, bool) {
     let rules = dns::is_nrpt_applied();
-    let relay = background::is_enabled() && background::is_running();
+    let relay = background::is_enabled() && background::is_running() && relay_reporting();
     (rules, relay)
+}
+
+/// Whether the relay itself is alive, and not only a process of its name.
+///
+/// `is_running` matches `ag_dns.exe` in the task list, and the watchdog is a
+/// second process with that same image name - so a relay that died on startup
+/// still read as running for as long as its watchdog lived (P54). A field
+/// report printed both halves of that contradiction in one paste: «Служба:
+/// запущена» over «Записи нет — служба не запущена или старая». The relay
+/// writes `gate.json` from its first moment (`gate::note_started`) and on every
+/// warm pass; the watchdog never writes it.
+///
+/// Windows only. The Linux proxy writes that file solely to record a blocker,
+/// so there the systemd unit being active is all there is to go on.
+fn relay_reporting() -> bool {
+    !cfg!(target_os = "windows") || crate::gate::read().is_some_and(|r| !r.is_stale())
 }
 
 fn dns_state(
@@ -995,19 +1011,46 @@ fn dns_state(
     }
 }
 
-fn read_local_proxy() -> State {
+/// The local-proxy switch: what the user asked for, and whether the variable
+/// has caught up with it.
+///
+/// Both halves, because the two readers of this route are not the same process.
+/// The relay obeys `settings.local_proxy` and nothing else; the window used to
+/// draw the switch from the environment alone, so a variable that outlived a
+/// failed removal made the window say «вкл» in the same minute the service
+/// logged «выключена в настройках», with nothing on screen to explain it or
+/// any way for the user to act on it (G74, two field reports on `2.15.1`).
+fn read_local_proxy(settings: &Settings) -> State {
     let url = proxy::proxy_url();
     if let Some(foreign) = endpoint::foreign_proxy(&url) {
         // Measured (G33): ours wins over theirs inside the patched server, so
         // leaving both set silently hijacks a proxy the user configured on
-        // purpose. Theirs means ours stays off.
+        // purpose. Theirs means ours stays off - whatever the setting says.
         let _ = foreign;
         return State::Blocked("в системе задан свой прокси".into());
     }
-    if endpoint::proxy_env_is_ours() {
-        State::On
-    } else {
-        State::Off
+    local_proxy_state(settings.local_proxy, endpoint::proxy_env_is_ours())
+}
+
+/// The switch itself, away from the machine it reads.
+///
+/// The invariant, and the whole point of the split: the switch **never reads as
+/// on while the setting is off**, because the setting is the only thing the
+/// relay obeys. Anything else is a window that disagrees with the service and
+/// leaves the user nothing to act on (G74).
+fn local_proxy_state(wanted: bool, ours: bool) -> State {
+    match (wanted, ours) {
+        (true, true) => State::On,
+        // Asked for, not written yet: the relay writes it once its listener
+        // answers, and `repair` does the same while the window is open. An
+        // on-ish state, so `Partial` and never `OffNote` - the switch has to
+        // stay switchable (G41).
+        (true, false) => State::Partial("переменная ещё не выставлена".into()),
+        // Off, and the variable is still there: a removal that did not land.
+        // The relay takes it off within a minute now; saying so beats a switch
+        // that contradicts the service's own log.
+        (false, true) => State::OffNote("переменная ещё не снята".into()),
+        (false, false) => State::Off,
     }
 }
 
@@ -1614,6 +1657,9 @@ fn enable_dns(ctx: &mut Ctx) {
     match dns::setup_dns_nrpt() {
         Ok(outcome) => {
             dns::invalidate_cache();
+            // The rules are in; what the client cached before them is not ours
+            // to keep (G75). The relay does the same at its own start.
+            dns::flush_client_cache();
             if outcome.stood_down_for_vpn {
                 // Not a failure, and not "on" either: with the client measured
                 // inside a tunnel the rules would override the resolver the user
@@ -1705,6 +1751,7 @@ fn reapply_dns_rules(ctx: &mut Ctx) -> bool {
     match dns::setup_dns_nrpt() {
         Ok(_) => {
             dns::invalidate_cache();
+            dns::flush_client_cache();
             ctx.log(Level::Ok, "Правила DNS переписаны под новый список.");
         }
         Err(e) => ctx.log(Level::Warn, format!("Правила DNS не переписаны: {}", e)),
@@ -1733,12 +1780,27 @@ fn enable_local_proxy(ctx: &mut Ctx) {
     //    who configured their own proxy must keep it, so ours comes off — this
     //    is not a "skip".
     if endpoint::foreign_proxy(&url).is_some() {
-        let _ = endpoint::remove_proxy(&url, "");
-        ctx.log(
-            Level::Warn,
-            "В системе задан свой прокси — наш не включаем, чтобы не перехватывать чужой.",
-        );
-        ctx.settings.local_proxy = false;
+        match endpoint::remove_proxy(&url, "") {
+            Ok(()) => {
+                ctx.log(
+                    Level::Warn,
+                    "В системе задан свой прокси — наш не включаем, чтобы не перехватывать чужой.",
+                );
+                ctx.settings.local_proxy = false;
+            }
+            // Swallowed by a `let _ =` until `2.15.1_2`, and that is one way the
+            // two readers came apart: the setting went off while the variable
+            // stayed set, so the relay stopped writing it and the window went on
+            // drawing it as on (G74). A removal that did not happen must not be
+            // recorded as a switch that did.
+            Err(e) => ctx.log(
+                Level::Err,
+                format!(
+                    "В системе задан свой прокси, но нашу переменную снять не удалось: {}",
+                    e
+                ),
+            ),
+        }
         return;
     }
 
@@ -1890,6 +1952,29 @@ mod tests {
         assert_eq!(Cap::Dns.needs_admin(), cfg!(target_os = "windows"));
         assert!(!Cap::ClientPatch.needs_admin(), "the patch needs no UAC");
         assert!(!Cap::OwnProxy.needs_admin());
+    }
+
+    /// G74: the window drew the local-proxy switch from the environment alone,
+    /// so a variable that outlived a failed removal showed «вкл» while the relay
+    /// logged «выключена в настройках» in the same minute. The setting is what
+    /// the relay obeys, so the setting is what the switch may never contradict.
+    #[test]
+    fn the_local_proxy_switch_never_reads_on_while_the_setting_is_off() {
+        for ours in [true, false] {
+            assert!(
+                !local_proxy_state(false, ours).is_on(),
+                "switch on with the setting off (variable present: {ours})"
+            );
+        }
+        assert_eq!(local_proxy_state(true, true), State::On);
+        assert_eq!(local_proxy_state(false, false), State::Off);
+        // Both mismatches say which way round they are, rather than going quiet.
+        assert!(local_proxy_state(true, false).note().is_some());
+        assert!(local_proxy_state(false, true).note().is_some());
+        // And each stays switchable the other way (G41): asked-for reads as on
+        // so it can be turned off, left-over reads as off so it can be turned on.
+        assert!(local_proxy_state(true, false).is_on());
+        assert!(!local_proxy_state(false, true).is_on());
     }
 
     #[test]

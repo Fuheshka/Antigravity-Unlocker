@@ -1,4 +1,5 @@
 use std::env;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -313,6 +314,165 @@ pub fn set_clipboard_text(text: &str) -> bool {
         .is_ok()
 }
 
+/// What the saved report is called. One fixed name, not a stamped one: the
+/// point is a file the user can find and attach without being told a path, and
+/// a Desktop collecting `отчёт (7).txt` is its own kind of mess. Pressing the
+/// button again replaces it.
+pub const REPORT_FILE: &str = "Antigravity Unlocker - отчёт.txt";
+
+/// The user's Desktop.
+///
+/// `SHGetKnownFolderPath`, not `%USERPROFILE%\\Desktop`: with OneDrive's
+/// "back up your folders" on - the default on a lot of machines - the real
+/// Desktop is inside the OneDrive folder and the profile one is not what the
+/// user is looking at. Falls back to the profile path, and then to the profile
+/// itself, so this never returns a directory that is not there.
+#[cfg(target_os = "windows")]
+pub fn desktop_dir() -> Option<PathBuf> {
+    use std::ffi::{c_void, OsString};
+    use std::os::windows::ffi::OsStringExt;
+
+    #[repr(C)]
+    struct Guid {
+        d1: u32,
+        d2: u16,
+        d3: u16,
+        d4: [u8; 8],
+    }
+    // FOLDERID_Desktop {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
+    const DESKTOP: Guid = Guid {
+        d1: 0xB4BF_CC3A,
+        d2: 0xDB2C,
+        d3: 0x424C,
+        d4: [0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41],
+    };
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHGetKnownFolderPath(
+            id: *const Guid,
+            flags: u32,
+            token: *mut c_void,
+            out: *mut *mut u16,
+        ) -> i32;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoTaskMemFree(block: *mut c_void);
+    }
+
+    let known = {
+        let mut raw: *mut u16 = std::ptr::null_mut();
+        let hr = unsafe { SHGetKnownFolderPath(&DESKTOP, 0, std::ptr::null_mut(), &mut raw) };
+        if hr == 0 && !raw.is_null() {
+            let mut len = 0usize;
+            // The call hands back a NUL-terminated wide string and its own
+            // allocation; both the length and the free are ours to do.
+            while unsafe { *raw.add(len) } != 0 {
+                len += 1;
+            }
+            let wide = unsafe { std::slice::from_raw_parts(raw, len) }.to_vec();
+            unsafe { CoTaskMemFree(raw.cast()) };
+            Some(PathBuf::from(OsString::from_wide(&wide)))
+        } else {
+            if !raw.is_null() {
+                unsafe { CoTaskMemFree(raw.cast()) };
+            }
+            None
+        }
+    };
+    let profile = || {
+        env::var("USERPROFILE")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+    };
+    known
+        .filter(|p| p.is_dir())
+        .or_else(|| profile().map(|p| p.join("Desktop")).filter(|p| p.is_dir()))
+        .or_else(profile)
+}
+
+/// The same, where there is no shell to ask: `$XDG_DESKTOP_DIR`, then
+/// `$HOME/Desktop`, then `$HOME`. A headless box has no Desktop at all and
+/// lands on the home directory, which is where its user will look.
+#[cfg(not(target_os = "windows"))]
+pub fn desktop_dir() -> Option<PathBuf> {
+    let home = env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    let named = env::var("XDG_DESKTOP_DIR")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from);
+    Some(
+        named
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| PathBuf::from(&home).join("Desktop"))
+    )
+    .map(|p| if p.is_dir() { p } else { PathBuf::from(home) })
+}
+
+/// Writes `text` where the user will find it, and hands back the path.
+///
+/// UTF-8 with a BOM and CRLF line endings on Windows, because the program that
+/// opens a `.txt` there is Notepad and the report is Russian: without the BOM an
+/// older build of it guesses the ANSI code page and shows mojibake, and without
+/// the CRLFs it runs the whole report into one line. None when the directory
+/// cannot be written to at all.
+pub fn save_text_file(dir: &Path, name: &str, text: &str) -> Option<PathBuf> {
+    let path = dir.join(name);
+    #[cfg(target_os = "windows")]
+    let bytes = {
+        let mut out = String::with_capacity(text.len() + text.len() / 40 + 3);
+        out.push('\u{feff}');
+        let mut prev = '\0';
+        for ch in text.chars() {
+            // Only a bare `\n`: a text that already ends its lines the Windows
+            // way would otherwise come out as `\r\r\n`.
+            if ch == '\n' && prev != '\r' {
+                out.push('\r');
+            }
+            out.push(ch);
+            prev = ch;
+        }
+        out.into_bytes()
+    };
+    #[cfg(not(target_os = "windows"))]
+    let bytes = text.as_bytes().to_vec();
+    std::fs::write(&path, bytes).ok().map(|()| path)
+}
+
+/// Opens the folder holding `path` with the file itself selected, so the user
+/// has it under the cursor rather than a path to go and find. Best effort: a
+/// machine with no shell at all simply gets nothing.
+pub fn reveal_in_explorer(path: &Path) {
+    #[cfg(target_os = "windows")]
+    {
+        // `/select,<path>` as one argument, and the comma is part of it.
+        // Explorer exits non-zero even when it worked, so the status is not
+        // asked for.
+        let mut arg = std::ffi::OsString::from("/select,");
+        arg.push(path.as_os_str());
+        let mut cmd = Command::new("explorer.exe");
+        cmd.arg(arg);
+        no_window(&mut cmd).spawn().ok();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok();
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        if let Some(dir) = path.parent() {
+            Command::new("xdg-open").arg(dir).stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok();
+        }
+    }
+}
+
 /// Starts this exe again through the shell's `runas` verb, i.e. behind a UAC
 /// prompt, and reports whether the new process was actually launched.
 ///
@@ -514,6 +674,44 @@ pub fn local_clock() -> Option<LocalClock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The report has to land somewhere the user can find without being told a
+    /// path, so the one thing this must never do is hand back a directory that
+    /// is not there - the caller would write nothing and say it had.
+    #[test]
+    fn the_desktop_is_a_directory_that_exists() {
+        let dir = desktop_dir().expect("every account has one of these");
+        assert!(dir.is_dir(), "{} is not a directory", dir.display());
+    }
+
+    /// Russian text that Notepad opens right: a BOM so it does not guess the
+    /// ANSI code page, and CRLFs so the whole report is not one line.
+    #[test]
+    fn a_saved_report_is_what_notepad_expects() {
+        let dir = std::env::temp_dir().join("ag_unlocker_report_test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = save_text_file(&dir, REPORT_FILE, "Отчёт\nвторая строка\n").expect("written");
+        assert_eq!(path.file_name().and_then(|f| f.to_str()), Some(REPORT_FILE));
+        let raw = std::fs::read(&path).expect("read back");
+        let text = String::from_utf8(raw).expect("utf-8");
+        #[cfg(target_os = "windows")]
+        {
+            assert!(text.starts_with('\u{feff}'), "no BOM");
+            assert!(text.contains("Отчёт\r\nвторая"), "no CRLF: {text:?}");
+        }
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(text, "Отчёт\nвторая строка\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A directory that is not there is a `None`, not a silent success: the
+    /// window falls back to the clipboard on it and says so.
+    #[test]
+    fn a_report_with_nowhere_to_go_says_so() {
+        let nowhere = std::env::temp_dir().join("ag_unlocker_no_such_dir_ce1f");
+        std::fs::remove_dir_all(&nowhere).ok();
+        assert!(save_text_file(&nowhere, REPORT_FILE, "x").is_none());
+    }
 
     /// The hang users reported. `Command::output()` waits forever, and the DNS
     /// step drives CIM cmdlets, i.e. WMI - which on some machines stops

@@ -620,14 +620,28 @@ pub fn vpn_exit() -> Option<bool> {
 }
 
 fn vpn_usable() -> bool {
-    crate::net::tunnel_up() && vpn_exit() == Some(true) && !routes::is_penalised(routes::Kind::Vpn)
+    crate::net::tunnel_up() && vpn_exit() == Some(true)
 }
 
 /// Whether `kind` is worth offering the next gate connection to. The route
 /// table orders; this says who is in the running at all.
+///
+/// A region bench (`routes::is_penalised`) is deliberately **not** asked about
+/// here, for any route. It is an ordering signal - `order_with` puts benched
+/// routes last, soonest-to-expire first - and answering it here as well took
+/// four of the five kinds out of the table altogether, leaving that branch to
+/// run for `Exits` alone. A field report showed what the asymmetry costs: with
+/// every other route benched out of existence, the table fell through to a
+/// relay that carried nothing, while the benched built-in exit - the only one
+/// answering - stayed in only because its arm never asked. Being last is the
+/// punishment; disappearing is not.
+///
+/// What is asked about here is whether the route exists at all on this machine
+/// right now: a proxy the user has not given us, a tunnel that is not up, a
+/// pool with nothing in it, a name the DNS layer is not substituting.
 pub fn route_usable(kind: routes::Kind, host: &str) -> bool {
     match kind {
-        routes::Kind::Own => upstream::available() && !routes::is_penalised(routes::Kind::Own),
+        routes::Kind::Own => upstream::available(),
         // The window's switch, checked at the one place the route is offered
         // from. Off means the route is simply not usable, which the table
         // already knows how to deal with - it is the same answer an exit that
@@ -646,9 +660,6 @@ pub fn route_usable(kind: routes::Kind, host: &str) -> bool {
 /// do (S37): a needless hop costs one connection, a missing route costs every
 /// request.
 fn direct_usable(host: &str) -> bool {
-    if routes::is_penalised(routes::Kind::Direct) {
-        return false;
-    }
     if crate::resolvers::vpn_is_active() {
         return true;
     }
@@ -698,7 +709,7 @@ pub fn probe_direct(if_index: u32) {
     match probe_direct_once(if_index) {
         Ok(()) => routes::record(routes::Kind::Direct, started.elapsed()),
         Err(why) => {
-            routes::record_failure(routes::Kind::Direct);
+            routes::probe_failed(routes::Kind::Direct);
             crate::dns_forwarder::log_proxy(&format!("напрямую не отвечает: {}", why));
         }
     }
@@ -726,7 +737,7 @@ pub fn probe_vpn() {
     match outcome {
         Ok(()) => routes::record(routes::Kind::Vpn, started.elapsed()),
         Err(why) => {
-            routes::record_failure(routes::Kind::Vpn);
+            routes::probe_failed(routes::Kind::Vpn);
             crate::dns_forwarder::log_proxy(&format!("через VPN не отвечает: {}", why));
         }
     }
@@ -837,6 +848,39 @@ fn tunnel(mut client: TcpStream, host: &str, port: u16) {
     splice(client, upstream);
 }
 
+/// A writer that records what it actually handed on, for the tunnel's own
+/// activity stamp.
+///
+/// The *writer* and not the reader: bytes read from one socket may still be
+/// sitting in this process, and a tunnel is carrying only what the far end has
+/// taken. It costs `io::copy`'s fd-to-fd specialisation on Linux, which is a
+/// trade this tunnel can afford - it moves a token stream, not a file.
+struct Marked<'a, W: Write> {
+    inner: &'a mut W,
+    activity: Option<&'a routes::Activity>,
+    to_client: bool,
+}
+
+impl<W: Write> Write for Marked<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        if n > 0 {
+            if let Some(a) = self.activity {
+                if self.to_client {
+                    a.to_client(n as u64);
+                } else {
+                    a.to_upstream(n as u64);
+                }
+            }
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Moves raw bytes between two sockets until one of them ends.
 ///
 /// Split out of `tunnel` because a tunnel through the user's proxy is the same
@@ -875,8 +919,21 @@ pub(crate) fn splice(mut client: TcpStream, mut upstream: TcpStream) {
     // closing only the client side left the other direction in a blocking read
     // on an idle Google connection until Google closed it, minutes later (G52).
     routes::attach_upstream(&upstream);
+    // What the tunnel is carrying, and when it last carried anything. The route
+    // table reads it to tell an answer still streaming from a pooled connection
+    // the client keeps feeding refused requests (D32). `None` for every tunnel
+    // that is not a gate tunnel - `splice` carries those too.
+    let activity = routes::serving_activity();
+    let up_activity = activity.clone();
     let up = thread::spawn(move || {
-        let moved = io::copy(&mut client, &mut upstream_w);
+        let moved = {
+            let mut sink = Marked {
+                inner: &mut upstream_w,
+                activity: up_activity.as_deref(),
+                to_client: false,
+            };
+            io::copy(&mut client, &mut sink)
+        };
         match moved {
             // The client finished sending. Pass the half-close on rather than
             // tearing the socket down: a client that half-closes still wants
@@ -892,7 +949,14 @@ pub(crate) fn splice(mut client: TcpStream, mut upstream: TcpStream) {
         }
         moved
     });
-    io::copy(&mut upstream, &mut client_w).ok();
+    {
+        let mut sink = Marked {
+            inner: &mut client_w,
+            activity: activity.as_deref(),
+            to_client: true,
+        };
+        io::copy(&mut upstream, &mut sink).ok();
+    }
     // FIN first, and only then the full shutdown that releases the thread still
     // reading from this socket. Going straight to `Both` closes it with whatever
     // the client had already sent still unread, and Windows answers unread bytes
@@ -1290,9 +1354,11 @@ mod tests {
     /// socket while `bind_listener` retries it.
     #[test]
     fn waiting_for_a_listener_that_never_comes_costs_the_budget_and_says_no() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");
-        let addr = listener.local_addr().expect("addr");
-        drop(listener);
+        // Port 1, not an ephemeral one just released: the OS hands those out
+        // again, and any other test in this process that binds a listener while
+        // this one is waiting made it fail for a reason that has nothing to do
+        // with what it tests. Nothing listens on tcpmux on Windows.
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
 
         let budget = Duration::from_millis(600);
         let started = Instant::now();
