@@ -131,7 +131,7 @@ pub const LISTEN_PORT: u16 = 53;
 ///     for every kind alike, and a route that fails its probe is kept back
 ///     until one succeeds. An older relay drops the working route mid-answer
 ///     and thrashes between benched ones.
-pub const RELAY_VERSION: u32 = 33;
+pub const RELAY_VERSION: u32 = 35;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -750,6 +750,21 @@ fn on_refusals(count: usize, at: Instant, host: Option<&str>) {
                     kind.label()
                 ));
             }
+            // A tunnel that carried an answer is still open on this route, so
+            // the answer is still coming through it. Nothing is done at all,
+            // and nothing is on a clock: it ends when the client closes (D32).
+            routes::Blamed::Streaming { idle, to_client } => {
+                log_proxy(&format!(
+                    "маршрут «{}» нёс region-400, но по нему идёт ответ модели ({} КБ, байты {} с назад) — не тронут",
+                    kind.label(),
+                    to_client / 1024,
+                    idle.as_secs()
+                ));
+                acted.push(format!(
+                    "по «{}» сейчас идёт ответ модели — маршрут и его соединения не тронуты",
+                    kind.label()
+                ));
+            }
         },
         // The client reached Google without us, from inside a tunnel the relay
         // was standing down for: that tunnel exits somewhere blocked, so the
@@ -779,9 +794,12 @@ fn on_refusals(count: usize, at: Instant, host: Option<&str>) {
 }
 
 fn on_answers(count: usize, at: Instant, host: Option<&str>) {
-    let carried = routes::attribute(at, host);
-    if let Some(kind) = carried {
+    let carried = routes::attribute_tunnel(at, host);
+    if let Some((kind, tunnel)) = carried {
         routes::credit(kind);
+        // The tunnel as well as the route: while *it* is open the answer is
+        // still arriving, and nothing is allowed to bench or cut it (D32).
+        routes::credit_tunnel(tunnel);
         // A model answer is the one thing that settles whether the relay works,
         // so it clears the relay's dud streak and lifts any bench: a client fans
         // out several gate tunnels and the short ancillary ones the relay closes
@@ -808,10 +826,10 @@ fn on_answers(count: usize, at: Instant, host: Option<&str>) {
         log_proxy(&format!(
             "модель ответила (x{}) — маршрут «{}»",
             count,
-            carried.map_or("не наш", |k| k.label())
+            carried.map_or("не наш", |(k, _)| k.label())
         ));
     }
-    gate::record_answer(carried.map(|k| k.label()));
+    gate::record_answer(carried.map(|(k, _)| k.label()));
 }
 
 /// How long one refusal through a tunnel the relay stood down for keeps
@@ -883,38 +901,62 @@ pub fn run() -> Result<(), String> {
         // The port that answered is the one named: the proxy may have moved
         // while this waited (P26), and only our own listener counts - not a
         // program of someone else's answering on the default port.
-        let port = match proxy::wait_for_our_listener(PROXY_START_BUDGET) {
-            Some(port) => port,
-            None => {
-                log_proxy(&format!(
-                    "{} не выставлена: локальный прокси не поднялся",
-                    var
-                ));
+        // The window's switch, honoured here as well as there - and honoured
+        // for as long as this process lives, not once at start. Both halves are
+        // the same bug (G74): a single pass meant a user who turned the local
+        // proxy back on had no variable until the next start, and a `return` on
+        // the off branch meant a variable that was already set stayed set while
+        // this process had decided not to write it - which is exactly what let
+        // the window draw «вкл» over a service logging «выключена в
+        // настройках». Now the two converge, and steady state is silent:
+        // `AlreadySet` says nothing, and a variable already gone is nothing to
+        // remove. The legacy-pair removal above stays unconditional: that is
+        // cleanup, not a route.
+        let mut waiting_said = false;
+        loop {
+            // The port that answered is the one named: the proxy may have moved
+            // while this waited (P26), and only our own listener counts - not a
+            // program of someone else's answering on the default port.
+            let Some(port) = proxy::wait_for_our_listener(PROXY_START_BUDGET) else {
                 // It keeps trying (`proxy::run`, P53): an antivirus exception
                 // or a closed program frees the port without a restart, and the
                 // variable follows the listener up - still only once it answers.
-                loop {
-                    if let Some(port) = proxy::wait_for_our_listener(proxy::REBIND_EVERY) {
-                        break port;
+                // Said once per outage, not once a minute: this log is 64 KB.
+                if !waiting_said {
+                    log_proxy(&format!(
+                        "{} не выставлена: локальный прокси не поднялся",
+                        var
+                    ));
+                    waiting_said = true;
+                }
+                continue;
+            };
+            waiting_said = false;
+            let url = proxy::url_at(port);
+            if crate::settings::local_proxy_wanted() {
+                // `ensure_proxy_env` asks `foreign_proxy` first, so a proxy the
+                // user set themselves still outranks ours (D19, I52, G33).
+                match crate::endpoint::ensure_proxy_env(&url) {
+                    Ok(crate::endpoint::Outcome::Applied) => {
+                        log_proxy(&format!("{} снова указывает на локальный прокси", var))
                     }
+                    Ok(crate::endpoint::Outcome::AlreadySet) => {}
+                    Err(e) => log_proxy(&format!("{} не восстановлена: {}", var, e)),
+                }
+            } else if crate::endpoint::proxy_env_is_ours() {
+                // Off in the settings and still set. `remove_proxy` judges each
+                // variable on its own: `PROXY_ENV_VAR` is a name only this tool
+                // writes, and the legacy pair is removed by value, so a proxy of
+                // the user's own is never taken off here.
+                match crate::endpoint::remove_proxy(&url, "") {
+                    Ok(()) => log_proxy(&format!(
+                        "{} снята: локальный прокси выключен в настройках",
+                        var
+                    )),
+                    Err(e) => log_proxy(&format!("{} не снята: {}", var, e)),
                 }
             }
-        };
-        // The window's switch, honoured here as well as there. Without it a user
-        // who turned the local proxy off got it back at the next relay start -
-        // the relay wrote the variable unconditionally - and the switch looked
-        // like it had simply not worked. The legacy-pair removal above stays
-        // unconditional: that is cleanup, not a route.
-        if !crate::settings::local_proxy_wanted() {
-            log_proxy(&format!("{} не выставлена: выключена в настройках", var));
-            return;
-        }
-        match crate::endpoint::ensure_proxy_env(&proxy::url_at(port)) {
-            Ok(crate::endpoint::Outcome::Applied) => {
-                log_proxy(&format!("{} снова указывает на локальный прокси", var))
-            }
-            Ok(crate::endpoint::Outcome::AlreadySet) => {}
-            Err(e) => log_proxy(&format!("{} не восстановлена: {}", var, e)),
+            thread::sleep(proxy::REBIND_EVERY);
         }
     });
 

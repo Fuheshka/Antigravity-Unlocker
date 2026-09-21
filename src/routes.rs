@@ -39,7 +39,8 @@
 
 use std::cell::RefCell;
 use std::net::TcpStream;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// The routes a gate host can take, as the proxy knows them. `Exits` is the
@@ -362,6 +363,12 @@ pub enum Blamed {
     /// client makes on a connection it still held are the same refusal, not a
     /// new one.
     AlreadyBenched,
+    /// Left alone, and not on a clock: a tunnel that carried a model answer is
+    /// still open on this route, so an answer is still arriving through it
+    /// (D32). Carries how long since its last byte and how much it has handed
+    /// the client, which is what a field report needs to see that the thing
+    /// being protected is a real answer and not an idle socket.
+    Streaming { idle: Duration, to_client: u64 },
 }
 
 /// A refusal came through `kind`: bench it and close its gate tunnels, unless
@@ -371,13 +378,23 @@ pub enum Blamed {
 /// connection instead of going on being refused for another minute and a half
 /// on a pooled one (D26). It is exactly the wrong thing to do to a route that
 /// is working: a model answer arrives as a stream, so cutting a proven route's
-/// sockets is how a user loses an answer halfway through - «то работает, то
-/// нет», reported from the field. So a proven route keeps both its place and
-/// its connections, and if the answers really have stopped, the protection
-/// lapses ninety seconds later and the next refusal benches it as usual.
+/// sockets is how a user loses an answer halfway through, reported from the
+/// field as «to rabotaet, to net».
+///
+/// Two things can say the route is working, and they answer different
+/// questions. An **open tunnel that carried an answer** says one is arriving
+/// right now, so nothing is done to the route for as long as that connection
+/// lives (D32) - no clock, because a model that is thinking sends nothing while
+/// it thinks, and a ninety-second rule measured from the *start* of the stream
+/// is what cut long answers in half. A **recent answer with no tunnel left** is
+/// the weaker case, the short exchange that is already over: it keeps its place
+/// for `PROOF_PROTECTS_FOR`, and then the next refusal benches it as usual.
 pub fn blame(kind: Kind) -> Blamed {
-    let outcome = blame_table(kind);
-    if !matches!(outcome, Blamed::Proven(_)) {
+    // The tunnel list first, and released before `TABLE` is taken: the two locks
+    // are never held together (G30, I50).
+    let streaming = live_answer(kind);
+    let outcome = blame_table(kind, streaming);
+    if !matches!(outcome, Blamed::Proven(_) | Blamed::Streaming { .. }) {
         cut_tunnels(kind);
     }
     outcome
@@ -385,7 +402,7 @@ pub fn blame(kind: Kind) -> Blamed {
 
 /// The table half of `blame`, so the lock is released before `cut_tunnels`
 /// takes the tunnel list (the two are never held together - G30, I50).
-fn blame_table(kind: Kind) -> Blamed {
+fn blame_table(kind: Kind, streaming: Option<(Duration, u64)>) -> Blamed {
     let Ok(mut t) = TABLE.lock() else {
         return Blamed::AlreadyBenched;
     };
@@ -396,6 +413,11 @@ fn blame_table(kind: Kind) -> Blamed {
     // refusals.
     let answered_ago = t.ok_at[i].map(|ok| ok.elapsed());
     t.bad_at[i] = Some(now);
+    // Ahead of everything else, the already-benched arm included: that arm
+    // cuts, and this is the one case where cutting is the damage (D32).
+    if let Some((idle, to_client)) = streaming {
+        return Blamed::Streaming { idle, to_client };
+    }
     if penalised(&t.penalised, kind) {
         return Blamed::AlreadyBenched;
     }
@@ -598,6 +620,71 @@ fn keep_leader(tier: &mut Vec<(Kind, Duration)>, leader: Option<Kind>) {
 // Open tunnels: who carried what, and closing a refused route's connections.
 // ---------------------------------------------------------------------------
 
+/// The clock the lock-free activity stamps count from. An `Instant` does not
+/// fit in an atomic, and taking `TUNNELS` on every 8 KB chunk would put a
+/// global lock on the byte path of every tunnel at once.
+fn epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// What a tunnel has moved, written by the threads pumping it and read by the
+/// table without touching them.
+///
+/// Both directions are counted because both are a conversation in flight: the
+/// answer streaming back, and the request going out - a long chat is a 100 KB
+/// upload before it is anything else (field, `116225 B out`).
+#[derive(Default)]
+pub struct Activity {
+    /// Milliseconds since `epoch()` when the last byte moved, either way.
+    /// Zero means nothing has moved yet.
+    at_ms: AtomicU64,
+    to_client: AtomicU64,
+    to_upstream: AtomicU64,
+}
+
+impl Activity {
+    /// `n` bytes reached the client. Called per chunk, so it does no more than
+    /// two relaxed adds and a clock read.
+    pub fn to_client(&self, n: u64) {
+        self.to_client.fetch_add(n, Ordering::Relaxed);
+        self.touch();
+    }
+
+    /// `n` bytes went out toward Google.
+    pub fn to_upstream(&self, n: u64) {
+        self.to_upstream.fetch_add(n, Ordering::Relaxed);
+        self.touch();
+    }
+
+    fn touch(&self) {
+        // `max(1)`: zero is "nothing yet", and the first millisecond of the
+        // process would otherwise read as silence for the tunnel's whole life.
+        let ms = (epoch().elapsed().as_millis() as u64).max(1);
+        self.at_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// How long since the last byte, or `None` if none has moved.
+    pub fn idle(&self) -> Option<Duration> {
+        match self.at_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(
+                epoch()
+                    .elapsed()
+                    .saturating_sub(Duration::from_millis(ms)),
+            ),
+        }
+    }
+
+    /// Bytes to the client, bytes out.
+    pub fn bytes(&self) -> (u64, u64) {
+        (
+            self.to_client.load(Ordering::Relaxed),
+            self.to_upstream.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// One gate tunnel, from the `200` to the end of its splice.
 struct Tunnel {
     id: u64,
@@ -608,6 +695,13 @@ struct Tunnel {
     host: String,
     opened: Instant,
     closed: Option<Instant>,
+    /// When a model answer was attributed to *this* tunnel. The one fact that
+    /// separates a conversation in flight from a pooled connection the client
+    /// keeps feeding refused requests: a refusal-only tunnel is never credited
+    /// here, however busy it looks (D32).
+    answered_at: Option<Instant>,
+    /// What has moved through it and when, shared with its pump threads.
+    activity: Arc<Activity>,
     /// The client's socket, kept while the tunnel is open so a refused route's
     /// connections can be closed from outside the thread pumping them.
     client: Option<TcpStream>,
@@ -629,6 +723,8 @@ struct Serving {
     client: Option<TcpStream>,
     host: String,
     tunnel: Option<u64>,
+    /// Handed to the pump by `serving_activity` once `note_used` has made one.
+    activity: Option<Arc<Activity>>,
 }
 
 thread_local! {
@@ -647,6 +743,7 @@ pub fn begin_gate_connection(client: &TcpStream, host: &str) -> GateConnection {
             client: clone,
             host: host.trim_end_matches('.').to_ascii_lowercase(),
             tunnel: None,
+            activity: None,
         })
     });
     GateConnection { _private: () }
@@ -711,6 +808,12 @@ pub fn note_used(kind: Kind) {
             ))
         })
         .unwrap_or_default();
+    let activity = Arc::new(Activity::default());
+    SERVING.with(|s| {
+        if let Some(serving) = s.borrow_mut().as_mut() {
+            serving.activity = Some(Arc::clone(&activity));
+        }
+    });
     if let Ok(mut list) = TUNNELS.lock() {
         list.push(Tunnel {
             id,
@@ -718,11 +821,20 @@ pub fn note_used(kind: Kind) {
             host,
             opened: now,
             closed: None,
+            answered_at: None,
+            activity,
             client,
             upstream: None,
         });
         prune(&mut list);
     }
+}
+
+/// The activity stamp of the gate tunnel this thread is serving, for its pump
+/// to mark as bytes move. `None` outside a gate connection, or before the
+/// route committed one: `splice` carries every non-gate tunnel too.
+pub fn serving_activity() -> Option<Arc<Activity>> {
+    SERVING.with(|s| s.borrow().as_ref().and_then(|s| s.activity.clone()))
 }
 
 fn prune(list: &mut Vec<Tunnel>) {
@@ -754,7 +866,14 @@ pub fn open_counts() -> [u32; N] {
 /// connection is offered to the table afresh.
 fn cut_tunnels(kind: Kind) {
     let Ok(mut list) = TUNNELS.lock() else { return };
-    for t in list.iter_mut().filter(|t| t.kind == kind && t.closed.is_none()) {
+    // A tunnel that carried a model answer is never cut, whatever brought the
+    // route here. `blame` already turns back before this for the same reason,
+    // and saying it twice is deliberate: this is the call that destroys a live
+    // answer, so it is the call that must not depend on a caller's check (D32).
+    for t in list
+        .iter_mut()
+        .filter(|t| t.kind == kind && t.closed.is_none() && t.answered_at.is_none())
+    {
         for sock in [t.client.take(), t.upstream.take()].into_iter().flatten() {
             sock.shutdown(std::net::Shutdown::Both).ok();
         }
@@ -770,6 +889,13 @@ fn cut_tunnels(kind: Kind) {
 /// some other way, and pinning the event on whichever route last opened a
 /// tunnel would bench a route that never saw it.
 pub fn attribute(at: Instant, host: Option<&str>) -> Option<Kind> {
+    attribute_tunnel(at, host).map(|(kind, _)| kind)
+}
+
+/// The same, naming the tunnel as well: an answer is credited to the one that
+/// carried it, not only to its route, because that tunnel is what tells a
+/// conversation in flight from a pooled connection being refused (D32).
+pub fn attribute_tunnel(at: Instant, host: Option<&str>) -> Option<(Kind, u64)> {
     let host = host.map(|h| h.trim_end_matches('.').to_ascii_lowercase());
     let list = TUNNELS.lock().ok()?;
     list.iter()
@@ -777,7 +903,38 @@ pub fn attribute(at: Instant, host: Option<&str>) -> Option<Kind> {
         .filter(|t| t.opened <= at + ATTRIBUTION_SLACK)
         .filter(|t| t.closed.is_none_or(|c| c + ATTRIBUTION_SLACK >= at))
         .max_by_key(|t| t.opened)
-        .map(|t| t.kind)
+        .map(|t| (t.kind, t.id))
+}
+
+/// Marks the tunnel a model answer came through. Closed tunnels are marked too:
+/// the log line is read seconds after the answer started, and a short answer is
+/// over by then - what matters is that the credit lands on the right record.
+pub fn credit_tunnel(id: u64) {
+    if let Ok(mut list) = TUNNELS.lock() {
+        if let Some(t) = list.iter_mut().find(|t| t.id == id) {
+            t.answered_at = Some(Instant::now());
+        }
+    }
+}
+
+/// An **open** tunnel of `kind` that carried a model answer, i.e. a conversation
+/// still in flight, with how long since its last byte.
+///
+/// No clock and no idle limit on purpose (D32, owner): a model that is thinking
+/// sends nothing for as long as it thinks, and the whole point of this check is
+/// that the answer survives it. What ends the protection is the connection
+/// closing - the client's own signal that the exchange is over.
+fn live_answer(kind: Kind) -> Option<(Duration, u64)> {
+    let list = TUNNELS.lock().ok()?;
+    list.iter()
+        .filter(|t| t.kind == kind && t.closed.is_none() && t.answered_at.is_some())
+        .map(|t| {
+            let idle = t.activity.idle().unwrap_or_else(|| t.opened.elapsed());
+            (idle, t.activity.bytes().0)
+        })
+        // The liveliest of them: with several open, one gone quiet says nothing
+        // while another is still handing the client bytes.
+        .min_by_key(|(idle, _)| *idle)
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,5 +1318,87 @@ mod tests {
         assert!(matches!(got, Ok(0) | Err(_)), "the tunnel was not closed");
         server.join().expect("server thread");
         credit(Kind::Exits);
+    }
+
+    /// D32: while a tunnel that carried an answer is open, a refusal pinned on
+    /// that route does nothing at all - no bench, and above all no cut. This is
+    /// the field symptom as a test: a long answer streaming while something
+    /// else on the machine keeps walking into the gate.
+    #[test]
+    fn an_answer_still_streaming_keeps_its_route_and_its_socket() {
+        let _turn = turn();
+        use std::io::{ErrorKind, Read};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bound");
+        let addr = listener.local_addr().expect("addr");
+        let mut far = TcpStream::connect(addr).expect("connected");
+        let (near, _) = listener.accept().expect("accepted");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let _gate = begin_gate_connection(&near, "daily-cloudcode-pa.googleapis.com");
+            note_used(Kind::Exits);
+            tx.send(serving_activity()).ok();
+            // Stands in for the splice: returns when the socket ends.
+            let mut buf = [0u8; 1];
+            let mut near = near;
+            let _ = near.read(&mut buf);
+            done_tx.send(()).ok();
+        });
+        let activity = rx.recv().expect("opened").expect("a gate tunnel has a stamp");
+
+        set_context(0x5555);
+        let (kind, id) = attribute_tunnel(Instant::now(), None).expect("attributed");
+        assert_eq!(kind, Kind::Exits);
+        credit_tunnel(id);
+        // The answer hands the client bytes, the way a stream does.
+        activity.to_client(8 * 1024);
+
+        match blame(Kind::Exits) {
+            Blamed::Streaming { to_client, .. } => assert_eq!(to_client, 8 * 1024),
+            other => panic!("a streaming answer was not recognised: {other:?}"),
+        }
+        assert!(
+            !is_penalised(Kind::Exits),
+            "a route carrying an answer must not be benched"
+        );
+        // And the socket is still there: this is the half that cut answers in two.
+        far.set_read_timeout(Some(Duration::from_millis(250))).ok();
+        let mut buf = [0u8; 1];
+        let got = far.read(&mut buf);
+        assert!(
+            matches!(&got, Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)),
+            "the live answer's socket was cut: {got:?}"
+        );
+
+        // The client ends the exchange. Nothing is in flight any more, so the
+        // next refusal benches the route exactly as it did before (D26).
+        far.shutdown(std::net::Shutdown::Both).ok();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the tunnel ended");
+        server.join().expect("server thread");
+        assert!(
+            live_answer(Kind::Exits).is_none(),
+            "a closed tunnel protects nothing"
+        );
+        assert!(matches!(blame(Kind::Exits), Blamed::Benched(_)));
+        assert!(is_penalised(Kind::Exits));
+    }
+
+    /// Both directions count as activity: a long chat is a 100 KB upload before
+    /// it is an answer (field: `116225 B out` against `4253 B to client`).
+    #[test]
+    fn a_tunnels_activity_counts_both_directions() {
+        let a = Activity::default();
+        assert!(a.idle().is_none(), "nothing has moved yet");
+        assert_eq!(a.bytes(), (0, 0));
+        a.to_upstream(116_225);
+        assert_eq!(a.bytes(), (0, 116_225));
+        assert!(a.idle().is_some_and(|d| d < Duration::from_secs(1)));
+        a.to_client(4_253);
+        assert_eq!(a.bytes(), (4_253, 116_225));
     }
 }

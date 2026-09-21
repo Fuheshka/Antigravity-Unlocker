@@ -848,6 +848,39 @@ fn tunnel(mut client: TcpStream, host: &str, port: u16) {
     splice(client, upstream);
 }
 
+/// A writer that records what it actually handed on, for the tunnel's own
+/// activity stamp.
+///
+/// The *writer* and not the reader: bytes read from one socket may still be
+/// sitting in this process, and a tunnel is carrying only what the far end has
+/// taken. It costs `io::copy`'s fd-to-fd specialisation on Linux, which is a
+/// trade this tunnel can afford - it moves a token stream, not a file.
+struct Marked<'a, W: Write> {
+    inner: &'a mut W,
+    activity: Option<&'a routes::Activity>,
+    to_client: bool,
+}
+
+impl<W: Write> Write for Marked<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        if n > 0 {
+            if let Some(a) = self.activity {
+                if self.to_client {
+                    a.to_client(n as u64);
+                } else {
+                    a.to_upstream(n as u64);
+                }
+            }
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Moves raw bytes between two sockets until one of them ends.
 ///
 /// Split out of `tunnel` because a tunnel through the user's proxy is the same
@@ -886,8 +919,21 @@ pub(crate) fn splice(mut client: TcpStream, mut upstream: TcpStream) {
     // closing only the client side left the other direction in a blocking read
     // on an idle Google connection until Google closed it, minutes later (G52).
     routes::attach_upstream(&upstream);
+    // What the tunnel is carrying, and when it last carried anything. The route
+    // table reads it to tell an answer still streaming from a pooled connection
+    // the client keeps feeding refused requests (D32). `None` for every tunnel
+    // that is not a gate tunnel - `splice` carries those too.
+    let activity = routes::serving_activity();
+    let up_activity = activity.clone();
     let up = thread::spawn(move || {
-        let moved = io::copy(&mut client, &mut upstream_w);
+        let moved = {
+            let mut sink = Marked {
+                inner: &mut upstream_w,
+                activity: up_activity.as_deref(),
+                to_client: false,
+            };
+            io::copy(&mut client, &mut sink)
+        };
         match moved {
             // The client finished sending. Pass the half-close on rather than
             // tearing the socket down: a client that half-closes still wants
@@ -903,7 +949,14 @@ pub(crate) fn splice(mut client: TcpStream, mut upstream: TcpStream) {
         }
         moved
     });
-    io::copy(&mut upstream, &mut client_w).ok();
+    {
+        let mut sink = Marked {
+            inner: &mut client_w,
+            activity: activity.as_deref(),
+            to_client: true,
+        };
+        io::copy(&mut upstream, &mut sink).ok();
+    }
     // FIN first, and only then the full shutdown that releases the thread still
     // reading from this socket. Going straight to `Both` closes it with whatever
     // the client had already sent still unread, and Windows answers unread bytes
