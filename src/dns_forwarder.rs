@@ -131,7 +131,14 @@ pub const LISTEN_PORT: u16 = 53;
 ///     for every kind alike, and a route that fails its probe is kept back
 ///     until one succeeds. An older relay drops the working route mid-answer
 ///     and thrashes between benched ones.
-pub const RELAY_VERSION: u32 = 36;
+/// 37 = a refusal the table declines to hold against a route no longer costs it
+///     its place in the order either (`routes::bad_at` split from
+///     `refused_at`, G76), the connection a refusal arrived on is named in the
+///     log and closed when it is not the one carrying the answer, and the log
+///     says which host was refused and how many answers were held back. An
+///     older relay swaps the gate route away from the one that is answering
+///     every fifteen seconds and cannot say whether a route half-works.
+pub const RELAY_VERSION: u32 = 37;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -266,9 +273,13 @@ fn stamp() -> String {
 fn log(line: &str) {
     // Never from a test. The file is the *installed* relay's log, and a unit test
     // exercising `health` or `routes` used to append lines like «тест отложен на
-    // 5 мин» to it on the developer's machine - which the window's «Скопировать
-    // отчёт» now pastes into a support message (G18's other half).
+    // 5 мин» to it on the developer's machine - which the window's «Сохранить
+    // отчёт» now puts in a support file (G18's other half).
     if cfg!(test) {
+        return;
+    }
+    let (note, write_line) = collapse_repeat(line);
+    if note.is_none() && !write_line {
         return;
     }
     let path = log_path();
@@ -284,9 +295,59 @@ fn log(line: &str) {
         // processes) logging at once interleaved into lines like
         // «16:48:2616:48:26 PASSTHROUGH … PASSTHROUGH …» - seen in reports from
         // both platforms.
-        let entry = format!("{} {}\n", stamp(), line);
+        let at = stamp();
+        let mut entry = String::new();
+        if let Some(note) = note {
+            entry.push_str(&format!("{} {}\n", at, note));
+        }
+        if write_line {
+            entry.push_str(&format!("{} {}\n", at, line));
+        }
         f.write_all(entry.as_bytes()).ok();
     }
+}
+
+/// How long a line has to repeat within to be counted rather than written.
+const REPEAT_WINDOW: Duration = Duration::from_secs(30);
+/// …and how many repeats are counted before the tally is written anyway, so a
+/// problem repeating forever is never silent.
+const REPEAT_RUN: u32 = 50;
+
+/// Collapses a run of one identical line into a count.
+///
+/// The log holds 64 KB and the report shows its last 60 lines, so a burst of
+/// one message costs exactly the minutes a report is about: a field report
+/// (2026-09-21) spent fifteen of its sixty visible lines on the same
+/// «напрямую …: имя не разрешается» inside a single second, and the route
+/// switch that followed was off the top of it.
+///
+/// Returns the tally line to write first, if any, and whether `line` itself is
+/// written. The *first* of a run always goes out at once - the news is that it
+/// happened, and a delayed first line is a log that lies about when.
+fn collapse_repeat(line: &str) -> (Option<String>, bool) {
+    static RUN: Mutex<Option<(String, u32, Instant)>> = Mutex::new(None);
+    let tally = |n: u32| format!("↑ то же самое ещё {} раз", n);
+    let Ok(mut g) = RUN.lock() else {
+        return (None, true);
+    };
+    let same = g
+        .as_ref()
+        .is_some_and(|(prev, _, at)| prev == line && at.elapsed() < REPEAT_WINDOW);
+    if same {
+        let mut flush = None;
+        if let Some((_, n, at)) = g.as_mut() {
+            *n += 1;
+            *at = Instant::now();
+            if *n >= REPEAT_RUN {
+                flush = Some(tally(*n));
+                *n = 0;
+            }
+        }
+        return (flush, false);
+    }
+    let held = g.as_ref().map_or(0, |(_, n, _)| *n);
+    *g = Some((line.to_string(), 0, Instant::now()));
+    ((held > 0).then(|| tally(held)), true)
 }
 
 /// The only way a failed start can be reported: the console is gone by then.
@@ -660,9 +721,16 @@ fn answer_log(hits: &[(std::path::PathBuf, ls_log::Tally)]) {
             .file_name()
             .map_or_else(String::new, |f| f.to_string_lossy().into_owned());
         if t.refusals > 0 {
+            // The host, when the log named one: a refusal about a name we do
+            // not route at all is a different story from one on a gate host,
+            // and the line said neither (three field reports, 2026-09-21).
             log_proxy(&format!(
-                "region-400 x{} в {} — Antigravity упёрся в гейт",
-                t.refusals, file
+                "region-400 x{} в {}{} — Antigravity упёрся в гейт",
+                t.refusals,
+                file,
+                t.refused_host
+                    .as_deref()
+                    .map_or_else(String::new, |h| format!(" ({h})"))
             ));
         }
         refusals += t.refusals;
@@ -710,62 +778,133 @@ fn newest(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
     }
 }
 
+/// One line about the connection a refusal came in on: the fact that decides
+/// whether changing the route could possibly help.
+///
+/// Same connection as the one carrying an answer → the backend is turning
+/// single requests down and every road leads to the same place. A sibling →
+/// this is one pooled connection that went bad while another works, and closing
+/// it is what makes the client dial a fresh one (D26). The log could not tell
+/// the two apart, and three field reports (2026-09-21) turn on exactly that:
+/// a route answering and refusing in the same minute, over and over.
+fn connection_note(kind: routes::Kind, id: u64, shape: Option<routes::Shape>) -> String {
+    let Some(s) = shape else {
+        return format!("region-400 по соединению #{} «{}»", id, kind.label());
+    };
+    let open = routes::open_counts();
+    let others: Vec<String> = routes::ALL
+        .iter()
+        .zip(open)
+        .filter(|(_, n)| *n > 0)
+        .map(|(k, n)| format!("{} {}", k.label(), n))
+        .collect();
+    let what = match s.answered_ago {
+        Some(ago) => format!(
+            "то же соединение, по которому шёл ответ ({} с назад, {} КБ)",
+            ago.as_secs(),
+            s.to_client / 1024
+        ),
+        None => format!(
+            "ответов не нёс, открыто {} с, {} КБ",
+            s.age.as_secs(),
+            s.to_client / 1024
+        ),
+    };
+    format!(
+        "region-400 по соединению #{} «{}»: {}; открыто: {}",
+        id,
+        kind.label(),
+        what,
+        others.join(", ")
+    )
+}
+
 fn on_refusals(count: usize, at: Instant, host: Option<&str>) {
-    let carried = routes::attribute(at, host);
+    let carried = routes::attribute_tunnel(at, host);
     let mut acted: Vec<String> = Vec::new();
     match carried {
-        Some(kind) => match routes::blame(kind) {
-            routes::Blamed::Benched(penalty) => {
-                log_proxy(&format!(
-                    "маршрут «{}» нёс region-400 — отложен на {}, его соединения закрыты",
-                    kind.label(),
-                    human_minutes(penalty)
-                ));
-                acted.push(format!(
-                    "маршрут «{}» отложен на {}, следующее соединение пойдёт другим",
-                    kind.label(),
-                    human_minutes(penalty)
-                ));
+        Some((kind, tunnel)) => {
+            let shape = routes::tunnel_shape(tunnel);
+            log_proxy(&connection_note(kind, tunnel, shape));
+            match routes::blame(kind) {
+                routes::Blamed::Benched(penalty) => {
+                    log_proxy(&format!(
+                        "маршрут «{}» нёс region-400 — отложен на {}, его соединения закрыты",
+                        kind.label(),
+                        human_minutes(penalty)
+                    ));
+                    acted.push(format!(
+                        "маршрут «{}» отложен на {}, следующее соединение пойдёт другим",
+                        kind.label(),
+                        human_minutes(penalty)
+                    ));
+                }
+                // The route answered a moment ago, so the refusal is about the
+                // request or about a connection the client made without us -
+                // not about the road. Leaving its sockets alone is the point:
+                // an answer arrives as a stream, and cutting them is how a user
+                // loses one halfway through.
+                routes::Blamed::Proven(ago) => {
+                    log_proxy(&format!(
+                        "маршрут «{}» нёс region-400, но ответ модели был {} с назад — оставлен как есть",
+                        kind.label(),
+                        ago.as_secs()
+                    ));
+                    acted.push(format!(
+                        "по «{}» модель отвечала {} с назад — маршрут и его соединения не тронуты",
+                        kind.label(),
+                        ago.as_secs()
+                    ));
+                }
+                routes::Blamed::AlreadyBenched => {
+                    acted.push(format!(
+                        "соединения через «{}» закрыты — повтор пойдёт другим путём",
+                        kind.label()
+                    ));
+                }
+                // A tunnel that carried an answer is still open on this route,
+                // so the answer is still coming through it. The route is not
+                // touched at all, and nothing is on a clock: it ends when the
+                // client closes (D32).
+                routes::Blamed::Streaming { idle, to_client } => {
+                    log_proxy(&format!(
+                        "маршрут «{}» нёс region-400, но по нему идёт ответ модели ({} КБ, байты {} с назад) — не тронут",
+                        kind.label(),
+                        to_client / 1024,
+                        idle.as_secs()
+                    ));
+                    // The route is protected, and so is the connection carrying
+                    // the answer. The connection the refusal actually arrived
+                    // on is protected only when it is that same one. For a
+                    // sibling D26 still holds, narrowed to it alone: closing it
+                    // makes the client dial again, and the new connection is
+                    // offered the table afresh, while the answer in flight
+                    // never notices.
+                    let same = shape.is_some_and(|s| s.answered_ago.is_some());
+                    if same {
+                        acted.push(format!(
+                            "ошибка 400 пришла по тому же соединению, по которому идёт ответ модели («{}»): отказывают отдельные запросы, а не маршрут — смена маршрута тут не поможет",
+                            kind.label()
+                        ));
+                    } else if routes::cut_tunnel(tunnel) {
+                        log_proxy(&format!(
+                            "соединение #{} закрыто — по «{}» ответ модели идёт по другому, его не трогаем",
+                            tunnel,
+                            kind.label()
+                        ));
+                        acted.push(format!(
+                            "по «{}» идёт ответ модели — маршрут не тронут; отказавшее соединение закрыто, следующий запрос пойдёт по новому",
+                            kind.label()
+                        ));
+                    } else {
+                        acted.push(format!(
+                            "по «{}» сейчас идёт ответ модели — маршрут и его соединения не тронуты",
+                            kind.label()
+                        ));
+                    }
+                }
             }
-            // The route answered a moment ago, so the refusal is about the
-            // request or about a connection the client made without us - not
-            // about the road. Leaving its sockets alone is the point: an answer
-            // arrives as a stream, and cutting them is how a user loses one
-            // halfway through.
-            routes::Blamed::Proven(ago) => {
-                log_proxy(&format!(
-                    "маршрут «{}» нёс region-400, но ответ модели был {} с назад — оставлен как есть",
-                    kind.label(),
-                    ago.as_secs()
-                ));
-                acted.push(format!(
-                    "по «{}» модель отвечала {} с назад — маршрут и его соединения не тронуты",
-                    kind.label(),
-                    ago.as_secs()
-                ));
-            }
-            routes::Blamed::AlreadyBenched => {
-                acted.push(format!(
-                    "соединения через «{}» закрыты — повтор пойдёт другим путём",
-                    kind.label()
-                ));
-            }
-            // A tunnel that carried an answer is still open on this route, so
-            // the answer is still coming through it. Nothing is done at all,
-            // and nothing is on a clock: it ends when the client closes (D32).
-            routes::Blamed::Streaming { idle, to_client } => {
-                log_proxy(&format!(
-                    "маршрут «{}» нёс region-400, но по нему идёт ответ модели ({} КБ, байты {} с назад) — не тронут",
-                    kind.label(),
-                    to_client / 1024,
-                    idle.as_secs()
-                ));
-                acted.push(format!(
-                    "по «{}» сейчас идёт ответ модели — маршрут и его соединения не тронуты",
-                    kind.label()
-                ));
-            }
-        },
+        }
         // The client reached Google without us, from inside a tunnel the relay
         // was standing down for: that tunnel exits somewhere blocked, so the
         // substituted address is sent back through it for a while (D15's rule,
@@ -790,7 +929,11 @@ fn on_refusals(count: usize, at: Instant, host: Option<&str>) {
             );
         }
     }
-    gate::record_episode(count as u32, acted.join("; "), carried.map(|k| k.label()));
+    gate::record_episode(
+        count as u32,
+        acted.join("; "),
+        carried.map(|(k, _)| k.label()),
+    );
 }
 
 fn on_answers(count: usize, at: Instant, host: Option<&str>) {
@@ -810,24 +953,41 @@ fn on_answers(count: usize, at: Instant, host: Option<&str>) {
         }
     }
     // One line a minute at most: a user in a long session produces an answer
-    // every few seconds, and the log is 64 KB.
-    static LAST_LINE: Mutex<Option<Instant>> = Mutex::new(None);
-    let due = LAST_LINE
-        .lock()
-        .map(|mut g| {
-            let due = g.is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
-            if due {
-                *g = Some(Instant::now());
+    // every few seconds, and the log is 64 KB. What is held back is *counted*,
+    // not dropped - a report showing one answer a minute while the user was
+    // getting a dozen made the refusals look like the whole story - and a
+    // change of route always prints, because that is the event worth seeing.
+    struct AnswerLine {
+        at: Option<Instant>,
+        held: usize,
+        route: Option<&'static str>,
+    }
+    static LAST_LINE: Mutex<AnswerLine> = Mutex::new(AnswerLine {
+        at: None,
+        held: 0,
+        route: None,
+    });
+    let label = carried.map_or("не наш", |(k, _)| k.label());
+    let mut lines: Vec<(usize, &'static str)> = Vec::new();
+    if let Ok(mut g) = LAST_LINE.lock() {
+        // A change of route ends the old line first: what was held back came
+        // through the route it came through, and printing it under the new one
+        // would credit a road that carried none of it.
+        if let Some(prev) = g.route.filter(|prev| *prev != label) {
+            if g.held > 0 {
+                lines.push((std::mem::take(&mut g.held), prev));
             }
-            due
-        })
-        .unwrap_or(false);
-    if due {
-        log_proxy(&format!(
-            "модель ответила (x{}) — маршрут «{}»",
-            count,
-            carried.map_or("не наш", |(k, _)| k.label())
-        ));
+            g.at = None;
+        }
+        g.held += count;
+        if g.at.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+            g.at = Some(Instant::now());
+            lines.push((std::mem::take(&mut g.held), label));
+        }
+        g.route = Some(label);
+    }
+    for (held, route) in lines {
+        log_proxy(&format!("модель ответила (x{}) — маршрут «{}»", held, route));
     }
     gate::record_answer(carried.map(|(k, _)| k.label()));
 }
@@ -1230,6 +1390,44 @@ mod tests {
     #[test]
     fn warming_runs_more_often_than_an_answer_goes_stale() {
         assert!(WARM_EVERY < resolvers::ANSWER_TTL);
+    }
+
+    /// A burst of one message must not eat the sixty lines a report shows.
+    /// The first of a run goes out at once; the rest are counted and the count
+    /// is written the moment anything else is logged.
+    #[test]
+    fn a_run_of_one_line_is_collapsed_into_a_count() {
+        let line = "напрямую X: имя не разрешается";
+        // The first is written, with nothing held back before it.
+        assert_eq!(collapse_repeat(line), (None, true));
+        for _ in 0..14 {
+            assert_eq!(collapse_repeat(line), (None, false), "a repeat was written");
+        }
+        // Something else ends the run and carries the tally.
+        let (note, write) = collapse_repeat("что-то другое");
+        assert!(write);
+        assert_eq!(note.as_deref(), Some("↑ то же самое ещё 14 раз"));
+        // …and the next line after that has nothing to report.
+        assert_eq!(collapse_repeat("третья"), (None, true));
+
+        // And a run that never ends is never silent: the tally is written every
+        // `REPEAT_RUN`, so a problem repeating for an hour is still visible.
+        // One test and not two: `collapse_repeat` keeps one run per process,
+        // and two tests would race for it.
+        let line = "бесконечное";
+        assert_eq!(collapse_repeat(line), (None, true));
+        for _ in 0..(REPEAT_RUN - 1) {
+            assert_eq!(collapse_repeat(line), (None, false));
+        }
+        let (note, write) = collapse_repeat(line);
+        assert!(!write, "the repeat itself is still not written");
+        assert_eq!(note.as_deref(), Some("↑ то же самое ещё 50 раз"));
+        // The counter restarted, so the next line ends a fresh run.
+        assert_eq!(collapse_repeat(line), (None, false));
+        assert_eq!(
+            collapse_repeat("иное").0.as_deref(),
+            Some("↑ то же самое ещё 1 раз")
+        );
     }
 
     #[test]

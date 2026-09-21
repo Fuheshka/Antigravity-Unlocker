@@ -619,26 +619,36 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// The window's «Скопировать отчёт». A server has no clipboard of its own,
-    /// so the text always lands in a file, and is also offered to the terminal
-    /// (OSC 52: Windows Terminal, iTerm2, kitty, WezTerm, tmux pass it on to
-    /// the clipboard of the machine the user sits at).
+    /// The window's «Сохранить отчёт». The file is the deliverable - a report
+    /// pasted into a chat is a wall of text that arrives truncated - so it goes
+    /// to the Desktop, and to the state directory when there is no Desktop to
+    /// write to (a server). It is also offered to the terminal (OSC 52: Windows
+    /// Terminal, iTerm2, kitty, WezTerm, tmux pass it on to the clipboard of the
+    /// machine the user sits at), which is the only clipboard an SSH session has.
     fn save_report(&mut self) {
         let text = crate::gui::report::build(self.status.as_ref(), &self.gate);
-        let path = crate::dns_forwarder::log_dir().join("report.txt");
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).ok();
-        }
-        let saved = std::fs::write(&path, &text).is_ok();
+        let saved = crate::utils::desktop_dir()
+            .and_then(|dir| crate::utils::save_text_file(&dir, crate::utils::REPORT_FILE, &text))
+            .or_else(|| {
+                let dir = crate::dns_forwarder::log_dir();
+                std::fs::create_dir_all(&dir).ok();
+                crate::utils::save_text_file(&dir, crate::utils::REPORT_FILE, &text)
+            });
         let copied = copy_out(&text);
         let msg = match (saved, copied) {
-            (true, Copied::Clipboard) => format!("Отчёт скопирован и сохранён: {}", path.display()),
-            (true, Copied::Terminal) => format!(
+            (Some(path), Copied::Clipboard) => {
+                format!("Отчёт сохранён: {} (и скопирован)", path.display())
+            }
+            (Some(path), Copied::Terminal) => format!(
                 "Отчёт сохранён: {} (и передан терминалу для буфера обмена)",
                 path.display()
             ),
-            (false, Copied::Clipboard) => "Отчёт скопирован в буфер обмена.".to_string(),
-            (false, Copied::Terminal) => "Отчёт передан терминалу для буфера обмена.".to_string(),
+            (None, Copied::Clipboard) => {
+                "Файл сохранить не удалось — отчёт скопирован в буфер обмена.".to_string()
+            }
+            (None, Copied::Terminal) => {
+                "Файл сохранить не удалось — отчёт передан терминалу для буфера обмена.".to_string()
+            }
         };
         self.toast(msg);
     }

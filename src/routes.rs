@@ -202,8 +202,28 @@ struct Table {
     penalised: [Option<Instant>; N],
     /// When each route last carried a model answer.
     ok_at: [Option<Instant>; N],
-    /// When each route last carried a refusal.
+    /// When each route last carried a refusal that counted *as evidence*
+    /// against it - one that was neither protected by a live answer (D32) nor
+    /// by a fresh one (D31). This is what `proven` reads.
+    ///
+    /// Split from `refused_at` because the two answer different questions and
+    /// sharing one field made a protected route lose its place anyway: `blame`
+    /// declined to bench or cut it and then stamped this, `proven` went false,
+    /// and the route dropped out of tier 0 into whatever its measurement said.
+    /// A field report (2026-09-21) shows the result - the leader flapping
+    /// between the route that was streaming an answer and the next one every
+    /// fifteen seconds, so half the client's new connections went to a road
+    /// nothing had proved (G76).
     bad_at: [Option<Instant>; N],
+    /// When each route last carried a refusal at all, protected or not, for the
+    /// window's table. Never evidence.
+    refused_at: [Option<Instant>; N],
+    /// Refusal episodes and model answers pinned on each route since the relay
+    /// started or the network changed. Only the report reads them: "this route
+    /// answered twenty times and was refused thirty" is the one line that says
+    /// whether a route half-works, which no single timestamp can.
+    ok_count: [u32; N],
+    bad_count: [u32; N],
     /// Refusals in a row with no answer in between, which sets the next penalty.
     streak: [u8; N],
     /// Until when a route that failed to open for a live connection sits last.
@@ -221,6 +241,9 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
     penalised: [None; N],
     ok_at: [None; N],
     bad_at: [None; N],
+    refused_at: [None; N],
+    ok_count: [0; N],
+    bad_count: [0; N],
     streak: [0; N],
     stumbled: [None; N],
     leader: None,
@@ -323,6 +346,7 @@ pub fn credit(kind: Kind) {
     if let Ok(mut t) = TABLE.lock() {
         let i = kind.index();
         t.ok_at[i] = Some(Instant::now());
+        t.ok_count[i] = t.ok_count[i].saturating_add(1);
         t.streak[i] = 0;
         // A route that carried an answer is not one to keep behind the others.
         t.penalised[i] = None;
@@ -412,20 +436,28 @@ fn blame_table(kind: Kind, streaming: Option<(Duration, u64)>) -> Blamed {
     // refused, and a protected route is one the user should still see taking
     // refusals.
     let answered_ago = t.ok_at[i].map(|ok| ok.elapsed());
-    t.bad_at[i] = Some(now);
+    t.refused_at[i] = Some(now);
+    t.bad_count[i] = t.bad_count[i].saturating_add(1);
     // Ahead of everything else, the already-benched arm included: that arm
     // cuts, and this is the one case where cutting is the damage (D32).
     if let Some((idle, to_client)) = streaming {
+        // `bad_at` deliberately untouched. "Does nothing at all" (D31) has to
+        // include the ordering: a route that is handing the client an answer
+        // right now must stay in the proven tier, or the next connection is
+        // offered a road nothing has proved while this one works (G76).
         return Blamed::Streaming { idle, to_client };
     }
     if penalised(&t.penalised, kind) {
+        t.bad_at[i] = Some(now);
         return Blamed::AlreadyBenched;
     }
     if let Some(ago) = answered_ago.filter(|a| *a < PROOF_PROTECTS_FOR) {
         // Not a strike either: a streak is "refused again with no model answer
-        // in between", and there was one.
+        // in between", and there was one - and not evidence either, for the
+        // same reason as the arm above.
         return Blamed::Proven(ago);
     }
+    t.bad_at[i] = Some(now);
     let step = (t.streak[i] as usize).min(PENALTY_STEPS.len() - 1);
     let penalty = PENALTY_STEPS[step];
     t.streak[i] = t.streak[i].saturating_add(1);
@@ -448,6 +480,9 @@ pub fn set_context(fingerprint: u64) -> bool {
     if !first {
         t.ok_at = [None; N];
         t.bad_at = [None; N];
+        t.refused_at = [None; N];
+        t.ok_count = [0; N];
+        t.bad_count = [0; N];
         t.streak = [0; N];
         t.penalised = [None; N];
         t.stumbled = [None; N];
@@ -474,6 +509,9 @@ struct Snapshot {
     penalised: [Option<Instant>; N],
     ok_at: [Option<Instant>; N],
     bad_at: [Option<Instant>; N],
+    refused_at: [Option<Instant>; N],
+    ok_count: [u32; N],
+    bad_count: [u32; N],
     stumbled: [Option<Instant>; N],
     leader: Option<Kind>,
 }
@@ -486,6 +524,9 @@ fn snapshot() -> Snapshot {
             penalised: t.penalised,
             ok_at: t.ok_at,
             bad_at: t.bad_at,
+            refused_at: t.refused_at,
+            ok_count: t.ok_count,
+            bad_count: t.bad_count,
             stumbled: t.stumbled,
             leader: t.leader,
         },
@@ -494,6 +535,9 @@ fn snapshot() -> Snapshot {
             penalised: [None; N],
             ok_at: [None; N],
             bad_at: [None; N],
+            refused_at: [None; N],
+            ok_count: [0; N],
+            bad_count: [0; N],
             stumbled: [None; N],
             leader: None,
         },
@@ -888,6 +932,7 @@ fn cut_tunnels(kind: Kind) {
 /// `None` when no tunnel of ours was open around it: the client reached Google
 /// some other way, and pinning the event on whichever route last opened a
 /// tunnel would bench a route that never saw it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn attribute(at: Instant, host: Option<&str>) -> Option<Kind> {
     attribute_tunnel(at, host).map(|(kind, _)| kind)
 }
@@ -915,6 +960,69 @@ pub fn credit_tunnel(id: u64) {
             t.answered_at = Some(Instant::now());
         }
     }
+}
+
+/// What one gate connection looks like, for the line the log writes when a
+/// refusal is pinned on it.
+///
+/// A refusal and a model answer on the **same** connection is a different
+/// diagnosis from one on a sibling, and the relay log could not tell them apart
+/// until now: three field reports (2026-09-21) showed a route refusing once a
+/// minute while answering on the same minute, and nothing in the log said
+/// whether the refused request rode the connection that was answering. If it
+/// did, no route change can help - the backend is turning single requests down
+/// - and the report should say so instead of sending the user round the routes
+/// again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shape {
+    /// This very connection carried a model answer, and how long ago.
+    pub answered_ago: Option<Duration>,
+    /// Still open.
+    pub open: bool,
+    /// Since it was opened.
+    pub age: Duration,
+    /// Bytes handed to the client on it, and how long since the last one.
+    pub to_client: u64,
+    pub idle: Duration,
+}
+
+/// `Shape` of one tunnel, by the id `attribute_tunnel` gave.
+pub fn tunnel_shape(id: u64) -> Option<Shape> {
+    let list = TUNNELS.lock().ok()?;
+    let t = list.iter().find(|t| t.id == id)?;
+    Some(Shape {
+        answered_ago: t.answered_at.map(|a| a.elapsed()),
+        open: t.closed.is_none(),
+        age: t.opened.elapsed(),
+        to_client: t.activity.bytes().0,
+        idle: t.activity.idle().unwrap_or_else(|| t.opened.elapsed()),
+    })
+}
+
+/// Closes one gate tunnel by id, and only if it never carried a model answer.
+///
+/// The narrow half of `cut_tunnels`. When a route is protected because *another*
+/// of its connections is streaming an answer (D32), the connection the refusal
+/// actually came in on is still a connection the client will go on being
+/// refused over, and D26's reason for cutting applies to it and to nothing else
+/// on the route. Returns whether anything was closed, so the log can say which
+/// of the two cases this was.
+pub fn cut_tunnel(id: u64) -> bool {
+    let Ok(mut list) = TUNNELS.lock() else {
+        return false;
+    };
+    let Some(t) = list
+        .iter_mut()
+        .find(|t| t.id == id && t.closed.is_none() && t.answered_at.is_none())
+    else {
+        return false;
+    };
+    let mut cut = false;
+    for sock in [t.client.take(), t.upstream.take()].into_iter().flatten() {
+        sock.shutdown(std::net::Shutdown::Both).ok();
+        cut = true;
+    }
+    cut
 }
 
 /// An **open** tunnel of `kind` that carried a model answer, i.e. a conversation
@@ -951,8 +1059,13 @@ pub struct Row {
     pub proven: bool,
     /// Seconds since the last model answer it carried.
     pub ok_ago: Option<u64>,
-    /// Seconds since the last refusal it carried.
+    /// Seconds since the last refusal it carried, whether or not that refusal
+    /// was held against it.
     pub refused_ago: Option<u64>,
+    /// Model answers and refusal episodes pinned on it since the relay started
+    /// or the network last changed.
+    pub answers: u32,
+    pub refusals: u32,
     /// Seconds of bench left.
     pub bench_left: Option<u64>,
     pub open: u32,
@@ -977,7 +1090,9 @@ pub fn rows(usable: impl Fn(Kind) -> bool) -> Vec<Row> {
                     .map(|d| d.as_millis().min(u32::MAX as u128) as u32),
                 proven: proven(&s.ok_at, &s.bad_at, k),
                 ok_ago: s.ok_at[i].map(|a| a.elapsed().as_secs()),
-                refused_ago: s.bad_at[i].map(|a| a.elapsed().as_secs()),
+                refused_ago: s.refused_at[i].map(|a| a.elapsed().as_secs()),
+                answers: s.ok_count[i],
+                refusals: s.bad_count[i],
                 bench_left: s.penalised[i]
                     .max(s.stumbled[i])
                     .and_then(|u| u.checked_duration_since(Instant::now()))
@@ -1025,6 +1140,9 @@ mod tests {
             penalised: [None; N],
             ok_at: [None; N],
             bad_at: [None; N],
+            refused_at: [None; N],
+            ok_count: [0; N],
+            bad_count: [0; N],
             stumbled: [None; N],
             leader: None,
         }
@@ -1193,10 +1311,18 @@ mod tests {
         credit(Kind::Relay);
         assert!(!is_penalised(Kind::Relay), "an answer lifts the bench");
         assert!(is_proven(Kind::Relay));
-        // Refused straight after an answer: the route is left alone entirely.
+        // Refused straight after an answer: the route is left alone entirely -
+        // its tier included, which is what Â«Ð½Ðµ Ñ‚Ñ€Ð¾Ð½ÑƒÑ‚Â» has to mean if the next
+        // connection is not to be handed to somebody else (G76).
         assert!(matches!(blame(Kind::Relay), Blamed::Proven(_)));
         assert!(!is_penalised(Kind::Relay), "a proven route is not benched");
-        assert!(!is_proven(Kind::Relay), "but the refusal is on the record");
+        assert!(is_proven(Kind::Relay), "and it keeps its place");
+        assert!(
+            rows(|k| k == Kind::Relay)
+                .iter()
+                .any(|r| r.label == Kind::Relay.label() && r.refused_ago.is_some()),
+            "but the refusal is still on the record the window shows"
+        );
         // Once the proof has aged out, the same refusal benches - at the first
         // step, because the answer reset the streak.
         age_out_answer(Kind::Relay);
@@ -1386,6 +1512,137 @@ mod tests {
         );
         assert!(matches!(blame(Kind::Exits), Blamed::Benched(_)));
         assert!(is_penalised(Kind::Exits));
+    }
+
+    /// G76, the flap three field reports (2026-09-21) show: a refusal the table
+    /// declines to hold against a route must not cost it its place either.
+    ///
+    /// It did. `blame` stamped the refusal whatever it decided, `proven` reads
+    /// that stamp, and the route dropped out of the proven tier the moment it
+    /// was refused - so the leader swapped to whatever measured fastest, swapped
+    /// back on the next answer, and did it again fifteen seconds later. Half the
+    /// client's new connections went to a road nothing had proved, while the
+    /// road that was answering sat second.
+    #[test]
+    fn a_protected_refusal_does_not_cost_the_route_its_place() {
+        let _turn = turn();
+        set_context(0x7601);
+        let usable = |k: Kind| matches!(k, Kind::Exits | Kind::Relay);
+        credit(Kind::Exits);
+        record(Kind::Relay, ms(50));
+        assert_eq!(order(usable).first(), Some(&Kind::Exits));
+
+        // A refusal inside `PROOF_PROTECTS_FOR`: not evidence (D31).
+        assert!(matches!(blame(Kind::Exits), Blamed::Proven(_)));
+        assert!(
+            is_proven(Kind::Exits),
+            "a refusal that was not held against the route must not unprove it"
+        );
+        assert_eq!(
+            order(usable).first(),
+            Some(&Kind::Exits),
+            "the route that answered must still be the one offered first"
+        );
+
+        // The user is still told it happened - that half was never the bug.
+        let row = rows(usable)
+            .into_iter()
+            .find(|r| r.label == Kind::Exits.label())
+            .expect("a row for the route");
+        assert!(row.refused_ago.is_some(), "the report must still show it");
+        assert_eq!((row.answers, row.refusals), (1, 1));
+    }
+
+    /// And the other way round, so the fix cannot quietly turn every refusal
+    /// into a free one: once nothing protects the route, the refusal is
+    /// evidence, the bench lands and the proof goes.
+    #[test]
+    fn an_unprotected_refusal_still_takes_the_proof_away() {
+        let _turn = turn();
+        set_context(0x7602);
+        let usable = |k: Kind| matches!(k, Kind::Exits | Kind::Relay);
+        credit(Kind::Exits);
+        age_out_answer(Kind::Exits);
+        assert!(matches!(blame(Kind::Exits), Blamed::Benched(_)));
+        assert!(!is_proven(Kind::Exits));
+        record(Kind::Relay, ms(50));
+        assert_eq!(order(usable).first(), Some(&Kind::Relay));
+    }
+
+    /// The narrow cut: when one connection on a route is streaming an answer
+    /// and the refusal arrived on a *different* one, that other one is closed
+    /// and the streaming one is not. Anything else leaves the client retrying
+    /// over a pooled connection that is being refused (D26) or cuts the answer
+    /// in half (D32) - the two halves of the same field report.
+    #[test]
+    fn only_the_refused_connection_is_cut_beside_a_live_answer() {
+        let _turn = turn();
+        use std::io::{ErrorKind, Read};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bound");
+        let addr = listener.local_addr().expect("addr");
+
+        // Two gate tunnels on one route, the way a client's pool makes them.
+        let mut open_one = |host: &'static str| {
+            let far = TcpStream::connect(addr).expect("connected");
+            let (near, _) = listener.accept().expect("accepted");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let _gate = begin_gate_connection(&near, host);
+                note_used(Kind::Exits);
+                tx.send(attribute_tunnel(Instant::now(), Some(host))).ok();
+                let mut buf = [0u8; 1];
+                let mut near = near;
+                let _ = near.read(&mut buf);
+            });
+            let (_, id) = rx.recv().expect("opened").expect("attributed");
+            (far, id, thread)
+        };
+        let (mut answering, answering_id, t1) = open_one("daily-cloudcode-pa.googleapis.com");
+        let (mut refused, refused_id, t2) = open_one("cloudcode-pa.googleapis.com");
+        assert_ne!(answering_id, refused_id);
+
+        set_context(0x7603);
+        credit(Kind::Exits);
+        credit_tunnel(answering_id);
+
+        // The refusal came in on the sibling.
+        assert!(matches!(blame(Kind::Exits), Blamed::Streaming { .. }));
+        assert!(cut_tunnel(refused_id), "the refused connection must be cut");
+        assert!(
+            !cut_tunnel(answering_id),
+            "the connection carrying the answer must never be cut"
+        );
+
+        refused.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut buf = [0u8; 1];
+        assert!(
+            matches!(refused.read(&mut buf), Ok(0) | Err(_)),
+            "the refused connection is still open"
+        );
+        answering
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .ok();
+        let got = answering.read(&mut buf);
+        assert!(
+            matches!(&got, Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)),
+            "the answer's own connection was cut: {got:?}"
+        );
+
+        // `tunnel_shape` is what the log line reads to tell the two apart.
+        assert!(tunnel_shape(answering_id)
+            .expect("a shape")
+            .answered_ago
+            .is_some());
+        assert!(tunnel_shape(refused_id)
+            .expect("a shape")
+            .answered_ago
+            .is_none());
+
+        answering.shutdown(std::net::Shutdown::Both).ok();
+        t1.join().expect("first tunnel");
+        t2.join().expect("second tunnel");
     }
 
     /// Both directions count as activity: a long chat is a 100 KB upload before

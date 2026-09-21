@@ -120,6 +120,7 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
     let busy = app.is_busy();
     let mut pressed: Option<Action> = None;
     let mut copy = false;
+    let mut reveal: Option<std::path::PathBuf> = None;
     egui::Frame::new()
         .fill(theme::CARD)
         .corner_radius(egui::CornerRadius::same(theme::RADIUS))
@@ -146,26 +147,62 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
                 }
             }
             ui.add_space(10.0);
+            // The saved file is named on a line of its own, under the buttons.
+            // A report the size of these is pasted into a chat as a wall of
+            // text nobody reads and half of them arrive truncated, so the file
+            // *is* the deliverable and its name is what the user has to act on;
+            // the path is not shown, because «рабочий стол» plus «Показать» is
+            // what actually gets them to it.
+            let saved = app
+                .report_saved
+                .clone()
+                .filter(|(at, _)| at.elapsed() < REPORT_SHOWN_FOR);
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!busy, egui::Button::new(egui::RichText::new("Скопировать отчёт").size(12.5)))
-                    .on_hover_text("Всё, что нужно, чтобы понять, почему Antigravity отвечает или нет — одним текстом для группы")
+                    .add_enabled(!busy, egui::Button::new(egui::RichText::new("Сохранить отчёт").size(12.5)))
+                    .on_hover_text("Всё, что нужно, чтобы понять, почему Antigravity отвечает или нет — одним файлом на рабочем столе: приложите его к сообщению")
                     .clicked()
                 {
                     copy = true;
                 }
-                if app
-                    .report_copied_at
-                    .is_some_and(|at| at.elapsed() < Duration::from_secs(4))
-                {
-                    ui.label(
-                        egui::RichText::new("Отчёт скопирован — вставьте его в сообщение.")
-                            .size(12.5)
-                            .color(theme::OK),
-                    );
-                    ui.ctx().request_repaint_after(Duration::from_millis(500));
+                if let Some((_, path)) = &saved {
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("Показать файл").size(12.5)))
+                        .on_hover_text("Открыть папку с отчётом")
+                        .clicked()
+                    {
+                        reveal = Some(path.clone());
+                    }
                 }
             });
+            if let Some((_, path)) = &saved {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Отчёт сохранён на рабочий стол: «{}». Приложите этот файл к сообщению.",
+                        path.file_name()
+                            .map(|f| f.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    ))
+                    .size(12.5)
+                    .color(theme::OK),
+                );
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+            }
+            if app
+                .report_clipboard_at
+                .is_some_and(|at| at.elapsed() < REPORT_SHOWN_FOR)
+            {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Файл сохранить не удалось — отчёт скопирован, вставьте его в сообщение.",
+                    )
+                    .size(12.5)
+                    .color(theme::WARN),
+                );
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+            }
         });
 
     match pressed {
@@ -176,10 +213,32 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
     }
     if copy {
         let text = super::report::build(app.status.as_ref(), &app.gate);
-        ui.ctx().copy_text(text);
-        app.report_copied_at = Some(std::time::Instant::now());
+        // The clipboard as well, always: it costs nothing and a user who would
+        // rather paste still can.
+        ui.ctx().copy_text(text.clone());
+        let now = std::time::Instant::now();
+        match crate::utils::desktop_dir()
+            .and_then(|dir| crate::utils::save_text_file(&dir, crate::utils::REPORT_FILE, &text))
+        {
+            Some(path) => {
+                app.report_saved = Some((now, path));
+                app.report_clipboard_at = None;
+            }
+            None => {
+                app.report_saved = None;
+                app.report_clipboard_at = Some(now);
+            }
+        }
+    }
+    if let Some(path) = reveal {
+        crate::utils::reveal_in_explorer(&path);
     }
 }
+
+/// How long the card goes on saying where the report was saved. Four seconds
+/// was right for «скопировано»; this one is an instruction to go and find a
+/// file and attach it, and the user is in another window by then.
+const REPORT_SHOWN_FOR: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Antigravity: the three switches anyone needs, and the installs

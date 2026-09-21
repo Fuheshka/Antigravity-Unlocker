@@ -1354,9 +1354,11 @@ mod tests {
     /// socket while `bind_listener` retries it.
     #[test]
     fn waiting_for_a_listener_that_never_comes_costs_the_budget_and_says_no() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");
-        let addr = listener.local_addr().expect("addr");
-        drop(listener);
+        // Port 1, not an ephemeral one just released: the OS hands those out
+        // again, and any other test in this process that binds a listener while
+        // this one is waiting made it fail for a reason that has nothing to do
+        // with what it tests. Nothing listens on tcpmux on Windows.
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
 
         let budget = Duration::from_millis(600);
         let started = Instant::now();

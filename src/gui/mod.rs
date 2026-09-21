@@ -88,9 +88,13 @@ pub struct App {
     providers_reordering: bool,
     path_dialog: Option<String>,
     path_dialog_error: Option<String>,
-    /// When «Скопировать отчёт» was last pressed, for the few seconds the card
-    /// says so.
-    report_copied_at: Option<std::time::Instant>,
+    /// The report file the button last wrote, and when — for as long as the
+    /// card keeps telling the user where it is. Longer than a toast on purpose:
+    /// this is an instruction to go and attach a file, not an acknowledgement.
+    report_saved: Option<(std::time::Instant, std::path::PathBuf)>,
+    /// Set instead when there was nowhere to write it and the text went to the
+    /// clipboard alone.
+    report_clipboard_at: Option<std::time::Instant>,
     /// Frames drawn so far, up to the few it takes to call the renderer proven
     /// (`renderer::confirm`).
     frames: u8,
@@ -153,7 +157,8 @@ impl App {
             providers_reordering: false,
             path_dialog: None,
             path_dialog_error: None,
-            report_copied_at: None,
+            report_saved: None,
+            report_clipboard_at: None,
             frames: 0,
         }
     }

@@ -1,4 +1,4 @@
-//! «Скопировать отчёт»: everything needed to say why Antigravity is or is not
+//! «Сохранить отчёт»: everything needed to say why Antigravity is or is not
 //! answering, in one paste.
 //!
 //! «Поставил анлокер, но не помогает что-то» plus a screenshot of a green card
@@ -257,6 +257,16 @@ fn relay_part(out: &mut String, r: &Report) {
         if let Some(a) = row.refused_ago {
             parts.push(format!("ошибка 400 {a} с назад"));
         }
+        // The tally, not just the two timestamps: «ответ 34 с назад, ошибка 400
+        // 14 с назад» is the same line for a route that answers nine times out
+        // of ten and for one that answers once in fifty, and three field
+        // reports (2026-09-21) turned on telling those apart.
+        if row.answers > 0 || row.refusals > 0 {
+            parts.push(format!(
+                "ответов {}, отказов {}",
+                row.answers, row.refusals
+            ));
+        }
         if let Some(b) = row.bench_left.filter(|_| !row.usable) {
             parts.push(format!("отложен ещё на {} мин", b / 60 + 1));
         }
@@ -343,7 +353,7 @@ fn non_empty(s: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    /// What «Скопировать отчёт» puts on the clipboard on this machine, minus the
+    /// What «Сохранить отчёт» writes to the file on this machine, minus the
     /// system scan the window adds. Reads, never asserts content.
     ///
     ///     cargo test prints_the_report -- --ignored --nocapture
@@ -353,6 +363,42 @@ mod tests {
         let text = super::build(None, &crate::gate::View::default());
         println!("{text}");
         assert!(text.contains("отчёт"));
+    }
+
+    /// The line that says whether a route half-works. Two timestamps read the
+    /// same for a route answering nine times in ten and one answering once in
+    /// fifty, and three field reports (2026-09-21) turned on telling them
+    /// apart.
+    #[test]
+    fn a_route_row_says_how_often_it_answered_and_how_often_it_was_refused() {
+        let relay = crate::gate::Report {
+            at: crate::gate::now_unix(),
+            routes: vec![crate::routes::Row {
+                label: "напрямую".into(),
+                usable: true,
+                latency_ms: Some(479),
+                proven: true,
+                ok_ago: Some(34),
+                refused_ago: Some(14),
+                answers: 21,
+                refusals: 30,
+                open: 2,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // `relay_part`, not `build`: the report reads the live record off the
+        // disk on purpose (the table's ages move every pass and nothing wakes
+        // the window for them), so a synthesised one only reaches this half.
+        let mut text = String::new();
+        super::relay_part(&mut text, &relay);
+        assert!(
+            text.contains("ответов 21, отказов 30"),
+            "the tally is missing:\n{text}"
+        );
+        // …and the refusal is still shown, which is the half the split of
+        // `bad_at`/`refused_at` must not have cost (G76).
+        assert!(text.contains("ошибка 400 14 с назад"), "{text}");
     }
 
     use super::mask_addresses as mask;
