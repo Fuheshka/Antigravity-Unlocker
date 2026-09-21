@@ -1,6 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::net::UdpSocket;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
@@ -121,7 +121,17 @@ pub const LISTEN_PORT: u16 = 53;
 ///     have (P26), and reports when nothing on the internet answers it
 ///     (`gate::Report::{blockers, reached_at, started_at, exe}`, P53). An older
 ///     relay leaves a user with `os error 10013` in its log and a 400 on screen.
-pub const RELAY_VERSION: u32 = 32;
+/// 33 = its own UDP `:53` is retried and diagnosed like the other two listeners
+///     instead of killing the process (`serve_dns_forever`), so a machine where
+///     something holds port 53 still gets the door, the proxy, the exits and
+///     the auto-patch; a refusal no longer benches - or even disconnects - a
+///     route that carried a model answer in the last ninety seconds
+///     (`routes::Blamed::Proven`), the first bench is two minutes rather than
+///     ten, a region bench orders a route instead of removing it from the table
+///     for every kind alike, and a route that fails its probe is kept back
+///     until one succeeds. An older relay drops the working route mid-answer
+///     and thrashes between benched ones.
+pub const RELAY_VERSION: u32 = 33;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -705,7 +715,7 @@ fn on_refusals(count: usize, at: Instant, host: Option<&str>) {
     let mut acted: Vec<String> = Vec::new();
     match carried {
         Some(kind) => match routes::blame(kind) {
-            Some(penalty) => {
+            routes::Blamed::Benched(penalty) => {
                 log_proxy(&format!(
                     "маршрут «{}» нёс region-400 — отложен на {}, его соединения закрыты",
                     kind.label(),
@@ -717,7 +727,24 @@ fn on_refusals(count: usize, at: Instant, host: Option<&str>) {
                     human_minutes(penalty)
                 ));
             }
-            None => {
+            // The route answered a moment ago, so the refusal is about the
+            // request or about a connection the client made without us - not
+            // about the road. Leaving its sockets alone is the point: an answer
+            // arrives as a stream, and cutting them is how a user loses one
+            // halfway through.
+            routes::Blamed::Proven(ago) => {
+                log_proxy(&format!(
+                    "маршрут «{}» нёс region-400, но ответ модели был {} с назад — оставлен как есть",
+                    kind.label(),
+                    ago.as_secs()
+                ));
+                acted.push(format!(
+                    "по «{}» модель отвечала {} с назад — маршрут и его соединения не тронуты",
+                    kind.label(),
+                    ago.as_secs()
+                ));
+            }
+            routes::Blamed::AlreadyBenched => {
                 acted.push(format!(
                     "соединения через «{}» закрыты — повтор пойдёт другим путём",
                     kind.label()
@@ -805,18 +832,27 @@ fn human_minutes(d: Duration) -> String {
 /// absent. Covers `proxy::bind_listener`'s own retries (15 s) with room to spare.
 const PROXY_START_BUDGET: Duration = Duration::from_secs(30);
 
-/// Runs until killed. Never returns `Ok` - the only way out is a bind failure,
-/// which is worth reporting because it means something else holds the address.
+/// Runs until killed, and never returns.
+///
+/// The DNS listener is started **last and separately** (`serve_dns_forever`),
+/// and a port it cannot take is no longer the end of the process. It used to
+/// be: `run` bound `127.0.0.53:53` first and returned the error, `main` logged
+/// it as fatal and exited 1. A field report (2026-09-20) showed what that costs
+/// - something on that machine had held UDP `:53` for a day, so every start
+/// died within seconds, and with it went the gate hosts' door, the local proxy,
+/// the built-in exits, the route table, the region-400 watch and the auto-patch
+/// watchdog. Not one of those needs port 53. That user had a working bypass
+/// available the whole time and got nothing.
 pub fn run() -> Result<(), String> {
-    let sock = UdpSocket::bind((LISTEN_IP, LISTEN_PORT))
-        .map_err(|e| format!("не удалось занять {}:{} — {}", LISTEN_IP, LISTEN_PORT, e))?;
-    log(&format!("start: {}:{}", LISTEN_IP, LISTEN_PORT));
     // Detect once up front. Otherwise the first query pays for a cold probe,
     // which is long enough that Windows gives up on us and falls back to the
     // direct resolvers - and then caches that unsubstituted answer for its full
     // TTL, so one slow startup is felt for minutes.
     log(&format!("egress: if{}", isp_interface()));
     record_version();
+    // Before any listener is tried: from here on the window can tell this
+    // process from its own watchdog by the age of what it writes (P54).
+    gate::note_started();
     thread::spawn(warm_forever);
     // The proxy variable is user-wide and must never outlive the listener it
     // names, so the watchdog takes it off when the listener is dead for a while
@@ -902,11 +938,105 @@ pub fn run() -> Result<(), String> {
     });
     thread::spawn(watch_client_logs);
 
+    serve_dns_forever()
+}
+
+/// Where the NRPT rules send their queries, as an address to bind and to
+/// diagnose. `LISTEN_IP` is a literal and always parses; the fallback only
+/// exists so a typo in it could never panic the relay.
+fn listen_addr() -> SocketAddr {
+    SocketAddr::from((
+        LISTEN_IP.parse::<Ipv4Addr>().unwrap_or(Ipv4Addr::LOCALHOST),
+        LISTEN_PORT,
+    ))
+}
+
+/// How many `recv_from` failures in a row mean the socket is gone rather than
+/// one exchange having gone wrong.
+///
+/// Windows surfaces an ICMP port-unreachable for an answer we already sent as
+/// `WSAECONNRESET` on the *next* receive, so single errors are ordinary and are
+/// skipped, as they always were. Sixty-four of them with not one query in
+/// between is a socket worth dropping and taking again.
+const RECV_ERRORS_BEFORE_REBIND: u32 = 64;
+
+/// Holds `127.0.0.53:53` and answers on it, for as long as the process lives.
+///
+/// A port that cannot be had is diagnosed (`portcheck`), published for the
+/// window's card (`gate::set_blocker`) and tried again every minute, the same
+/// way the local proxy and the door already do. Unlike those two it cannot move
+/// to another port: the NRPT rules name an address and Windows sends DNS to
+/// port 53 or nowhere. Meanwhile the NRPT rules list this address *first* and
+/// the substituting providers after it, so a Windows client falls through to
+/// them on its own - the layer degrades to slow rather than to nothing.
+fn serve_dns_forever() -> ! {
+    let addr = listen_addr();
+    let mut said: Option<crate::gate::Blocker> = None;
+    loop {
+        let sock = match UdpSocket::bind(addr) {
+            Ok(sock) => {
+                if said.take().is_some() {
+                    log("порт DNS-релея освободился");
+                    gate::set_blocker("dns", None);
+                }
+                sock
+            }
+            Err(e) => {
+                let blocker =
+                    crate::portcheck::diagnose_on(addr, &e, crate::portcheck::Proto::Udp)
+                        .blocker("dns", addr, &e);
+                // Once per distinct cause: the retry is a minute, the log is 64 KB.
+                if said.as_ref() != Some(&blocker) {
+                    log(&format!(
+                        "не занять {} — {} ({}{})",
+                        blocker.addr,
+                        blocker.error,
+                        blocker.cause,
+                        if blocker.by.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", blocker.by)
+                        }
+                    ));
+                    said = Some(blocker.clone());
+                }
+                // Every try, so the record never goes stale under the card.
+                gate::set_blocker("dns", Some(blocker));
+                thread::sleep(proxy::REBIND_EVERY);
+                continue;
+            }
+        };
+        log(&format!("start: {}:{}", LISTEN_IP, LISTEN_PORT));
+        let up = Instant::now();
+        serve_queries(&sock);
+        drop(sock);
+        log("DNS-сокет перестал принимать запросы — занимаем заново");
+        // Never in a tight loop: a socket that did not last a minute is not one
+        // an immediate retry will fix, so it waits out the same clock a failed
+        // bind does.
+        if up.elapsed() < proxy::REBIND_EVERY {
+            thread::sleep(proxy::REBIND_EVERY);
+        }
+    }
+}
+
+/// Answers queries on `sock` until it stops taking them.
+fn serve_queries(sock: &UdpSocket) {
     let mut buf = [0u8; 4096];
+    let mut misses = 0u32;
     loop {
         let (n, from) = match sock.recv_from(&mut buf) {
-            Ok(v) => v,
-            Err(_) => continue,
+            Ok(v) => {
+                misses = 0;
+                v
+            }
+            Err(_) => {
+                misses += 1;
+                if misses >= RECV_ERRORS_BEFORE_REBIND {
+                    return;
+                }
+                continue;
+            }
         };
         // Anything shorter than a header is not a query worth relaying.
         if n < 12 {

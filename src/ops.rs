@@ -963,8 +963,24 @@ fn read_watchdog(admin: bool) -> State {
 /// from the last measurement instead of asking Windows again (`Scan::Settings`).
 fn probe_dns() -> (bool, bool) {
     let rules = dns::is_nrpt_applied();
-    let relay = background::is_enabled() && background::is_running();
+    let relay = background::is_enabled() && background::is_running() && relay_reporting();
     (rules, relay)
+}
+
+/// Whether the relay itself is alive, and not only a process of its name.
+///
+/// `is_running` matches `ag_dns.exe` in the task list, and the watchdog is a
+/// second process with that same image name - so a relay that died on startup
+/// still read as running for as long as its watchdog lived (P54). A field
+/// report printed both halves of that contradiction in one paste: «Служба:
+/// запущена» over «Записи нет — служба не запущена или старая». The relay
+/// writes `gate.json` from its first moment (`gate::note_started`) and on every
+/// warm pass; the watchdog never writes it.
+///
+/// Windows only. The Linux proxy writes that file solely to record a blocker,
+/// so there the systemd unit being active is all there is to go on.
+fn relay_reporting() -> bool {
+    !cfg!(target_os = "windows") || crate::gate::read().is_some_and(|r| !r.is_stale())
 }
 
 fn dns_state(

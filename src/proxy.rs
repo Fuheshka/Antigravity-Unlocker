@@ -620,14 +620,28 @@ pub fn vpn_exit() -> Option<bool> {
 }
 
 fn vpn_usable() -> bool {
-    crate::net::tunnel_up() && vpn_exit() == Some(true) && !routes::is_penalised(routes::Kind::Vpn)
+    crate::net::tunnel_up() && vpn_exit() == Some(true)
 }
 
 /// Whether `kind` is worth offering the next gate connection to. The route
 /// table orders; this says who is in the running at all.
+///
+/// A region bench (`routes::is_penalised`) is deliberately **not** asked about
+/// here, for any route. It is an ordering signal - `order_with` puts benched
+/// routes last, soonest-to-expire first - and answering it here as well took
+/// four of the five kinds out of the table altogether, leaving that branch to
+/// run for `Exits` alone. A field report showed what the asymmetry costs: with
+/// every other route benched out of existence, the table fell through to a
+/// relay that carried nothing, while the benched built-in exit - the only one
+/// answering - stayed in only because its arm never asked. Being last is the
+/// punishment; disappearing is not.
+///
+/// What is asked about here is whether the route exists at all on this machine
+/// right now: a proxy the user has not given us, a tunnel that is not up, a
+/// pool with nothing in it, a name the DNS layer is not substituting.
 pub fn route_usable(kind: routes::Kind, host: &str) -> bool {
     match kind {
-        routes::Kind::Own => upstream::available() && !routes::is_penalised(routes::Kind::Own),
+        routes::Kind::Own => upstream::available(),
         // The window's switch, checked at the one place the route is offered
         // from. Off means the route is simply not usable, which the table
         // already knows how to deal with - it is the same answer an exit that
@@ -646,9 +660,6 @@ pub fn route_usable(kind: routes::Kind, host: &str) -> bool {
 /// do (S37): a needless hop costs one connection, a missing route costs every
 /// request.
 fn direct_usable(host: &str) -> bool {
-    if routes::is_penalised(routes::Kind::Direct) {
-        return false;
-    }
     if crate::resolvers::vpn_is_active() {
         return true;
     }
@@ -698,7 +709,7 @@ pub fn probe_direct(if_index: u32) {
     match probe_direct_once(if_index) {
         Ok(()) => routes::record(routes::Kind::Direct, started.elapsed()),
         Err(why) => {
-            routes::record_failure(routes::Kind::Direct);
+            routes::probe_failed(routes::Kind::Direct);
             crate::dns_forwarder::log_proxy(&format!("напрямую не отвечает: {}", why));
         }
     }
@@ -726,7 +737,7 @@ pub fn probe_vpn() {
     match outcome {
         Ok(()) => routes::record(routes::Kind::Vpn, started.elapsed()),
         Err(why) => {
-            routes::record_failure(routes::Kind::Vpn);
+            routes::probe_failed(routes::Kind::Vpn);
             crate::dns_forwarder::log_proxy(&format!("через VPN не отвечает: {}", why));
         }
     }

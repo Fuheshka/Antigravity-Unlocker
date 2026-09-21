@@ -198,7 +198,17 @@ fn relay_part(out: &mut String, r: &Report) {
             format!(", выход: {}", r.vpn_exit)
         }
     );
-    let _ = writeln!(out, "Первый маршрут сейчас: {}", non_empty(&r.route));
+    // The table's own first usable row, not `r.route`: that one is the
+    // hysteresis memory (`routes::leader`) and can still name a route the order
+    // has moved past, which put a headline in the report contradicting the
+    // table printed right under it (field report, 2026-09-20).
+    let first = r
+        .routes
+        .iter()
+        .find(|row| row.usable)
+        .map(|row| row.label.as_str())
+        .unwrap_or(r.route.as_str());
+    let _ = writeln!(out, "Первый маршрут сейчас: {}", non_empty(first));
     if let Some(ok) = &r.last_ok {
         let _ = writeln!(
             out,
@@ -227,10 +237,13 @@ fn relay_part(out: &mut String, r: &Report) {
     let _ = writeln!(out, "Маршруты (в порядке выбора):");
     for row in &r.routes {
         let mut parts: Vec<String> = Vec::new();
-        parts.push(if row.usable {
-            "доступен".to_string()
-        } else {
-            "недоступен".to_string()
+        // One state word, not two: «доступен … отложен ещё на 10 мин» is what a
+        // benched-but-still-offered route used to print, and it reads as a
+        // contradiction to the person pasting it.
+        parts.push(match (row.usable, row.bench_left) {
+            (false, _) => "сейчас не используется".to_string(),
+            (true, Some(b)) => format!("отложен ещё на {} мин, но в очереди", b / 60 + 1),
+            (true, None) => "доступен".to_string(),
         });
         if let Some(ms) = row.latency_ms {
             parts.push(format!("{ms} мс"));
@@ -244,7 +257,7 @@ fn relay_part(out: &mut String, r: &Report) {
         if let Some(a) = row.refused_ago {
             parts.push(format!("ошибка 400 {a} с назад"));
         }
-        if let Some(b) = row.bench_left {
+        if let Some(b) = row.bench_left.filter(|_| !row.usable) {
             parts.push(format!("отложен ещё на {} мин", b / 60 + 1));
         }
         if row.open > 0 {

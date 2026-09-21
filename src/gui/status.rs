@@ -109,6 +109,10 @@ pub struct Facts {
     pub proxy_blocked: Option<crate::gate::Blocker>,
     /// What keeps the gate hosts' door on `:443` shut, the same way.
     pub door_blocked: Option<crate::gate::Blocker>,
+    /// What keeps the DNS relay off `127.0.0.53:53`. Unlike the other two this
+    /// listener cannot be moved - the NRPT rules name an address, not a port -
+    /// so naming the holder is the whole of what can be done about it.
+    pub dns_blocked: Option<crate::gate::Blocker>,
     /// The relay has run for minutes and nothing on the internet answered it.
     pub cut_off: bool,
     /// Whether this window itself reaches the internet - asked only while the
@@ -199,6 +203,7 @@ impl Facts {
             route,
             proxy_blocked: blocker(relay, "proxy"),
             door_blocked: blocker(relay, "door"),
+            dns_blocked: blocker(relay, "dns"),
             cut_off: relay.is_some_and(crate::gate::Report::cut_off),
             net_ok: gate.net_ok,
             relay_exe: relay.map(|r| r.exe.clone()).unwrap_or_default(),
@@ -267,7 +272,9 @@ pub fn switch_text(cap: Cap) -> (&'static str, &'static str) {
         Cap::OwnProxy => (
             "Свой HTTP-прокси",
             "Ваш собственный прокси в разрешённой стране — он всегда пробуется первым. \
-             Google может не принять прокси из дата-центра даже там.",
+             Формат: логин:пароль@адрес:порт — или просто адрес:порт, если пароля нет, \
+             например ivan:secret@203.0.113.9:3128. Только HTTP-прокси, SOCKS не \
+             подойдёт. Google может не принять прокси из дата-центра даже там.",
         ),
         Cap::DnsRotation => (
             "Ротация между серверами",
@@ -284,11 +291,31 @@ pub fn switch_text(cap: Cap) -> (&'static str, &'static str) {
 /// so the fixes that need no restart say so.
 fn blocked(b: &crate::gate::Blocker, exe: &str) -> Headline {
     let port = b.addr.rsplit(':').next().unwrap_or(&b.addr);
-    let effect = if b.what == "door" {
-        "Antigravity обращается к Google мимо обхода и получает ошибку 400"
-    } else {
-        "обход ошибки 400 работает не полностью"
+    let effect = match b.what.as_str() {
+        "door" => "Antigravity обращается к Google мимо обхода и получает ошибку 400",
+        "dns" => "подмена адресов не работает и запросы к Google идут медленнее",
+        _ => "обход ошибки 400 работает не полностью",
     };
+    // Port 53 held by a service is the one case where the image name is worse
+    // than useless: it is `svchost.exe`, which the user cannot act on. What
+    // actually holds it is nearly always Internet Connection Sharing, started
+    // behind the user's back by the Hyper-V default switch, the mobile hotspot
+    // or a virtual machine - so that is what the card says instead.
+    let system_holder = b.by.is_empty() || b.by.eq_ignore_ascii_case("svchost.exe");
+    if b.what == "dns" && b.cause == "held" && system_holder {
+        return Headline {
+            tone: Tone::Action,
+            title: format!("Порт {port} занят системной службой"),
+            detail: format!(
+                "Порт {port} держит системная служба Windows, поэтому {effect}. Обычно это \
+                 «Общий доступ к подключению к Интернету (ICS)» — его включают Hyper-V, \
+                 мобильный хот-спот и виртуальные машины. Откройте «Службы», остановите \
+                 «Общий доступ к подключению к Интернету (ICS)» и поставьте тип запуска \
+                 «Отключена». Обход займёт порт сам в течение минуты."
+            ),
+            action: Some(Action::Repair),
+        };
+    }
     let (title, detail) = match b.cause.as_str() {
         "held" => {
             let who = if b.by.is_empty() {
@@ -352,10 +379,10 @@ fn exe_or_default(exe: &str) -> String {
 
 /// One blocker as a line of the report: what, where, why.
 pub fn blocker_line(b: &crate::gate::Blocker) -> String {
-    let what = if b.what == "door" {
-        "локальные адреса гейт-хостов"
-    } else {
-        "локальный прокси"
+    let what = match b.what.as_str() {
+        "door" => "локальные адреса гейт-хостов",
+        "dns" => "DNS-релей",
+        _ => "локальный прокси",
     };
     let why = match b.cause.as_str() {
         "held" if !b.by.is_empty() => format!("порт занят программой «{}»", b.by),
@@ -431,6 +458,13 @@ pub fn headline(f: &Facts) -> Headline {
     // Something on this machine keeps part of the relay down (P53). Said with
     // the thing to do about it - the 400 it causes says nothing of the sort.
     if let Some(b) = &f.proxy_blocked {
+        return blocked(b, &f.relay_exe);
+    }
+    // The DNS listener is the other half the relay cannot open by itself. Below
+    // the proxy because the proxy carries everything while it is up, and above
+    // "cut off" because a dead `:53` is a named, fixable cause and being cut
+    // off is a guess.
+    if let Some(b) = &f.dns_blocked {
         return blocked(b, &f.relay_exe);
     }
     if f.cut_off {

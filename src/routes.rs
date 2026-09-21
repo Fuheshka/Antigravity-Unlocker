@@ -110,15 +110,44 @@ const SWITCH_MARGIN_PCT: u64 = 20;
 /// whose exit rotated back into a usable region is not written off.
 pub const REGION_PENALTY: Duration = Duration::from_secs(10 * 60);
 
+/// The bench a route gets the *first* time, before anything says the gate is
+/// refusing the road rather than the request.
+///
+/// Short on purpose. A refusal is pinned on whichever tunnel was open around
+/// its timestamp (`attribute`), and a client that fans several gate connections
+/// out at once makes that an educated guess. Benching on the first one is still
+/// right - it is what switches the route inside the two-second watch, which is
+/// what the user feels - but a wrong guess should cost two minutes, not ten.
+/// Anything that is really being refused is refused again immediately and moves
+/// on to the steps below.
+const FIRST_PENALTY: Duration = Duration::from_secs(2 * 60);
+
 /// …and each time it is refused again with no model answer in between. A route
 /// that keeps being refused on this network is not going to start working in
 /// ten minutes, and handing it the next request every ten minutes was one
 /// failed message per cycle for the user (the reason proof exists at all).
-const PENALTY_STEPS: [Duration; 3] = [
+const PENALTY_STEPS: [Duration; 4] = [
+    FIRST_PENALTY,
     REGION_PENALTY,
     Duration::from_secs(60 * 60),
     Duration::from_secs(6 * 60 * 60),
 ];
+
+/// How long a model answer keeps the route that carried it safe from a bench.
+///
+/// A field report (2026-09-20, `2.15.0_2`) showed the cost of not having this:
+/// the built-in exit carried a model answer at 14:35:16 and was benched for ten
+/// minutes by a refusal at 14:35:18 - three times over six minutes, and every
+/// route the bench pushed that user onto carried nothing, so the table came
+/// back to the same exit half a minute later. A route that delivered an answer
+/// two seconds ago is demonstrably not the thing being refused: the refusal
+/// belongs to a request the backend turned down whatever the road, or to one of
+/// the connections the client made without us. Its tunnels are still cut, which
+/// is the half that makes the retry take a fresh connection; the bench is not.
+///
+/// Ninety seconds: shorter than the shortest bench, and comfortably wider than
+/// the answer-to-refusal gaps the field reports show (2-12 s).
+const PROOF_PROTECTS_FOR: Duration = Duration::from_secs(90);
 
 /// How long a model answer keeps a route in the proven tier. A working route is
 /// re-proved by every answer it carries, so this only matters for a machine
@@ -145,6 +174,19 @@ const MAX_TUNNEL_RECORDS: usize = 512;
 /// - and it only has to keep the next connections from waiting out the same
 /// budget until the next probe says something.
 const STUMBLE_FOR: Duration = Duration::from_secs(60);
+
+/// …and how long one that failed its *probe* does.
+///
+/// Longer than `PROBE_HEALTHY_EVERY`, deliberately: a probe failure that wore
+/// off before the next probe would leave the route a candidate again with
+/// nothing new known about it, which is what a field report showed - «напрямую»
+/// failed its handshake every two and a half minutes for an hour and a half and
+/// was still picked as the gate route, because a failed probe only cleared the
+/// measurement and an unmeasured route is a candidate. This keeps a route that
+/// cannot answer a probe out of the way until one succeeds, and no longer: the
+/// first successful probe `record`s a sample, and the stumble expires on its
+/// own.
+const PROBE_STUMBLE_FOR: Duration = Duration::from_secs(3 * 60);
 
 #[derive(Clone, Copy)]
 struct Sample {
@@ -201,14 +243,33 @@ pub fn record(kind: Kind, latency: Duration) {
         latency: blended,
         at: now,
     });
+    // Every caller of this is a probe or a health check that just completed a
+    // real request over the route, which settles the one question a stumble
+    // asks - whether it opens. Without this a route that failed one probe would
+    // stay at the back for the rest of `PROBE_STUMBLE_FOR` after the next probe
+    // had already succeeded.
+    t.stumbled[kind.index()] = None;
 }
 
 /// Forgets what was measured: the route failed its probe, so whatever it was
 /// timed at last time is not what a request would meet now.
+///
+/// On its own this does not say the route is *bad* - it says nothing is known
+/// about it. For a probe that actually ran and failed, use `probe_failed`.
 pub fn record_failure(kind: Kind) {
     if let Ok(mut t) = TABLE.lock() {
         t.samples[kind.index()] = None;
     }
+}
+
+/// A probe ran against `kind` and it did not answer: forget the measurement and
+/// keep it out of the running until a probe succeeds (`PROBE_STUMBLE_FOR`).
+///
+/// Not for a probe that was never applicable - a VPN row with no tunnel up is
+/// unmeasured, not failing - only for one that tried and got nothing.
+pub fn probe_failed(kind: Kind) {
+    record_failure(kind);
+    stumble_for(kind, PROBE_STUMBLE_FOR);
 }
 
 /// The route's last fresh measurement, if it has one.
@@ -224,6 +285,10 @@ fn fresh(samples: &[Option<Sample>; N], kind: Kind) -> Option<Duration> {
         .map(|s| s.latency)
 }
 
+/// Whether `kind` is serving a region bench. Only the ordering inside this
+/// module consults it now - a bench moves a route to the back, it does not take
+/// it out of the table (`proxy::route_usable`).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_penalised(kind: Kind) -> bool {
     TABLE
         .lock()
@@ -268,32 +333,82 @@ pub fn credit(kind: Kind) {
 /// Not the gate, so no penalty and no evidence - just out of the way of the
 /// next few connections, which would otherwise each wait out its budget again.
 pub fn stumble(kind: Kind) {
+    stumble_for(kind, STUMBLE_FOR);
+}
+
+/// The same, for however long the caller knows it needs. Never shortens a
+/// stumble already running: a route kept back by a failed probe should not be
+/// let out early by one connect failure with a shorter clock.
+pub fn stumble_for(kind: Kind, how_long: Duration) {
     if let Ok(mut t) = TABLE.lock() {
-        t.stumbled[kind.index()] = Some(Instant::now() + STUMBLE_FOR);
+        let until = Instant::now() + how_long;
+        let slot = &mut t.stumbled[kind.index()];
+        if slot.is_none_or(|prev| prev < until) {
+            *slot = Some(until);
+        }
     }
 }
 
-/// A refusal came through `kind`. Its open gate tunnels are closed, and unless
-/// it is already serving a penalty it gets the next one in `PENALTY_STEPS`.
-/// Returns the penalty applied, or `None` when it was already benched - the
-/// retries a client makes on a connection it still held are the same refusal,
-/// not a new one.
-pub fn blame(kind: Kind) -> Option<Duration> {
-    cut_tunnels(kind);
+/// What a refusal did to the route it was pinned on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Blamed {
+    /// Benched for this long, and its open gate tunnels closed.
+    Benched(Duration),
+    /// Left alone: it carried a model answer this recently
+    /// (`PROOF_PROTECTS_FOR`), so the refusal is not evidence against the
+    /// route - and its open tunnels are the ones carrying the conversation.
+    Proven(Duration),
+    /// Tunnels closed, no new bench: it was already serving one. The retries a
+    /// client makes on a connection it still held are the same refusal, not a
+    /// new one.
+    AlreadyBenched,
+}
+
+/// A refusal came through `kind`: bench it and close its gate tunnels, unless
+/// something says the refusal is not about the route.
+///
+/// Closing the tunnels is the half that makes the client's retry take a fresh
+/// connection instead of going on being refused for another minute and a half
+/// on a pooled one (D26). It is exactly the wrong thing to do to a route that
+/// is working: a model answer arrives as a stream, so cutting a proven route's
+/// sockets is how a user loses an answer halfway through - «то работает, то
+/// нет», reported from the field. So a proven route keeps both its place and
+/// its connections, and if the answers really have stopped, the protection
+/// lapses ninety seconds later and the next refusal benches it as usual.
+pub fn blame(kind: Kind) -> Blamed {
+    let outcome = blame_table(kind);
+    if !matches!(outcome, Blamed::Proven(_)) {
+        cut_tunnels(kind);
+    }
+    outcome
+}
+
+/// The table half of `blame`, so the lock is released before `cut_tunnels`
+/// takes the tunnel list (the two are never held together - G30, I50).
+fn blame_table(kind: Kind) -> Blamed {
     let Ok(mut t) = TABLE.lock() else {
-        return None;
+        return Blamed::AlreadyBenched;
     };
     let i = kind.index();
     let now = Instant::now();
+    // Recorded either way: the window's table shows when each route was last
+    // refused, and a protected route is one the user should still see taking
+    // refusals.
+    let answered_ago = t.ok_at[i].map(|ok| ok.elapsed());
     t.bad_at[i] = Some(now);
     if penalised(&t.penalised, kind) {
-        return None;
+        return Blamed::AlreadyBenched;
+    }
+    if let Some(ago) = answered_ago.filter(|a| *a < PROOF_PROTECTS_FOR) {
+        // Not a strike either: a streak is "refused again with no model answer
+        // in between", and there was one.
+        return Blamed::Proven(ago);
     }
     let step = (t.streak[i] as usize).min(PENALTY_STEPS.len() - 1);
     let penalty = PENALTY_STEPS[step];
     t.streak[i] = t.streak[i].saturating_add(1);
     t.penalised[i] = Some(now + penalty);
-    Some(penalty)
+    Blamed::Benched(penalty)
 }
 
 /// Tells the table which network it is on. A different fingerprint wipes what
@@ -913,17 +1028,22 @@ mod tests {
         assert_eq!(latency(Kind::Relay), None);
 
         set_context(0x1111);
-        assert_eq!(blame(Kind::Relay), Some(PENALTY_STEPS[0]));
+        assert_eq!(blame(Kind::Relay), Blamed::Benched(PENALTY_STEPS[0]));
         assert!(is_penalised(Kind::Relay));
         // Already benched: the client's retries on the old connection are the
         // same refusal, not a new one.
-        assert_eq!(blame(Kind::Relay), None);
+        assert_eq!(blame(Kind::Relay), Blamed::AlreadyBenched);
         credit(Kind::Relay);
         assert!(!is_penalised(Kind::Relay), "an answer lifts the bench");
         assert!(is_proven(Kind::Relay));
-        // Refused again after the answer: back to the first step, not the second.
-        assert_eq!(blame(Kind::Relay), Some(PENALTY_STEPS[0]));
-        assert!(!is_proven(Kind::Relay));
+        // Refused straight after an answer: the route is left alone entirely.
+        assert!(matches!(blame(Kind::Relay), Blamed::Proven(_)));
+        assert!(!is_penalised(Kind::Relay), "a proven route is not benched");
+        assert!(!is_proven(Kind::Relay), "but the refusal is on the record");
+        // Once the proof has aged out, the same refusal benches - at the first
+        // step, because the answer reset the streak.
+        age_out_answer(Kind::Relay);
+        assert_eq!(blame(Kind::Relay), Blamed::Benched(PENALTY_STEPS[0]));
         // A new network forgets it all.
         assert!(set_context(0x2222));
         assert!(!is_penalised(Kind::Relay));
@@ -935,21 +1055,67 @@ mod tests {
         let _turn = turn();
         // Uses Vpn so it cannot collide with the test above on the statics.
         set_context(0x3333);
+        for step in [0usize, 1, 2, 3, 3] {
+            assert_eq!(
+                blame(Kind::Vpn),
+                Blamed::Benched(PENALTY_STEPS[step]),
+                "step {step}"
+            );
+            if let Ok(mut t) = TABLE.lock() {
+                t.penalised[Kind::Vpn.index()] = Some(Instant::now() - ms(1));
+            }
+        }
         credit(Kind::Vpn);
-        assert_eq!(blame(Kind::Vpn), Some(PENALTY_STEPS[0]));
+    }
+
+    /// Pushes `kind`'s last answer out of `PROOF_PROTECTS_FOR` without waiting
+    /// ninety seconds for it.
+    fn age_out_answer(kind: Kind) {
         if let Ok(mut t) = TABLE.lock() {
-            t.penalised[Kind::Vpn.index()] = Some(Instant::now() - ms(1));
+            t.ok_at[kind.index()] = Instant::now().checked_sub(PROOF_PROTECTS_FOR + ms(1));
         }
-        assert_eq!(blame(Kind::Vpn), Some(PENALTY_STEPS[1]));
-        if let Ok(mut t) = TABLE.lock() {
-            t.penalised[Kind::Vpn.index()] = Some(Instant::now() - ms(1));
+    }
+
+    /// The field case this exists for: a route answers, is refused two seconds
+    /// later, and must keep both its place in the table and its open tunnels.
+    #[test]
+    fn an_answer_just_now_keeps_a_refusal_from_benching_the_route() {
+        let _turn = turn();
+        set_context(0x4444);
+        credit(Kind::Own);
+        // Ten refusals in a row while the answers keep coming change nothing:
+        // no bench, and no streak to escalate once the protection does lapse.
+        for _ in 0..10 {
+            assert!(matches!(blame(Kind::Own), Blamed::Proven(_)));
+            credit(Kind::Own);
         }
-        assert_eq!(blame(Kind::Vpn), Some(PENALTY_STEPS[2]));
-        if let Ok(mut t) = TABLE.lock() {
-            t.penalised[Kind::Vpn.index()] = Some(Instant::now() - ms(1));
-        }
-        assert_eq!(blame(Kind::Vpn), Some(PENALTY_STEPS[2]), "capped");
-        credit(Kind::Vpn);
+        assert!(!is_penalised(Kind::Own));
+        age_out_answer(Kind::Own);
+        assert_eq!(
+            blame(Kind::Own),
+            Blamed::Benched(PENALTY_STEPS[0]),
+            "the first step, because every answer reset the streak"
+        );
+    }
+
+    /// A failed probe is not the same as an unmeasured route: it has to keep the
+    /// route out of the running, or the next connection goes straight back to
+    /// something that just refused to answer one.
+    #[test]
+    fn a_failed_probe_keeps_the_route_back_where_a_lost_measurement_did_not() {
+        let _turn = turn();
+        set_context(0x5555);
+        record(Kind::Direct, ms(300));
+        record_failure(Kind::Direct);
+        assert_eq!(latency(Kind::Direct), None);
+        let after_loss = order(|_| true);
+        probe_failed(Kind::Direct);
+        let after_probe = order(|_| true);
+        assert!(
+            after_probe.last() == Some(&Kind::Direct) && after_loss.last() != Some(&Kind::Direct),
+            "{after_loss:?} then {after_probe:?}"
+        );
+        assert!(PROBE_STUMBLE_FOR > STUMBLE_FOR, "a probe runs every 2 min");
     }
 
     /// Attribution by open tunnel, and the tunnel of a refused route closed from

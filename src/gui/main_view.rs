@@ -530,7 +530,7 @@ fn own_proxy_field(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.add_space(10.0);
         let field = egui::TextEdit::singleline(&mut app.own_proxy_input)
-            .hint_text("host:port или user:pass@host:port")
+            .hint_text("логин:пароль@адрес:порт или адрес:порт")
             .desired_width(ui.available_width() - 110.0);
         let resp = ui.add_enabled(!busy, field);
         let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
