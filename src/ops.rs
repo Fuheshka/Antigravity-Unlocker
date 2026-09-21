@@ -1657,6 +1657,9 @@ fn enable_dns(ctx: &mut Ctx) {
     match dns::setup_dns_nrpt() {
         Ok(outcome) => {
             dns::invalidate_cache();
+            // The rules are in; what the client cached before them is not ours
+            // to keep (G75). The relay does the same at its own start.
+            dns::flush_client_cache();
             if outcome.stood_down_for_vpn {
                 // Not a failure, and not "on" either: with the client measured
                 // inside a tunnel the rules would override the resolver the user
@@ -1748,6 +1751,7 @@ fn reapply_dns_rules(ctx: &mut Ctx) -> bool {
     match dns::setup_dns_nrpt() {
         Ok(_) => {
             dns::invalidate_cache();
+            dns::flush_client_cache();
             ctx.log(Level::Ok, "Правила DNS переписаны под новый список.");
         }
         Err(e) => ctx.log(Level::Warn, format!("Правила DNS не переписаны: {}", e)),

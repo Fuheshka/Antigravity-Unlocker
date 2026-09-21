@@ -131,7 +131,7 @@ pub const LISTEN_PORT: u16 = 53;
 ///     for every kind alike, and a route that fails its probe is kept back
 ///     until one succeeds. An older relay drops the working route mid-answer
 ///     and thrashes between benched ones.
-pub const RELAY_VERSION: u32 = 35;
+pub const RELAY_VERSION: u32 = 36;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -1049,6 +1049,12 @@ fn serve_dns_forever() -> ! {
             }
         };
         log(&format!("start: {}:{}", LISTEN_IP, LISTEN_PORT));
+        // A client that was running before us is on answers that predate our
+        // rules, and nothing else tells it otherwise (G75). Here and not a line
+        // earlier: the socket is bound, so a re-ask reaches us.
+        if crate::dns::flush_client_cache() {
+            log("кэш DNS-клиента по гейт-именам сброшен — клиент спросит заново");
+        }
         let up = Instant::now();
         serve_queries(&sock);
         drop(sock);

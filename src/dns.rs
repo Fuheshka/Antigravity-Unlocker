@@ -64,6 +64,68 @@ pub fn core_namespaces() -> &'static [&'static str] {
     AG_NRPT_CORE
 }
 
+/// Drops what the Windows DNS Client has cached for the gate names, so a client
+/// that was already running asks again instead of living on answers that
+/// predate our rules.
+///
+/// Nothing else on the machine tells it to. A field report of 2026-09-21 shows
+/// `Antigravity обратился к Google мимо обхода` six times over three minutes after
+/// a relay start, with the first `loopback` line arriving only once the client's
+/// cached answer expired on its own: three minutes of refusals for a user whose
+/// switches were all green (G75).
+///
+/// Called **after** the relay is bound and about to answer, never before. A
+/// re-ask that arrives while nothing of ours is listening goes to the plain
+/// resolvers and is cached unsubstituted for its full TTL - the very state this
+/// is meant to end.
+#[cfg(target_os = "windows")]
+pub fn flush_client_cache() -> bool {
+    // Loaded by hand and never linked. `DnsFlushResolverCacheEntry_W` is
+    // exported by dnsapi.dll on every Windows that matters, but it is in no
+    // documented import library, and a missing import stops the exe from
+    // starting at all - on every machine, for a cache flush (D28).
+    extern "system" {
+        fn LoadLibraryA(name: *const u8) -> usize;
+        fn GetProcAddress(module: usize, name: *const u8) -> usize;
+    }
+    type FlushEntry = unsafe extern "system" fn(*const u16) -> i32;
+
+    let entry = unsafe {
+        match LoadLibraryA(b"dnsapi.dll\0".as_ptr()) {
+            0 => 0,
+            dll => GetProcAddress(dll, b"DnsFlushResolverCacheEntry_W\0".as_ptr()),
+        }
+    };
+    if entry != 0 {
+        // Per name, not the whole cache: everything else on this machine keeps
+        // what it has, and these two are the only names whose stale answer is
+        // ours to fix. The return value is not read - it is false for a name
+        // that was not cached, which is success as far as this is concerned.
+        let flush: FlushEntry = unsafe { std::mem::transmute(entry) };
+        for name in core_namespaces() {
+            let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            unsafe { flush(wide.as_ptr()) };
+        }
+        return true;
+    }
+    // No such export: the whole cache, then. Heavier than needed and not free
+    // for the rest of the machine, so it is the fallback and not the first
+    // choice.
+    std::process::Command::new("ipconfig")
+        .arg("/flushdns")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// No NRPT and no DNS Client here: there are no rules of ours in front of a
+/// resolver cache to invalidate.
+#[cfg(not(target_os = "windows"))]
+pub fn flush_client_cache() -> bool {
+    false
+}
+
 // The unblock resolvers live in `resolvers` - the rules and the relay have to
 // name the same services, and which of them actually substitutes a given name
 // is decided per query rather than assumed here.
