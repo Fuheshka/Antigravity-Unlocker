@@ -612,28 +612,42 @@ pub fn refresh_leader(usable: impl Fn(Kind) -> bool) {
 
 /// The pure ordering, so it can be tested without the static.
 ///
-/// Own first when usable. Then four tiers, each in the default order inside
-/// itself unless measured: proven (fastest first, the sitting leader kept unless
-/// clearly beaten), measured, unmeasured, penalised. Without a DNS layer the
-/// direct tunnel has nothing substituted to reach, so it counts as penalised.
+/// Own first when usable and not benched. Then four tiers, each in the default
+/// order inside itself unless measured: proven (fastest first, the sitting
+/// leader kept unless clearly beaten), measured, unmeasured, penalised. Without
+/// a DNS layer the direct tunnel has nothing substituted to reach, so it counts
+/// as penalised.
+///
+/// A benched Own joins the benched tier like any other route. Putting it first
+/// regardless meant a region 400 through the user's proxy was answered by
+/// cutting its tunnels and sending the retry straight back into it - the log
+/// said «следующее соединение пойдёт другим» and the next one went the same
+/// way, refusal after refusal. The bench ends, or an answer lifts it, and Own
+/// is first again.
 fn order_with(s: &Snapshot, has_dns_layer: bool, usable: impl Fn(Kind) -> bool) -> Vec<Kind> {
+    let benched = |k: Kind| {
+        penalised(&s.penalised, k) || penalised(&s.stumbled, k) || penalised(&s.silent, k)
+    };
     let mut out: Vec<Kind> = Vec::with_capacity(N);
-    if usable(Kind::Own) {
+    let own_benched = usable(Kind::Own) && benched(Kind::Own);
+    if !own_benched && usable(Kind::Own) {
         out.push(Kind::Own);
     }
 
     let rest: Vec<Kind> = DEFAULT_ORDER
         .iter()
         .copied()
-        .filter(|k| *k != Kind::Own && usable(*k))
+        .filter(|k| {
+            if *k == Kind::Own {
+                own_benched
+            } else {
+                usable(*k)
+            }
+        })
         .collect();
 
     let tier = |k: Kind| -> u8 {
-        if penalised(&s.penalised, k)
-            || penalised(&s.stumbled, k)
-            || penalised(&s.silent, k)
-            || (k == Kind::Direct && !has_dns_layer)
-        {
+        if benched(k) || (k == Kind::Direct && !has_dns_layer) {
             3
         } else if proven(&s.ok_at, &s.bad_at, k) {
             0
@@ -1412,6 +1426,46 @@ mod tests {
         s.leader = Some(Kind::Direct);
         assert_eq!(order_with(&s, true, |_| true)[0], Kind::Own);
         assert_eq!(order_with(&s, true, |k| k != Kind::Own)[0], Kind::Direct);
+    }
+
+    #[test]
+    fn a_benched_own_proxy_gives_way_and_comes_back() {
+        let now = Instant::now();
+        let usable = |k: Kind| k != Kind::Vpn;
+        for bench in [
+            |s: &mut Snapshot, until| s.penalised[Kind::Own.index()] = Some(until),
+            |s: &mut Snapshot, until| s.stumbled[Kind::Own.index()] = Some(until),
+            |s: &mut Snapshot, until| s.silent[Kind::Own.index()] = Some(until),
+        ] {
+            let mut s = blank();
+            bench(&mut s, now + ms(600_000));
+            let order = order_with(&s, true, usable);
+            assert_eq!(
+                order,
+                vec![Kind::Relay, Kind::Exits, Kind::Direct, Kind::Own]
+            );
+
+            // The bench over, first again.
+            let mut s = blank();
+            bench(&mut s, now - ms(1));
+            assert_eq!(order_with(&s, true, usable)[0], Kind::Own);
+        }
+    }
+
+    #[test]
+    fn a_benched_own_proxy_sorts_among_the_benched_by_when_it_ends() {
+        let now = Instant::now();
+        let mut s = blank();
+        s.penalised[Kind::Own.index()] = Some(now + ms(600_000));
+        s.penalised[Kind::Relay.index()] = Some(now + ms(60_000));
+        let order = order_with(&s, true, |k| k != Kind::Vpn);
+        assert_eq!(
+            order,
+            vec![Kind::Exits, Kind::Direct, Kind::Relay, Kind::Own]
+        );
+        // An unusable Own is not offered at all, benched or not.
+        let order = order_with(&s, true, |k| k != Kind::Vpn && k != Kind::Own);
+        assert!(!order.contains(&Kind::Own));
     }
 
     #[test]

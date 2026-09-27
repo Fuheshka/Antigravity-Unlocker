@@ -143,7 +143,13 @@ pub const LISTEN_PORT: u16 = 53;
 ///     longer lets it back in front - only a model answer does. An older relay
 ///     keeps sending every connection to a built-in exit that opens and then
 ///     carries nothing, and never tries the DNS route behind it.
-pub const RELAY_VERSION: u32 = 39;
+/// 40 = the user's own proxy gives way while benched (region 400, silent
+///     tunnel, failed open) instead of staying first regardless. An older
+///     relay answers a region 400 through the user's proxy by cutting its
+///     tunnels and sending the retry straight back into it. Same generation:
+///     the user's proxy no longer has its exit region traced on the warm loop
+///     (nor when it is added) - the region-400 watch stands it down instead.
+pub const RELAY_VERSION: u32 = 40;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.

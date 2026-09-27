@@ -1165,9 +1165,7 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
             // gone, so without the task back the switch would read off while
             // patching went on. `set_watchdog` no longer starts the relay, so
             // this does not depend on the bypass being wanted.
-            if is_admin()
-                && ctx.settings.auto_patch_wanted()
-                && !background::is_watchdog_enabled()
+            if is_admin() && ctx.settings.auto_patch_wanted() && !background::is_watchdog_enabled()
             {
                 set_watchdog(ctx, true);
             }
@@ -1671,7 +1669,10 @@ fn set_watchdog(ctx: &mut Ctx, on: bool) {
     // only the file: starting the relay here switched the 400 bypass on for a
     // user who asked for auto-patch alone.
     if let Err(e) = background::ensure_installed() {
-        ctx.log(Level::Warn, format!("Не удалось установить копию для автопатча: {}", e));
+        ctx.log(
+            Level::Warn,
+            format!("Не удалось установить копию для автопатча: {}", e),
+        );
     }
     match background::enable_watchdog() {
         Ok(()) => ctx.log(Level::Ok, "Автовосстановление патча включено."),
@@ -1907,40 +1908,35 @@ fn set_own_proxy(ctx: &mut Ctx, text: &str) {
         }
     };
 
+    // Saved and switched on whatever the checks below say: the user typed it in,
+    // and the route table is what decides whether it carries anything - a proxy
+    // that does not open is stepped around on the connection that finds out, and
+    // one that draws a region 400 is benched by the watch (G81). Refusing to save
+    // it made the user keep a proxy they wanted out of the table altogether.
+    if let Err(e) = upstream::save(&up) {
+        ctx.log(Level::Err, format!("Не сохранён: {}", e));
+        ctx.settings.own_proxy_enabled = false;
+        return;
+    }
+    ctx.settings.own_proxy_enabled = true;
+    ctx.log(Level::Ok, format!("Свой прокси включён: {}", up.display()));
+
+    // Whether it carries a request to Google, and nothing else. Its exit country
+    // is never traced (D34): through the user's proxy the only traffic is to
+    // Google, and the region is judged by the refusal Google actually gives -
+    // Cloudflare's geolocation only guessed at it, and no unsigned Google call
+    // can tell (401/403 from any exit, measured).
     ctx.log(Level::Info, "Проверяю прокси…");
     match upstream::probe(&up) {
-        Ok(()) => {
-            if let Err(e) = upstream::save(&up) {
-                ctx.log(Level::Err, format!("Не сохранён: {}", e));
-                ctx.settings.own_proxy_enabled = false;
-                return;
-            }
-            ctx.settings.own_proxy_enabled = true;
-            ctx.log(Level::Ok, format!("Свой прокси включён: {}", up.display()));
-
-            // Advisory only (P16): the country of the exit is inferred from
-            // geolocation, never proven — the region 400 is invisible out of
-            // band. It changes nothing, it just tells the user what to expect.
-            if let Some(country) = upstream::exit_country(&up) {
-                if upstream::region_is_blocked(&country) {
-                    ctx.log(
-                        Level::Warn,
-                        format!("Выход прокси в стране {} — она под ограничением, обход через него не поможет.", country),
-                    );
-                } else {
-                    ctx.log(
-                        Level::Ok,
-                        format!("Выход прокси в стране {} — подходит.", country),
-                    );
-                }
-            }
-        }
+        Ok(()) => ctx.log(Level::Ok, "Прокси отвечает."),
         Err(e) => {
-            // Saved anyway would be the console build's question. A switch has
-            // no room for a y/N, and a proxy that did not answer is not one the
-            // user wants silently in the route table.
-            ctx.log(Level::Err, format!("Прокси не отвечает: {}", e));
-            ctx.settings.own_proxy_enabled = false;
+            ctx.log(
+                Level::Warn,
+                format!(
+                    "Прокси не отвечает: {} — сохранён всё равно; пока он не отвечает, запросы пойдут другими маршрутами.",
+                    e
+                ),
+            );
         }
     }
 }
