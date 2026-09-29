@@ -3,7 +3,7 @@
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-blue?logo=apple&logoColor=white)](README.md)
 [![macOS Architecture](https://img.shields.io/badge/Architecture-Apple%20Silicon%20(arm64)%20%7C%20Intel%20(x86__64)-success)](macos/README.md)
 [![Rust](https://img.shields.io/badge/Rust-2021%20edition-orange?logo=rust)](Cargo.toml)
-[![Tests](https://img.shields.io/badge/Tests-215%20passed-brightgreen)](Cargo.toml)
+[![Tests](https://img.shields.io/badge/Tests-304%20passed-brightgreen)](Cargo.toml)
 [![License](https://img.shields.io/badge/License-Open%20Source-blue)](Cargo.toml)
 [![UI](https://img.shields.io/badge/UI-egui%20%2F%20eframe-purple)](src/gui/mod.rs)
 
@@ -119,7 +119,7 @@ irm https://raw.githubusercontent.com/confeden/Antigravity/main/tui.ps1 | iex
 
 ## Что именно анлокер меняет в системе?
 
-Все внесенные изменения строго обратимы:
+Все внесенные изменения точечные, безопасные и полностью обратимые (откатываются выключением соответствующих переключателей в окне):
 
 1. **Бинарник Language Server / CLI** (`language_server*`, `agy`):
    - Переименовываются две строки фиксированной длины: поле protobuf-дескриптора (`ineligible` → `inexigible`) и имя переменной прокси (`https_proxy` → `AG_LS_PROXY`).
@@ -136,6 +136,10 @@ irm https://raw.githubusercontent.com/confeden/Antigravity/main/tui.ps1 | iex
    - На macOS и Linux системные настройки DNS не затрагиваются.
 5. **Автоматический ad-hoc codesign на macOS**:
    - На Apple Silicon изменение любого байта в Mach-O файле нарушает цифровую подпись, из-за чего подсистема AMFI моментально убивает процесс (`SIGKILL`). Анлокер автоматически выполняет ad-hoc переподпись (`codesign --force -s -`), сохраняя запуск бинарников.
+
+### Чего нет в исходниках
+
+В открытом коде отсутствуют только ключи встроенных маршрутов (файлы исключены из git, чтобы публичные серверы не перегружались). Сборка из исходников полностью функциональна и разблокирует Antigravity штатным DNS-методом.
 
 ---
 
@@ -257,4 +261,10 @@ cargo build --release
 - **Никакой телеметрии:** программа не собирает статистику, не передает токены авторизации Google и не производит скрытых сетевых соединений.
 - **Откат в один клик:** отключение любого тумблера в GUI мгновенно возвращает оригинальные файлы и удаляет системные службы.
 
-Официальный Telegram проекта: [t.me/nova_txt](https://t.me/nova_txt)
+---
+
+# Создано с ❤️
+
+🙋 **Группа в Телеграм:** [@nova_txt](https://t.me/nova_txt) — вопросы, новости, поддержка.
+
+☕ **[Отблагодарить](https://nova-app.eu/donate)** — если Анлокер оказался полезным. Это необязательный способ сказать "спасибо".

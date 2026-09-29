@@ -512,25 +512,17 @@ pub fn probe(up: &Upstream) -> Result<(), String> {
 /// Checked on the warm loop, so the route is judged on our time and never with
 /// somebody's request. A no-op when the user never gave us a proxy.
 ///
-/// The region half runs every time here, unlike the built-in exits: this is one
-/// proxy belonging to the person in front of us, so there is nobody else to be
-/// considerate towards, and it is the route most likely to be a VPN that quietly
-/// surfaces next door.
+/// Carry only, never the region: the user's proxy has its exit country checked
+/// once, when it is added (`ops::set_own_proxy`), and after that the region-400
+/// watch is what stands it down - it sees the refusal Google actually gave,
+/// where the trace only guesses from Cloudflare's geolocation, and a benched
+/// Own gives way like any route (G81). Owner's decision: no trace traffic to
+/// third-party hosts through their proxy every two minutes.
 pub fn probe_health() {
     let Some(up) = configured() else {
         return;
     };
-    OWN.probe(&up, true);
-}
-
-/// Which country the proxy comes out in, as Cloudflare sees it.
-///
-/// The single most useful thing to tell a user at setup time. A proxy that exits
-/// in the blocked region changes the address and nothing else - measured on WARP,
-/// which reported `loc=RU` exactly like the direct connection - so it cannot lift
-/// the gate, and saying so at once saves them believing otherwise.
-pub fn exit_country(up: &Upstream) -> Option<String> {
-    exit_info(up).map(|(_, loc)| loc)
+    OWN.probe(&up, false);
 }
 
 /// The address the proxy comes out on, and the country Cloudflare puts it in.
@@ -803,7 +795,7 @@ mod tests {
     fn upstream_route_works_against_a_real_proxy() {
         let up = parse("127.0.0.1:1371").expect("parsed");
         probe(&up).expect("the proxy carried a request to Google");
-        let loc = exit_country(&up).expect("exit country");
+        let (_, loc) = exit_info(&up).expect("exit country");
         println!(
             "exit country: {} (blocked: {})",
             loc,

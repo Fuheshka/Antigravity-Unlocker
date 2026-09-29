@@ -291,6 +291,25 @@ pub fn open_url(url: &str) {
     }
 }
 
+/// `open_url` for a page that has to open in the user's own browser session.
+///
+/// The window usually runs elevated, and a browser started from it would be an
+/// elevated one - not necessarily the session signed in to the account the page
+/// is about. `explorer.exe` hands the link to the running, unelevated shell
+/// instead. Explorer reads a comma as an argument separator, so a link holding
+/// one takes the ordinary path.
+pub fn open_url_as_user(url: &str) {
+    #[cfg(target_os = "windows")]
+    if is_admin() && !url.contains(',') {
+        let mut cmd = Command::new("explorer.exe");
+        cmd.arg(url);
+        if no_window(&mut cmd).spawn().is_ok() {
+            return;
+        }
+    }
+    open_url(url);
+}
+
 /// The clipboard as text, or `None` if it holds none.
 ///
 /// Through `arboard` rather than a hand-rolled `OpenClipboard`/`GetClipboardData`
@@ -405,7 +424,7 @@ pub fn desktop_dir() -> Option<PathBuf> {
     Some(
         named
             .filter(|p| p.is_dir())
-            .unwrap_or_else(|| PathBuf::from(&home).join("Desktop"))
+            .unwrap_or_else(|| PathBuf::from(&home).join("Desktop")),
     )
     .map(|p| if p.is_dir() { p } else { PathBuf::from(home) })
 }
@@ -468,7 +487,12 @@ pub fn reveal_in_explorer(path: &Path) {
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         if let Some(dir) = path.parent() {
-            Command::new("xdg-open").arg(dir).stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok();
+            Command::new("xdg-open")
+                .arg(dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok();
         }
     }
 }
@@ -636,6 +660,8 @@ pub fn local_clock() -> Option<LocalClock> {
 
 #[cfg(not(target_os = "windows"))]
 pub fn local_clock() -> Option<LocalClock> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
     #[repr(C)]
     struct Tm {
         tm_sec: i32,
@@ -647,28 +673,23 @@ pub fn local_clock() -> Option<LocalClock> {
         tm_wday: i32,
         tm_yday: i32,
         tm_isdst: i32,
-        #[cfg(target_os = "macos")]
-        tm_gmtoff: std::os::raw::c_long,
-        #[cfg(target_os = "macos")]
-        tm_zone: *mut std::os::raw::c_char,
+        tm_gmtoff: i64,
+        tm_zone: *const std::os::raw::c_char,
     }
     extern "C" {
-        fn time(tloc: *mut i64) -> i64;
         fn localtime_r(timep: *const i64, result: *mut Tm) -> *mut Tm;
     }
-    unsafe {
-        let mut now: i64 = 0;
-        time(&mut now);
-        let mut tm: Tm = std::mem::zeroed();
-        if localtime_r(&now, &mut tm).is_null() {
-            return None;
-        }
-        Some(LocalClock {
-            month: (tm.tm_mon + 1) as u16,
-            day: tm.tm_mday as u16,
-            second_of_day: tm.tm_hour as u32 * 3600 + tm.tm_min as u32 * 60 + tm.tm_sec as u32,
-        })
+    let mut tm = std::mem::MaybeUninit::<Tm>::uninit();
+    let res = unsafe { localtime_r(&now, tm.as_mut_ptr()) };
+    if res.is_null() {
+        return None;
     }
+    let tm = unsafe { tm.assume_init() };
+    Some(LocalClock {
+        month: (tm.tm_mon + 1) as u16,
+        day: tm.tm_mday as u16,
+        second_of_day: tm.tm_hour as u32 * 3600 + tm.tm_min as u32 * 60 + tm.tm_sec as u32,
+    })
 }
 
 #[cfg(test)]
