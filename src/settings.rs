@@ -48,6 +48,14 @@ pub struct Settings {
     #[serde(default)]
     pub license_key: String,
 
+    /// When the group code and the user's own proxy were last set (unix
+    /// seconds, 0 = never). The one added later goes first in the route table
+    /// (owner, 2026-10-05).
+    #[serde(default)]
+    pub group_key_at: u64,
+    #[serde(default)]
+    pub own_proxy_at: u64,
+
     /// The user switched the client patch **off** on purpose.
     ///
     /// The one thing auto-patch must never do is put back a patch the user took
@@ -133,6 +141,8 @@ impl Default for Settings {
             auto_patch: true,
             group_key: String::new(),
             license_key: String::new(),
+            group_key_at: 0,
+            own_proxy_at: 0,
             patch_declined: false,
             decline_unrecorded: false,
             dns: true,
@@ -418,6 +428,12 @@ pub fn local_proxy_wanted() -> bool {
 /// there is the shipped behaviour.
 pub fn group_proxy_enabled() -> bool {
     cached().group_proxy
+}
+
+/// The user's own proxy was set after the group code, so it goes first.
+pub fn own_proxy_first() -> bool {
+    let c = cached();
+    c.own_proxy_at > c.group_key_at
 }
 
 pub fn group_key() -> String {

@@ -108,6 +108,17 @@ const DEFAULT_ORDER: [Kind; N] = [Kind::Group, Kind::Own, Kind::Relay, Kind::Exi
 /// vouches for; the user's own proxy right after it.
 const PINNED: [Kind; 2] = [Kind::Group, Kind::Own];
 
+/// The pinned pair in force: whichever of the group code and the user's own
+/// proxy was added later leads (owner, 2026-10-05: «в зависимости от того какой
+/// был добавлен позднее»).
+fn pinned_now() -> [Kind; 2] {
+    if crate::settings::own_proxy_first() {
+        [Kind::Own, Kind::Group]
+    } else {
+        PINNED
+    }
+}
+
 /// A measurement older than this says nothing about the route now. Probes run
 /// every two minutes; three misses in a row and the route is unmeasured again.
 const SAMPLE_TTL: Duration = Duration::from_secs(15 * 60);
@@ -556,6 +567,8 @@ struct Snapshot {
     stumbled: [Option<Instant>; N],
     silent: [Option<Instant>; N],
     leader: Option<Kind>,
+    /// Group and Own, in the order they lead the table.
+    pinned: [Kind; 2],
 }
 
 /// What the table holds right now, without holding it.
@@ -572,6 +585,7 @@ fn snapshot() -> Snapshot {
             stumbled: t.stumbled,
             silent: t.silent,
             leader: t.leader,
+            pinned: pinned_now(),
         },
         Err(_) => Snapshot {
             samples: [None; N],
@@ -584,6 +598,7 @@ fn snapshot() -> Snapshot {
             stumbled: [None; N],
             silent: [None; N],
             leader: None,
+            pinned: pinned_now(),
         },
     }
 }
@@ -644,7 +659,7 @@ fn order_with(s: &Snapshot, has_dns_layer: bool, usable: impl Fn(Kind) -> bool) 
     let mut out: Vec<Kind> = Vec::with_capacity(N);
     // Pinned routes: taken first whenever usable and not benched, in this
     // order, regardless of speed. A benched one joins the rest like any route.
-    for k in PINNED {
+    for k in s.pinned {
         if usable(k) && !benched(k) {
             out.push(k);
         }
@@ -1268,7 +1283,20 @@ mod tests {
             stumbled: [None; N],
             silent: [None; N],
             leader: None,
+            pinned: PINNED,
         }
+    }
+
+    #[test]
+    fn the_later_added_of_group_and_own_leads() {
+        let mut s = blank();
+        let all = |_: Kind| true;
+        assert_eq!(order_with(&s, true, all)[..2], [Kind::Group, Kind::Own]);
+        s.pinned = [Kind::Own, Kind::Group];
+        let order = order_with(&s, true, all);
+        assert_eq!(order[..2], [Kind::Own, Kind::Group]);
+        // Everything else keeps its own order behind the pair.
+        assert_eq!(order[2..], [Kind::Relay, Kind::Exits, Kind::Direct, Kind::Vpn]);
     }
 
     #[test]

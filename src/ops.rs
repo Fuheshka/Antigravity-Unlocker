@@ -576,6 +576,7 @@ fn run_worker(
                 match crate::group_key::parse_key(&text) {
                     Ok(_) => {
                         ctx.settings.group_key = text.trim().to_string();
+                        ctx.settings.group_key_at = crate::gate::now_unix();
                         ctx.settings.group_proxy = true;
                         ctx.settings.save();
                         apply(&mut ctx, Cap::GroupProxy, true);
@@ -1965,6 +1966,7 @@ fn set_own_proxy(ctx: &mut Ctx, text: &str) {
         return;
     }
     ctx.settings.own_proxy_enabled = true;
+    ctx.settings.own_proxy_at = crate::gate::now_unix();
     ctx.log(Level::Ok, format!("Свой прокси включён: {}", up.display()));
 
     // Whether it carries a request to Google, and nothing else. Its exit country
