@@ -622,13 +622,8 @@ fn group_proxy_field(app: &mut App, ui: &mut egui::Ui) {
         }
     });
     ui.add_space(4.0);
-    let have_key = !crate::settings::group_key().is_empty();
     let field = egui::TextEdit::singleline(&mut app.group_key_input)
-        .hint_text(if have_key {
-            "код принят — вставьте новый, чтобы заменить"
-        } else {
-            "код из группы"
-        })
+        .hint_text("код из группы")
         .desired_width(ui.available_width());
     let resp = ui
         .add_enabled(!busy, field)
@@ -642,14 +637,16 @@ fn group_proxy_field(app: &mut App, ui: &mut egui::Ui) {
             right_pasted = true;
         }
     }
-    // Sent as soon as the field holds a whole code (a paste), or on Enter.
+    // The field shows the saved code. Sent when it holds a whole new code (a
+    // paste), or on Enter - and only when it differs from what was sent last.
     let text = app.group_key_input.trim().to_string();
     let pasted = (resp.changed() || right_pasted) && text.starts_with("agk1.") && text.len() > 40;
     let entered =
         resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !text.is_empty();
-    if pasted || entered {
-        app.worker.send(Cmd::SetGroupKey(text));
-        app.group_key_input.clear();
+    if (pasted || entered) && text != app.group_key_sent {
+        app.worker.send(Cmd::SetGroupKey(text.clone()));
+        app.group_key_input = text.clone();
+        app.group_key_sent = text;
     }
 }
 

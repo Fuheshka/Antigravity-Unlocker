@@ -79,6 +79,9 @@ pub struct App {
     own_proxy_input: String,
     /// The group code field; sent once it holds something shaped like a code.
     group_key_input: String,
+    /// The group code last handed to the worker, so the field (which shows the
+    /// saved code) sends only a code that is actually new.
+    group_key_sent: String,
     /// The provider list as the window is drawing it right now.
     ///
     /// Kept beside the worker's snapshot so a drag can reorder it on the spot.
@@ -155,7 +158,10 @@ impl App {
             log_all_selected: false,
             busy: None,
             own_proxy_input: settings.own_proxy.clone(),
-            group_key_input: String::new(),
+            // The saved code stays in the field across restarts and updates,
+            // where it can be seen and replaced.
+            group_key_input: settings.group_key.clone(),
+            group_key_sent: settings.group_key.clone(),
             providers_local: Vec::new(),
             providers_reordering: false,
             path_dialog: None,
