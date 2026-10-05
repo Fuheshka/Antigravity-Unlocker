@@ -258,6 +258,16 @@ fn antigravity_card(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         bypass_master(app, ui);
 
+        // The group proxy is a part of the bypass, so it sits under it and only
+        // while the bypass is on: with the bypass off it has nothing to carry.
+        if app.status.as_ref().is_some_and(|s| s.bypass_on()) {
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+            cap_row(app, ui, Cap::GroupProxy);
+            group_proxy_field(app, ui);
+        }
+
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(8.0);
@@ -407,9 +417,6 @@ fn advanced_card(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(10.0);
             cap_row(app, ui, Cap::BuiltinExits);
 
-            ui.add_space(10.0);
-            cap_row(app, ui, Cap::GroupProxy);
-            group_proxy_field(app, ui);
 
             ui.add_space(10.0);
             cap_row(app, ui, Cap::VerifyTls);
@@ -594,39 +601,43 @@ fn providers_list(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn group_proxy_field(app: &mut App, ui: &mut egui::Ui) {
+    let busy = app.is_busy();
+    ui.add_space(4.0);
+    widgets::hint(
+        ui,
+        "Для активации прокси из группы Nova — отправьте туда команду и вставьте \
+         полученный код в поле ниже.",
+    );
+    ui.add_space(4.0);
     ui.horizontal(|ui| {
-        ui.add_space(10.0);
-        let pc = crate::hwid::pc_code();
-        let key_text = if crate::settings::group_key().is_empty() {
-            "ключа нет"
-        } else {
-            "ключ принят (до замены новым)"
-        };
-        ui.label(format!("Код этого ПК: {} — {}", pc, key_text));
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(10.0);
-        if ui.button("Открыть комнату группы").clicked() {
-            crate::utils::open_url("https://t.me/nova_txt/69864");
-        }
         if ui.button("Скопировать команду").clicked() {
             let cmd = format!("/ag+{}", crate::hwid::pc_code());
             crate::utils::set_clipboard_text(&cmd);
-            app.log.push((crate::ops::Level::Info, format!("Скопировано: {} — отправьте это сообщение в комнате", cmd)));
+            app.log.push((Level::Info, "Команда скопирована — отправьте её в группе.".to_string()));
         }
-        if ui.button("Вставить ключ из буфера").clicked() {
-            if let Some(text) = crate::utils::clipboard_text() {
-                app.worker.send(crate::ops::Cmd::SetGroupKey(text));
-            } else {
-                app.log.push((crate::ops::Level::Warn, "Буфер обмена пуст".to_string()));
-            }
+        if ui.button("Открыть группу").clicked() {
+            crate::utils::open_url(GROUP_ROOM_URL);
         }
     });
-    ui.horizontal(|ui| {
-        ui.add_space(10.0);
-        ui.label("1) Откройте комнату 2) Отправьте туда скопированную команду 3) Скопируйте ответ бота и нажмите «Вставить ключ»");
-    });
+    ui.add_space(4.0);
+    let have_key = !crate::settings::group_key().is_empty();
+    let field = egui::TextEdit::singleline(&mut app.group_key_input)
+        .hint_text(if have_key { "код принят — вставьте новый, чтобы заменить" } else { "код из группы" })
+        .desired_width(ui.available_width());
+    let resp = ui.add_enabled(!busy, field);
+    // Sent as soon as the field holds a whole code (a paste), or on Enter.
+    let text = app.group_key_input.trim().to_string();
+    let pasted = resp.changed() && text.starts_with("agk1.") && text.len() > 40;
+    let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !text.is_empty();
+    if pasted || entered {
+        app.worker.send(Cmd::SetGroupKey(text));
+        app.group_key_input.clear();
+    }
 }
+
+/// The group's topic where the bot answers the command.
+const GROUP_ROOM_URL: &str = "https://t.me/nova_txt/69864";
+
 fn own_proxy_field(app: &mut App, ui: &mut egui::Ui) {
     let busy = app.is_busy();
     ui.horizontal(|ui| {

@@ -88,6 +88,8 @@ const SWITCH_MARGIN: i64 = 20;
 /// Load assumed for a server that has not reported one.
 const UNKNOWN_CPU: i64 = 50;
 const MAX_SERVERS: usize = 16;
+/// Servers asked per poll before giving up until the next one.
+const STATUS_TRIES: usize = 3;
 
 #[derive(Clone, Copy)]
 struct Cand {
@@ -102,7 +104,12 @@ fn load(c: Cand) -> i64 {
 /// Which server new tunnels use. Sticky: with any tunnel open the current one
 /// stays as long as it answers; otherwise the least loaded wins, but only by
 /// SWITCH_MARGIN, so two near-equal servers do not trade places every poll.
-fn choose(cands: &[Cand], current: Option<usize>, active: usize) -> Option<usize> {
+///
+/// A fresh pick is weighted-random, not "the least loaded": every client sees
+/// the same pool, and all of them moving to the one idle server at once would
+/// load it the moment they arrive. Weight (101 - load)^2 still favours the idle
+/// ones strongly. `r` is uniform in [0, 1), passed in so tests can fix it.
+fn choose(cands: &[Cand], current: Option<usize>, active: usize, r: f64) -> Option<usize> {
     if cands.is_empty() {
         return None;
     }
@@ -111,13 +118,37 @@ fn choose(cands: &[Cand], current: Option<usize>, active: usize) -> Option<usize
         if active > 0 {
             return Some(c);
         }
+        let best = (0..cands.len()).filter(|&i| cands[i].ok).map(|i| load(cands[i])).min().unwrap_or(0);
+        if load(cands[c]) <= best + SWITCH_MARGIN {
+            return Some(c);
+        }
     }
-    let best = (0..cands.len()).filter(|&i| cands[i].ok).min_by_key(|&i| (load(cands[i]), i));
-    match (cur, best) {
-        (Some(c), Some(b)) if load(cands[b]) + SWITCH_MARGIN > load(cands[c]) => Some(c),
-        (_, Some(b)) => Some(b),
+    // Re-pick among the answering servers, the current one excluded when it is
+    // being left for its load.
+    let pool: Vec<usize> = (0..cands.len()).filter(|&i| cands[i].ok && Some(i) != cur).collect();
+    if pool.is_empty() {
         // Nothing answered: keep trying where we were, else the bootstrap.
-        (_, None) => Some(current.filter(|&c| c < cands.len()).unwrap_or(0)),
+        return Some(cur.or(current.filter(|&c| c < cands.len())).unwrap_or(0));
+    }
+    let weight = |i: usize| ((101 - load(cands[i]).clamp(0, 100)) as f64).powi(2);
+    let total: f64 = pool.iter().map(|&i| weight(i)).sum();
+    let mut at = r.clamp(0.0, 0.999_999) * total;
+    for &i in &pool {
+        at -= weight(i);
+        if at < 0.0 {
+            return Some(i);
+        }
+    }
+    pool.last().copied()
+}
+
+/// Uniform in [0, 1) from the system RNG; 0.5 if it fails (then the pick is
+/// still a valid one, just not spread).
+fn unit_random() -> f64 {
+    let mut b = [0u8; 8];
+    match default_provider().secure_random.fill(&mut b) {
+        Ok(()) => (u64::from_le_bytes(b) >> 11) as f64 / (1u64 << 53) as f64,
+        Err(_) => 0.5,
     }
 }
 
@@ -195,7 +226,7 @@ fn pick_server(key: &GroupKey) -> (usize, String) {
         return (0, format!("{}:{}", key.host, key.port));
     }
     let cands: Vec<Cand> = state.servers.iter().map(|s| Cand { ok: s.ok && s.tunnel_ok, cpu: s.cpu }).collect();
-    let pick = choose(&cands, state.current, ACTIVE.load(Ordering::SeqCst)).unwrap_or(0);
+    let pick = choose(&cands, state.current, ACTIVE.load(Ordering::SeqCst), unit_random()).unwrap_or(0);
     let name = state.servers[pick].name();
     if state.current != Some(pick) {
         let cpu = state.servers[pick].cpu.map_or("?".to_string(), |c| c.to_string());
@@ -700,6 +731,9 @@ pub fn probe_health() {
 struct Status {
     cpu: i64,
     servers: Vec<String>,
+    /// The whole pool's load as that server last saw it (`host:port`, CPU;
+    /// -1 = unknown). Empty from a server that predates the pool summary.
+    pool: Vec<(String, i64)>,
 }
 
 fn fetch_status(key: &GroupKey, server: &str) -> Result<Status, String> {
@@ -768,6 +802,12 @@ fn fetch_status(key: &GroupKey, server: &str) -> Result<Status, String> {
             .flatten()
             .filter_map(|s| s.as_str().map(str::to_string))
             .collect(),
+        pool: v["pool"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| Some((e["s"].as_str()?.to_string(), e["cpu"].as_i64().unwrap_or(-1))))
+            .collect(),
     })
 }
 
@@ -775,15 +815,30 @@ fn fetch_status(key: &GroupKey, server: &str) -> Result<Status, String> {
 /// servers they list. Then re-chooses (sticky while tunnels are open).
 fn poll_pool(key: &GroupKey) {
     ensure_pool(key);
-    let names: Vec<String> = group_state().lock().unwrap().servers.iter().map(Server::name).collect();
-    let handles: Vec<_> = names
-        .iter()
-        .map(|name| {
-            let (key, name) = (key.clone(), name.clone());
-            thread::spawn(move || fetch_status(&key, &name))
-        })
-        .collect();
-    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap_or(Err(String::new()))).collect();
+    // Any one server reports the whole pool's load (servers pull it from each
+    // other), so the current server is asked first and the next one only when
+    // it does not answer — one request per poll, not one per server.
+    let names: Vec<String> = {
+        let state = group_state().lock().unwrap();
+        let mut order: Vec<usize> = (0..state.servers.len()).collect();
+        if let Some(c) = state.current.filter(|&c| c < order.len()) {
+            order.retain(|&i| i != c);
+            order.insert(0, c);
+        }
+        order.iter().map(|&i| state.servers[i].name()).collect()
+    };
+    let mut asked = Vec::new();
+    let mut results = Vec::new();
+    for name in names.into_iter().take(STATUS_TRIES) {
+        let r = fetch_status(key, &name);
+        let done = r.is_ok();
+        asked.push(name);
+        results.push(r);
+        if done {
+            break;
+        }
+    }
+    let names = asked;
 
     let mut state = group_state().lock().unwrap();
     // Results belong to this key's pool; a key changed meanwhile has its own.
@@ -800,8 +855,15 @@ fn poll_pool(key: &GroupKey) {
             Ok(st) => {
                 state.servers[i].ok = true;
                 state.servers[i].cpu = Some(st.cpu);
-                for name in st.servers {
-                    if let Some((h, p)) = valid_server_name(&name) {
+                for (name, cpu) in &st.pool {
+                    if let Some((h, p)) = valid_server_name(name) {
+                        if let Some(s) = state.servers.iter_mut().find(|s| s.host == h && s.port == p) {
+                            s.cpu = (*cpu >= 0).then_some(*cpu);
+                        }
+                    }
+                }
+                for name in st.servers.iter().chain(st.pool.iter().map(|(n, _)| n)) {
+                    if let Some((h, p)) = valid_server_name(name) {
                         if state.servers.len() < MAX_SERVERS
                             && !state.servers.iter().any(|s| s.host == h && s.port == p)
                         {
@@ -965,40 +1027,46 @@ mod tests {
     }
 
     #[test]
-    fn the_least_loaded_server_is_chosen() {
+    fn a_fresh_pick_favours_the_idle_but_spreads() {
         let cands = [c(true, Some(80)), c(true, Some(10)), c(true, Some(40))];
-        assert_eq!(choose(&cands, None, 0), Some(1));
+        let mut hits = [0usize; 3];
+        for k in 0..1000 {
+            hits[choose(&cands, None, 0, k as f64 / 1000.0).unwrap()] += 1;
+        }
+        assert!(hits[1] > hits[2] && hits[2] > hits[0], "{:?}", hits);
+        assert!(hits[0] > 0, "a busier server still gets some clients: {:?}", hits);
+        assert!(hits[1] < 800, "not everyone piles onto the idle one: {:?}", hits);
     }
 
     #[test]
     fn open_tunnels_keep_the_current_server() {
         let cands = [c(true, Some(95)), c(true, Some(5))];
-        assert_eq!(choose(&cands, Some(0), 3), Some(0));
-        assert_eq!(choose(&cands, Some(0), 0), Some(1), "free to move once idle");
+        assert_eq!(choose(&cands, Some(0), 3, 0.5), Some(0));
+        assert_eq!(choose(&cands, Some(0), 0, 0.5), Some(1), "free to move once idle");
     }
 
     #[test]
     fn a_dead_current_server_is_left_even_with_tunnels_open() {
         let cands = [c(false, Some(5)), c(true, Some(90))];
-        assert_eq!(choose(&cands, Some(0), 3), Some(1));
+        assert_eq!(choose(&cands, Some(0), 3, 0.5), Some(1));
     }
 
     #[test]
     fn a_small_lead_does_not_move_the_route() {
         let cands = [c(true, Some(50)), c(true, Some(35))];
-        assert_eq!(choose(&cands, Some(0), 0), Some(0));
+        assert_eq!(choose(&cands, Some(0), 0, 0.5), Some(0));
         let cands = [c(true, Some(50)), c(true, Some(29))];
-        assert_eq!(choose(&cands, Some(0), 0), Some(1));
+        assert_eq!(choose(&cands, Some(0), 0, 0.5), Some(1));
     }
 
     #[test]
     fn unknown_load_counts_as_middling_and_nothing_alive_keeps_trying() {
         let cands = [c(true, None), c(true, Some(60))];
-        assert_eq!(choose(&cands, None, 0), Some(0));
+        assert_eq!(choose(&cands, None, 0, 0.0), Some(0));
         let cands = [c(false, None), c(false, None)];
-        assert_eq!(choose(&cands, Some(1), 0), Some(1));
-        assert_eq!(choose(&cands, None, 0), Some(0));
-        assert_eq!(choose(&[], None, 0), None);
+        assert_eq!(choose(&cands, Some(1), 0, 0.5), Some(1));
+        assert_eq!(choose(&cands, None, 0, 0.0), Some(0));
+        assert_eq!(choose(&[], None, 0, 0.5), None);
     }
 
     #[test]

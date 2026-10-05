@@ -77,6 +77,8 @@ pub struct App {
     busy: Option<String>,
 
     own_proxy_input: String,
+    /// The group code field; sent once it holds something shaped like a code.
+    group_key_input: String,
     /// The provider list as the window is drawing it right now.
     ///
     /// Kept beside the worker's snapshot so a drag can reorder it on the spot.
@@ -153,6 +155,7 @@ impl App {
             log_all_selected: false,
             busy: None,
             own_proxy_input: settings.own_proxy.clone(),
+            group_key_input: String::new(),
             providers_local: Vec::new(),
             providers_reordering: false,
             path_dialog: None,
