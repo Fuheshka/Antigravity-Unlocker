@@ -287,6 +287,8 @@ pub enum Cmd {
     /// here on, never before: the first scan runs under the licence screen, and
     /// patching from there would hand the patch to anyone without a key.
     Unlocked,
+    /// Store the licence key just accepted, so the next start skips the screen.
+    RememberLicense(String),
     /// Ask the system again where the client's traffic leaves.
     ///
     /// Its own command because it is the one measurement that goes stale on its
@@ -462,6 +464,12 @@ fn run_worker(
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Cmd::Stop => return,
+            Cmd::RememberLicense(key) => {
+                if ctx.settings.license_key != key {
+                    ctx.settings.license_key = key;
+                    ctx.settings.save();
+                }
+            }
             Cmd::Unlocked => {
                 // The first snapshot was taken while the licence screen was up;
                 // a fresh one either way, deep when auto-patch just wrote.

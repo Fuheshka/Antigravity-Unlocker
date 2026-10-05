@@ -245,8 +245,8 @@ pub fn provider_name(name: &str) -> String {
 /// The master switch of the bypass: what it is called and what it does.
 pub const BYPASS_TEXT: (&str, &str) = (
     "Снять ошибку 400 в чате с ИИ",
-    "«User location is not supported». Сам находит рабочий путь до серверов Google \
-     и переключается, если путь перестал работать — с VPN и без.",
+    "Сам находит рабочий путь до серверов Google и переключается, если путь \
+     перестал работать — с VPN и без.",
 );
 
 /// What a switch is called and what it does, in both front ends.
@@ -933,7 +933,12 @@ mod tests {
     fn blocker(what: &str, cause: &str, by: &str) -> crate::gate::Blocker {
         crate::gate::Blocker {
             what: what.into(),
-            addr: if what == "door" { "127.65.71.1:443" } else { "127.0.0.1:53129" }.into(),
+            addr: if what == "door" {
+                "127.65.71.1:443"
+            } else {
+                "127.0.0.1:53129"
+            }
+            .into(),
             cause: cause.into(),
             by: by.into(),
             error: "os error 10013".into(),
@@ -953,7 +958,11 @@ mod tests {
         let h = headline(&f);
         assert_eq!(h.tone, Tone::Action);
         assert_eq!(h.title, "Антивирус блокирует обход");
-        assert!(h.detail.contains(r"C:\ProgramData\AGUnlocker\ag_dns.exe"), "{}", h.detail);
+        assert!(
+            h.detail.contains(r"C:\ProgramData\AGUnlocker\ag_dns.exe"),
+            "{}",
+            h.detail
+        );
         assert!(h.detail.contains("53129"), "{}", h.detail);
         assert_eq!(h.action, Some(Action::Repair));
     }

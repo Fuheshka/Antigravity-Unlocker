@@ -194,7 +194,7 @@ impl App {
                 ));
             }
         }
-        let screen = first_screen();
+        let screen = first_screen(&crate::settings::Settings::load());
         if screen == Screen::Main {
             worker.send(Cmd::Unlocked);
         }
@@ -360,6 +360,7 @@ impl App {
             return;
         }
         if auth::verify_key(self.key.trim()) {
+            self.worker.send(Cmd::RememberLicense(self.key.trim().to_string()));
             self.screen = Screen::Main;
             self.worker.send(Cmd::Unlocked);
         } else {
@@ -1234,9 +1235,13 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
 
 /// The licence screen, always — except in a *debug* build started with
 /// `AG_UNLOCKER_DEV_SKIP_KEY`, as in the window.
-fn first_screen() -> Screen {
+fn first_screen(settings: &crate::settings::Settings) -> Screen {
     #[cfg(debug_assertions)]
     if std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some() {
+        return Screen::Main;
+    }
+    // A key accepted before and still good for this version: no screen.
+    if auth::verify_key(&settings.license_key) {
         return Screen::Main;
     }
     Screen::License

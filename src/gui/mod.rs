@@ -129,7 +129,7 @@ impl App {
         // from here on — two writers each saving the whole thing meant whichever
         // saved last silently reverted the other.
         let settings = Settings::load();
-        let screen = first_screen();
+        let screen = first_screen(&settings);
         // A debug build told to skip the key never passes the licence screen,
         // which is where `Unlocked` is otherwise sent from.
         if matches!(screen, Screen::Main) {
@@ -384,9 +384,13 @@ fn without_source_location(msg: &str) -> &str {
 /// `AG_UNLOCKER_DEV_SKIP_KEY` set, so the main screen can be looked at while it
 /// is being worked on. Compiled out of every release build (`build_rust.py`
 /// builds release), so a shipped exe has no way past the key.
-fn first_screen() -> Screen {
+fn first_screen(settings: &Settings) -> Screen {
     #[cfg(debug_assertions)]
     if std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some() {
+        return Screen::Main;
+    }
+    // A key accepted before and still good for this version: no screen.
+    if crate::auth::verify_key(&settings.license_key) {
         return Screen::Main;
     }
     Screen::License

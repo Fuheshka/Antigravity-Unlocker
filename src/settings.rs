@@ -42,6 +42,12 @@ pub struct Settings {
     #[serde(default)]
     pub group_key: String,
 
+    /// The licence key this machine last had accepted. Kept so a restart or an
+    /// `_N` update starts straight on the main screen; a key for another 3-digit
+    /// version fails `auth::verify_key` and the licence screen comes back.
+    #[serde(default)]
+    pub license_key: String,
+
     /// The user switched the client patch **off** on purpose.
     ///
     /// The one thing auto-patch must never do is put back a patch the user took
@@ -126,6 +132,7 @@ impl Default for Settings {
             client_patch: false,
             auto_patch: true,
             group_key: String::new(),
+            license_key: String::new(),
             patch_declined: false,
             decline_unrecorded: false,
             dns: true,

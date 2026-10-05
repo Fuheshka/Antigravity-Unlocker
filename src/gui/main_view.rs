@@ -417,7 +417,6 @@ fn advanced_card(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(10.0);
             cap_row(app, ui, Cap::BuiltinExits);
 
-
             ui.add_space(10.0);
             cap_row(app, ui, Cap::VerifyTls);
 
@@ -613,7 +612,10 @@ fn group_proxy_field(app: &mut App, ui: &mut egui::Ui) {
         if ui.button("Скопировать команду").clicked() {
             let cmd = format!("/ag+{}", crate::hwid::pc_code());
             crate::utils::set_clipboard_text(&cmd);
-            app.log.push((Level::Info, "Команда скопирована — отправьте её в группе.".to_string()));
+            app.log.push((
+                Level::Info,
+                "Команда скопирована — отправьте её в группе.".to_string(),
+            ));
         }
         if ui.button("Открыть группу").clicked() {
             crate::utils::open_url(GROUP_ROOM_URL);
@@ -622,13 +624,29 @@ fn group_proxy_field(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     let have_key = !crate::settings::group_key().is_empty();
     let field = egui::TextEdit::singleline(&mut app.group_key_input)
-        .hint_text(if have_key { "код принят — вставьте новый, чтобы заменить" } else { "код из группы" })
+        .hint_text(if have_key {
+            "код принят — вставьте новый, чтобы заменить"
+        } else {
+            "код из группы"
+        })
         .desired_width(ui.available_width());
-    let resp = ui.add_enabled(!busy, field);
+    let resp = ui
+        .add_enabled(!busy, field)
+        .on_hover_text("Правая кнопка мыши — вставить код из буфера");
+    // Right click pastes: egui's field has no context menu, and the code
+    // arrives on the clipboard from Telegram.
+    let mut right_pasted = false;
+    if resp.secondary_clicked() && !busy {
+        if let Some(clip) = crate::utils::clipboard_text() {
+            app.group_key_input = clip.trim().to_string();
+            right_pasted = true;
+        }
+    }
     // Sent as soon as the field holds a whole code (a paste), or on Enter.
     let text = app.group_key_input.trim().to_string();
-    let pasted = resp.changed() && text.starts_with("agk1.") && text.len() > 40;
-    let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !text.is_empty();
+    let pasted = (resp.changed() || right_pasted) && text.starts_with("agk1.") && text.len() > 40;
+    let entered =
+        resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !text.is_empty();
     if pasted || entered {
         app.worker.send(Cmd::SetGroupKey(text));
         app.group_key_input.clear();
