@@ -245,7 +245,11 @@ impl Status {
     /// The bypass master switch. Derived, never stored: it is on when any part
     /// of the bypass is, which keeps one truth instead of two.
     pub fn bypass_on(&self) -> bool {
-        self.dns.is_on() || self.local_proxy.is_on() || self.builtin_exits.is_on()
+        self.dns.is_on()
+            || self.local_proxy.is_on()
+            || self.builtin_exits.is_on()
+            || self.group_proxy.is_on()
+            || self.own_proxy.is_on()
     }
 }
 
@@ -255,11 +259,18 @@ impl Status {
 /// proxy variable may name it (I53) â€” the worker runs these in order, so DNS
 /// finishes first. OFF: the variable comes off *before* the listener it names
 /// goes away, or a sign-in that lands in between dials a dead port (G31).
-pub fn bypass_order(on: bool) -> [Cap; 4] {
+pub fn bypass_order(on: bool) -> Vec<Cap> {
     if on {
-        [Cap::Dns, Cap::LocalProxy, Cap::BuiltinExits, Cap::GroupProxy]
+        // The user's own proxy is theirs to switch on: it needs an address.
+        vec![Cap::Dns, Cap::LocalProxy, Cap::BuiltinExits, Cap::GroupProxy]
     } else {
-        [Cap::LocalProxy, Cap::BuiltinExits, Cap::GroupProxy, Cap::Dns]
+        vec![
+            Cap::LocalProxy,
+            Cap::OwnProxy,
+            Cap::BuiltinExits,
+            Cap::GroupProxy,
+            Cap::Dns,
+        ]
     }
 }
 
@@ -401,6 +412,9 @@ struct Ctx {
     /// The raw pair `read_dns` needs, kept from the last system scan so the DNS
     /// row can be recomputed for a new `vpn_detect` without going near PowerShell.
     dns_probe: (bool, bool),
+    /// `ensure_route_carrier` switched the local-proxy wish on, rather than the
+    /// user: only then does letting go of the last route switch it off again.
+    carrier_set_proxy: bool,
 }
 
 /// How much of the system a refresh is allowed to ask about.
@@ -451,6 +465,7 @@ fn run_worker(
         relay_egress: None,
         last: None,
         dns_probe: (false, false),
+        carrier_set_proxy: false,
     };
 
     settle_decline(&mut ctx);
@@ -786,7 +801,14 @@ fn push_status(ctx: &mut Ctx, scan: Scan) {
 fn settings_only_status(ctx: &Ctx, prev: Status) -> Status {
     let (rules, relay) = ctx.dns_probe;
     Status {
-        dns: dns_state(prev.admin, rules, relay, ctx.vpn, ctx.settings.vpn_detect),
+        dns: dns_state(
+            prev.admin,
+            rules,
+            relay,
+            ctx.vpn,
+            ctx.settings.vpn_detect,
+            ctx.settings.dns,
+        ),
         // Not `..prev`: `Cmd::Probed` refreshes this behind the window's back,
         // and a row carried forward from the last system scan would say a relay
         // that died an hour ago is still running.
@@ -910,6 +932,7 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
             dns_probe.1,
             ctx.vpn,
             ctx.settings.vpn_detect,
+            ctx.settings.dns,
         ),
         local_proxy,
         own_proxy,
@@ -1022,6 +1045,7 @@ fn dns_state(
     relay: bool,
     vpn: Option<VpnSeen>,
     detect_on: bool,
+    wanted: bool,
 ) -> State {
     // No VPN branch any more (D25): the layer does not stand down for a tunnel,
     // so a client measured inside one says nothing about whether the rules are
@@ -1033,6 +1057,11 @@ fn dns_state(
         // the fallback providers only, which works but is not what was asked
         // for — and it is exactly what a crashed relay looks like.
         (true, false) => State::Partial("правила стоят, служба не запущена".into()),
+        // A service that runs for the sake of a route (own proxy, group, exits)
+        // is not a half-installed DNS layer: the DNS switch is off, and drawing
+        // it as `Partial` - which reads as on - made it impossible to switch off
+        // while any route kept the service up.
+        (false, true) if !wanted => State::Off,
         (false, true) => State::Partial("служба работает, правил нет".into()),
         (false, false) => {
             if !admin && cfg!(target_os = "windows") {
@@ -1259,6 +1288,7 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
             } else {
                 upstream::clear();
                 ctx.log(Level::Ok, "Свой прокси отключён.");
+                release_route_carrier(ctx);
             }
         }
         (Cap::DnsRotation, on) => {
@@ -1302,6 +1332,11 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
                     "Встроенные выходы отключены."
                 },
             );
+            if on {
+                ensure_route_carrier(ctx);
+            } else {
+                release_route_carrier(ctx);
+            }
         }
         (Cap::GroupProxy, on) => {
             ctx.settings.group_proxy = on;
@@ -1313,6 +1348,11 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
                     "Прокси из группы выключен."
                 },
             );
+            if on {
+                ensure_route_carrier(ctx);
+            } else {
+                release_route_carrier(ctx);
+            }
         }
     }
 }
@@ -1335,12 +1375,9 @@ fn enable_all(ctx: &mut Ctx) {
         apply(ctx, Cap::ClientPatch, true);
     }
     // Nothing but a line in settings.json, so it needs nobody's permission.
-    if !ctx.settings.builtin_exits {
-        apply(ctx, Cap::BuiltinExits, true);
-    }
-    if !ctx.settings.group_proxy {
-        apply(ctx, Cap::GroupProxy, true);
-    }
+    // The service they ride on is brought up below, with DNS.
+    ctx.settings.builtin_exits = true;
+    ctx.settings.group_proxy = true;
     let dns_on =
         dns::is_nrpt_applied() && background::is_running() && !background::relay_is_outdated();
     if !dns_on {
@@ -1389,7 +1426,12 @@ fn repair(ctx: &mut Ctx) {
         );
         return;
     }
-    ctx.settings.dns = true;
+    // DNS is put back only when it was wanted, or when nothing else is: a user
+    // running just their own proxy must not get DNS rules from a repair.
+    let with_dns = ctx.settings.dns || !routes_want_relay(&ctx.settings);
+    if with_dns {
+        ctx.settings.dns = true;
+    }
     // `ensure_running` reinstalls only a copy that differs from this build;
     // a relay that is merely stopped or outdated needs the full `enable`.
     if let Err(e) = background::enable() {
@@ -1397,7 +1439,11 @@ fn repair(ctx: &mut Ctx) {
         return;
     }
     ctx.log(Level::Ok, "Служба обхода переустановлена и запущена.");
-    enable_dns(ctx);
+    if with_dns {
+        enable_dns(ctx);
+    } else {
+        ensure_route_carrier(ctx);
+    }
 }
 
 // --- client patch ----------------------------------------------------------
@@ -1780,28 +1826,45 @@ fn enable_dns(ctx: &mut Ctx) {
 fn disable_dns(ctx: &mut Ctx) {
     ctx.log(Level::Step, "Отключение обхода через DNS");
 
+    // The relay is also the carrier of every route (local proxy, own proxy,
+    // group, exits): it stays while any of them is wanted, and only the rules
+    // come off.
+    let keep_relay = routes_want_relay(&ctx.settings);
+
     // First, because the listener is about to stop existing: the local proxy
     // runs *inside* the relay, so stopping the relay leaves `AG_LS_PROXY`
     // naming a port nothing answers on, and Antigravity loses its sign-in with
     // `dial tcp 127.0.0.1: ... actively refused` (I53, G31). The user's wish for
     // the proxy is kept in settings, so it comes back when the relay does.
-    if endpoint::proxy_env_is_ours() {
+    if !keep_relay && endpoint::proxy_env_is_ours() {
         disable_local_proxy(ctx);
-    }
-
-    // The standalone watchdog task launches the copy of this exe that
-    // `background::disable` is about to delete. It is taken down first and put
-    // back after, on a copy of its own: auto-patch is not part of the bypass,
-    // and switching the bypass off must not switch it off too.
-    let restore_watchdog = ctx.settings.auto_patch && background::is_watchdog_enabled();
-    if restore_watchdog {
-        background::disable_watchdog();
     }
 
     // I45: both steps run regardless of what the first one did.
     dns::remove_dns_nrpt();
     dns::invalidate_cache();
     ctx.log(Level::Ok, "Правила DNS сняты.");
+    if keep_relay {
+        ctx.log(
+            Level::Info,
+            "Служба осталась запущенной: она нужна включённым прокси и выходам.",
+        );
+    } else {
+        stop_relay(ctx);
+    }
+}
+
+/// Takes the relay service down for good, with auto-patch kept.
+///
+/// The standalone watchdog task launches the copy of this exe that
+/// `background::disable` is about to delete. It is taken down first and put
+/// back after, on a copy of its own: auto-patch is not part of the bypass,
+/// and switching the bypass off must not switch it off too.
+fn stop_relay(ctx: &mut Ctx) {
+    let restore_watchdog = ctx.settings.auto_patch && background::is_watchdog_enabled();
+    if restore_watchdog {
+        background::disable_watchdog();
+    }
     match background::disable() {
         Ok(()) => ctx.log(Level::Ok, "Локальная служба DNS остановлена."),
         Err(e) => ctx.log(
@@ -1812,6 +1875,74 @@ fn disable_dns(ctx: &mut Ctx) {
     if restore_watchdog {
         set_watchdog(ctx, true);
     }
+}
+
+/// Whether something other than the DNS rules needs the relay running: the
+/// proxy listener and every route it serves live inside it.
+fn routes_want_relay(s: &Settings) -> bool {
+    s.local_proxy || s.own_proxy_enabled || s.group_proxy || s.builtin_exits
+}
+
+/// A route that was switched on by itself has to have something to ride on.
+///
+/// The routes (own proxy, group, exits) are chosen by the local proxy, which
+/// lives in the relay, and the client reaches that proxy by its variable or by
+/// the loopback door. With DNS off neither exists, so a route switched on alone
+/// carried nothing - which is exactly how «свой прокси» "did not work" with the
+/// other ways off. Starts the service and points the client at it; the DNS
+/// rules are not touched.
+fn ensure_route_carrier(ctx: &mut Ctx) {
+    if cfg!(target_os = "windows") && !is_admin() {
+        ctx.log(
+            Level::Warn,
+            "Служба обхода не запущена: нужны права администратора. Нажмите «Перезапустить от имени администратора».",
+        );
+        return;
+    }
+    if let Err(e) = background::ensure_running() {
+        ctx.log(Level::Err, format!("Служба обхода не запустилась: {}", e));
+        return;
+    }
+    // Wanted, whatever `enable_local_proxy` manages below: the relay writes the
+    // variable itself once its listener answers, and the door opens only while
+    // this is set (`loopback::is_up`).
+    if !ctx.settings.local_proxy {
+        ctx.carrier_set_proxy = true;
+    }
+    ctx.settings.local_proxy = true;
+    ctx.settings.save();
+    if !endpoint::proxy_env_is_ours() {
+        enable_local_proxy(ctx);
+    }
+}
+
+/// The counterpart: a route went off, and if nothing else wants the service it
+/// goes too. Not while DNS is on - then it is the DNS layer's.
+fn release_route_carrier(ctx: &mut Ctx) {
+    if ctx.settings.dns || routes_want_relay_without_proxy_var(&ctx.settings) {
+        return;
+    }
+    if cfg!(target_os = "windows") && !is_admin() {
+        return;
+    }
+    if ctx.carrier_set_proxy {
+        ctx.carrier_set_proxy = false;
+        ctx.settings.local_proxy = false;
+        if endpoint::proxy_env_is_ours() {
+            disable_local_proxy(ctx);
+        }
+    }
+    // The local proxy switched on by the user keeps the service.
+    if ctx.settings.local_proxy {
+        return;
+    }
+    stop_relay(ctx);
+}
+
+/// `routes_want_relay` minus the proxy variable's own wish: a route's carrier
+/// sets that wish itself, so it must not count against letting go of it.
+fn routes_want_relay_without_proxy_var(s: &Settings) -> bool {
+    s.own_proxy_enabled || s.group_proxy || s.builtin_exits
 }
 
 /// Re-writes the NRPT rules when the pool they name has changed.
@@ -1943,6 +2074,7 @@ fn set_own_proxy(ctx: &mut Ctx, text: &str) {
         upstream::clear();
         ctx.settings.own_proxy_enabled = false;
         ctx.log(Level::Ok, "Свой прокси убран.");
+        release_route_carrier(ctx);
         return;
     }
 
@@ -1968,6 +2100,8 @@ fn set_own_proxy(ctx: &mut Ctx, text: &str) {
     ctx.settings.own_proxy_enabled = true;
     ctx.settings.own_proxy_at = crate::gate::now_unix();
     ctx.log(Level::Ok, format!("Свой прокси включён: {}", up.display()));
+    // Alone it needs the service and the variable; DNS is not part of it.
+    ensure_route_carrier(ctx);
 
     // Whether it carries a request to Google, and nothing else. Its exit country
     // is never traced (D34): through the user's proxy the only traffic is to
@@ -2136,6 +2270,57 @@ mod tests {
         assert_eq!(scan_after(Cap::ClientPatch), Scan::Deep);
     }
 
+    /// Any single way can be the only one on: the master switch follows it
+    /// instead of reading off (which is what unset it under the user's own proxy).
+    #[test]
+    fn any_single_way_keeps_the_master_switch_on() {
+        let blank = blank_status();
+        assert!(!blank.bypass_on());
+        for set in [
+            |s: &mut Status| s.own_proxy = State::On,
+            |s: &mut Status| s.group_proxy = State::On,
+            |s: &mut Status| s.builtin_exits = State::On,
+            |s: &mut Status| s.local_proxy = State::On,
+            |s: &mut Status| s.dns = State::On,
+        ] {
+            let mut s = blank_status();
+            set(&mut s);
+            assert!(s.bypass_on());
+        }
+    }
+
+    /// The master switch off lets go of every way, DNS last (the service dies
+    /// with it) and the user's own proxy included, or it would draw itself on again.
+    #[test]
+    fn master_off_takes_every_way_down_and_on_never_picks_the_users_proxy() {
+        let off = bypass_order(false);
+        assert_eq!(off.last(), Some(&Cap::Dns));
+        assert!(off.contains(&Cap::OwnProxy) && off.contains(&Cap::GroupProxy));
+        assert!(!bypass_order(true).contains(&Cap::OwnProxy));
+    }
+
+    /// A service kept up for a route is not a half-installed DNS layer: with the
+    /// DNS switch off it reads off, with it on it is still a fault.
+    #[test]
+    fn a_service_running_for_a_route_does_not_pin_the_dns_switch_on() {
+        let off = dns_state(true, false, true, None, true, false);
+        assert!(!off.is_on());
+        let broken = dns_state(true, false, true, None, true, true);
+        assert!(broken.is_on());
+    }
+
+    #[test]
+    fn the_service_is_wanted_while_any_route_is() {
+        let mut s = Settings::default();
+        s.local_proxy = false;
+        s.builtin_exits = false;
+        s.group_proxy = false;
+        s.own_proxy_enabled = false;
+        assert!(!routes_want_relay(&s));
+        s.own_proxy_enabled = true;
+        assert!(routes_want_relay(&s));
+    }
+
     /// Live: what a switch actually costs, which is the complaint this was built
     /// to answer («слишком много времени»). Prints, asserts only the shape.
     ///
@@ -2155,6 +2340,7 @@ mod tests {
             relay_egress: None,
             last: None,
             dns_probe: (false, false),
+            carrier_set_proxy: false,
         };
 
         let t = std::time::Instant::now();
@@ -2222,12 +2408,12 @@ mod tests {
         // And an unmeasured tunnel must not block the DNS row: it takes evidence
         // to stand down, not the absence of it (S37).
         assert_eq!(
-            dns_state(true, true, true, Some(VpnSeen::Unmeasured), true),
+            dns_state(true, true, true, Some(VpnSeen::Unmeasured), true, true),
             State::On
         );
         // A client in a tunnel no longer blocks the row either (D25).
         assert_eq!(
-            dns_state(true, true, true, Some(VpnSeen::CarryingClient), true),
+            dns_state(true, true, true, Some(VpnSeen::CarryingClient), true, true),
             State::On
         );
     }

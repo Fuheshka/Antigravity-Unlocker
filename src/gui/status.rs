@@ -204,10 +204,12 @@ impl Facts {
             admin: s.admin || !cfg!(target_os = "windows"),
             installs_found: s.installs.iter().any(|r| r.path.is_some()),
             patch_on: s.client_patch.is_on(),
-            bypass_on: s.dns.is_on(),
+            bypass_on: s.bypass_on(),
             relay_running: s.relay_running,
             relay_outdated: s.relay_outdated,
-            rules: s.rules || !cfg!(target_os = "windows"),
+            // Rules are only owed while the DNS switch is on: a route running alone
+            // (own proxy, group, exits) has none by design.
+            rules: s.rules || !s.dns.is_on() || !cfg!(target_os = "windows"),
             relay_reporting: relay.is_some(),
             refusal,
             answer,
