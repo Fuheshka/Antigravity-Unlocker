@@ -277,6 +277,10 @@ pub fn switch_text(cap: Cap) -> (&'static str, &'static str) {
             // free service that gets named publicly stops being free (I46).
             "Запасной путь до серверов Google — через страну без ограничений.",
         ),
+        Cap::GroupProxy => (
+            "Прокси из группы",
+            "Выделенный сервер группы: через него идут только запросы к моделям.",
+        ),
         Cap::VerifyTls => (
             "Сверять TLS",
             "Адрес от сервиса разблокировки принимается, только если предъявил настоящий \

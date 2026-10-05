@@ -55,6 +55,7 @@ pub enum Cap {
     OwnProxy,
     /// The built-in permitted-region exits.
     BuiltinExits,
+    GroupProxy,
     /// Whether the DNS pool rotates, or only its first enabled member answers.
     DnsRotation,
     // `VpnDetect` is gone (D25): the layer no longer stands down for a tunnel,
@@ -80,6 +81,7 @@ impl Cap {
             Cap::LocalProxy => "Локальный прокси",
             Cap::OwnProxy => "Свой HTTP-прокси",
             Cap::BuiltinExits => "Встроенные выходы",
+            Cap::GroupProxy => "Прокси из группы",
             Cap::DnsRotation => "Ротация DNS-серверов",
             Cap::VerifyTls => "Сверять TLS",
         }
@@ -197,6 +199,7 @@ pub struct Status {
     pub local_proxy: State,
     pub own_proxy: State,
     pub builtin_exits: State,
+    pub group_proxy: State,
     pub dns_rotation: State,
     pub verify_tls: State,
     /// What the last measurement saw. `None` means it has not been taken yet;
@@ -233,6 +236,7 @@ impl Status {
             Cap::LocalProxy => &self.local_proxy,
             Cap::OwnProxy => &self.own_proxy,
             Cap::BuiltinExits => &self.builtin_exits,
+            Cap::GroupProxy => &self.group_proxy,
             Cap::DnsRotation => &self.dns_rotation,
             Cap::VerifyTls => &self.verify_tls,
         }
@@ -251,11 +255,11 @@ impl Status {
 /// proxy variable may name it (I53) â€” the worker runs these in order, so DNS
 /// finishes first. OFF: the variable comes off *before* the listener it names
 /// goes away, or a sign-in that lands in between dials a dead port (G31).
-pub fn bypass_order(on: bool) -> [Cap; 3] {
+pub fn bypass_order(on: bool) -> [Cap; 4] {
     if on {
-        [Cap::Dns, Cap::LocalProxy, Cap::BuiltinExits]
+        [Cap::Dns, Cap::LocalProxy, Cap::BuiltinExits, Cap::GroupProxy]
     } else {
-        [Cap::LocalProxy, Cap::BuiltinExits, Cap::Dns]
+        [Cap::LocalProxy, Cap::BuiltinExits, Cap::GroupProxy, Cap::Dns]
     }
 }
 
@@ -311,6 +315,7 @@ pub enum Cmd {
     AddPath(PathBuf),
     ForgetPath(PathBuf),
     SetOwnProxy(String),
+    SetGroupKey(String),
     SetProvider(String, bool),
     /// The whole pool in the order the user dragged it into.
     ReorderProviders(Vec<String>),
@@ -558,6 +563,23 @@ fn run_worker(
                 push_status(&mut ctx, Scan::System);
                 ctx.busy(None);
             }
+            Cmd::SetGroupKey(text) => {
+                ctx.busy(Some("Проверка ключа"));
+                match crate::group_key::parse_key(&text) {
+                    Ok(_) => {
+                        ctx.settings.group_key = text.trim().to_string();
+                        ctx.settings.group_proxy = true;
+                        ctx.settings.save();
+                        apply(&mut ctx, Cap::GroupProxy, true);
+                        ctx.log(crate::ops::Level::Ok, "Ключ принят.");
+                        push_status(&mut ctx, scan_after(Cap::GroupProxy));
+                    }
+                    Err(e) => {
+                        ctx.log(crate::ops::Level::Err, format!("{}", e));
+                    }
+                }
+                ctx.busy(None);
+            }
             Cmd::EnableAll => {
                 ctx.busy(Some("Включаю"));
                 enable_all(&mut ctx);
@@ -703,7 +725,7 @@ fn scan_after(cap: Cap) -> Scan {
         Cap::Watchdog | Cap::Dns | Cap::LocalProxy | Cap::OwnProxy | Cap::DnsRotation => {
             Scan::System
         }
-        Cap::BuiltinExits | Cap::VerifyTls => Scan::Settings,
+        Cap::BuiltinExits | Cap::GroupProxy | Cap::VerifyTls => Scan::Settings,
     }
 }
 
@@ -778,6 +800,7 @@ impl Status {
     /// a switch that answers differently depending on which path drew it.
     fn with_settings_switches(mut self, s: &Settings) -> Self {
         self.builtin_exits = on_off(s.builtin_exits);
+        self.group_proxy = on_off(s.group_proxy);
         self.verify_tls = if s.verify_tls {
             State::On
         } else {
@@ -883,6 +906,7 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
         own_proxy,
         own_proxy_text,
         builtin_exits: State::Off,
+        group_proxy: State::Off,
         verify_tls: State::Off,
         vpn: ctx.vpn,
         dns_rotation: State::Off,
@@ -1270,6 +1294,17 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
                 },
             );
         }
+        (Cap::GroupProxy, on) => {
+            ctx.settings.group_proxy = on;
+            ctx.log(
+                Level::Ok,
+                if on {
+                    "Прокси из группы включён."
+                } else {
+                    "Прокси из группы выключен."
+                },
+            );
+        }
     }
 }
 
@@ -1293,6 +1328,9 @@ fn enable_all(ctx: &mut Ctx) {
     // Nothing but a line in settings.json, so it needs nobody's permission.
     if !ctx.settings.builtin_exits {
         apply(ctx, Cap::BuiltinExits, true);
+    }
+    if !ctx.settings.group_proxy {
+        apply(ctx, Cap::GroupProxy, true);
     }
     let dns_on =
         dns::is_nrpt_applied() && background::is_running() && !background::relay_is_outdated();
@@ -2082,6 +2120,7 @@ mod tests {
     fn only_the_switches_that_touch_the_system_pay_for_a_system_scan() {
         assert_eq!(scan_after(Cap::VerifyTls), Scan::Settings);
         assert_eq!(scan_after(Cap::BuiltinExits), Scan::Settings);
+        assert_eq!(scan_after(Cap::GroupProxy), Scan::Settings);
         assert_eq!(scan_after(Cap::Dns), Scan::System);
         assert_eq!(scan_after(Cap::LocalProxy), Scan::System);
         assert_eq!(scan_after(Cap::ClientPatch), Scan::Deep);
@@ -2137,6 +2176,7 @@ mod tests {
             local_proxy: State::Off,
             own_proxy: State::Off,
             builtin_exits: State::Off,
+            group_proxy: State::Off,
             dns_rotation: State::Off,
             verify_tls: State::Off,
             vpn: None,

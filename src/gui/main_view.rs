@@ -408,6 +408,10 @@ fn advanced_card(app: &mut App, ui: &mut egui::Ui) {
             cap_row(app, ui, Cap::BuiltinExits);
 
             ui.add_space(10.0);
+            cap_row(app, ui, Cap::GroupProxy);
+            group_proxy_field(app, ui);
+
+            ui.add_space(10.0);
             cap_row(app, ui, Cap::VerifyTls);
 
             ui.add_space(10.0);
@@ -589,6 +593,40 @@ fn providers_list(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+fn group_proxy_field(app: &mut App, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.add_space(10.0);
+        let pc = crate::hwid::pc_code();
+        let key_text = if crate::settings::group_key().is_empty() {
+            "ключа нет"
+        } else {
+            "ключ принят (до замены новым)"
+        };
+        ui.label(format!("Код этого ПК: {} — {}", pc, key_text));
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(10.0);
+        if ui.button("Открыть комнату группы").clicked() {
+            crate::utils::open_url("https://t.me/nova_txt/69864");
+        }
+        if ui.button("Скопировать команду").clicked() {
+            let cmd = format!("/ag+{}", crate::hwid::pc_code());
+            crate::utils::set_clipboard_text(&cmd);
+            app.log.push((crate::ops::Level::Info, format!("Скопировано: {} — отправьте это сообщение в комнате", cmd)));
+        }
+        if ui.button("Вставить ключ из буфера").clicked() {
+            if let Some(text) = crate::utils::clipboard_text() {
+                app.worker.send(crate::ops::Cmd::SetGroupKey(text));
+            } else {
+                app.log.push((crate::ops::Level::Warn, "Буфер обмена пуст".to_string()));
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(10.0);
+        ui.label("1) Откройте комнату 2) Отправьте туда скопированную команду 3) Скопируйте ответ бота и нажмите «Вставить ключ»");
+    });
+}
 fn own_proxy_field(app: &mut App, ui: &mut egui::Ui) {
     let busy = app.is_busy();
     ui.horizontal(|ui| {

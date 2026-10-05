@@ -39,6 +39,9 @@ pub struct Settings {
     /// from an in-memory `Settings` the watchdog never sees.
     pub auto_patch: bool,
 
+    #[serde(default)]
+    pub group_key: String,
+
     /// The user switched the client patch **off** on purpose.
     ///
     /// The one thing auto-patch must never do is put back a patch the user took
@@ -61,6 +64,7 @@ pub struct Settings {
     pub dns: bool,
     pub local_proxy: bool,
     pub builtin_exits: bool,
+    pub group_proxy: bool,
 
     /// Providers the user turned off by name. A deny-list rather than an
     /// allow-list on purpose: a provider added in a later release is then on by
@@ -121,11 +125,13 @@ impl Default for Settings {
         Self {
             client_patch: false,
             auto_patch: true,
+            group_key: String::new(),
             patch_declined: false,
             decline_unrecorded: false,
             dns: true,
             local_proxy: true,
             builtin_exits: true,
+            group_proxy: true,
             disabled_providers: Vec::new(),
             rotate_providers: true,
             provider_order: Vec::new(),
@@ -403,6 +409,14 @@ pub fn local_proxy_wanted() -> bool {
 /// Defaults to on: a missing settings file means a machine that never opened the
 /// window (the relay's first start races the first save), and the route being
 /// there is the shipped behaviour.
+pub fn group_proxy_enabled() -> bool {
+    cached().group_proxy
+}
+
+pub fn group_key() -> String {
+    cached().group_key.clone()
+}
+
 pub fn builtin_exits_enabled() -> bool {
     cached().builtin_exits
 }
@@ -416,7 +430,7 @@ mod tests {
         // Nothing has been written in a test process, so this exercises the
         // "first run" path that every new user takes.
         let s = Settings::default();
-        assert!(s.dns && s.local_proxy && s.builtin_exits && s.auto_patch);
+        assert!(s.dns && s.local_proxy && s.builtin_exits && s.group_proxy && s.auto_patch);
         assert!(s.rotate_providers, "the pool races by default");
         assert!(
             !s.client_patch,

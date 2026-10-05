@@ -139,6 +139,14 @@ fn status_part(out: &mut String, s: &Status) {
     let _ = writeln!(out, "Обход через DNS: {}", onoff(&s.dns));
     let _ = writeln!(out, "Локальный прокси: {}", onoff(&s.local_proxy));
     let _ = writeln!(out, "Встроенные выходы: {}", onoff(&s.builtin_exits));
+    let key_present = if crate::settings::group_key().is_empty() { "нет" } else { "есть" };
+    let _ = writeln!(
+        out,
+        "Прокси из группы: {}, ключ: {}, код ПК: {}",
+        onoff(&s.group_proxy),
+        key_present,
+        crate::hwid::pc_code()
+    );
     let _ = writeln!(out, "Свой прокси: {}", onoff(&s.own_proxy));
     let _ = writeln!(out, "Сверять TLS: {}", onoff(&s.verify_tls));
     let _ = writeln!(

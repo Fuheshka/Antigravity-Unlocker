@@ -149,7 +149,9 @@ pub const LISTEN_PORT: u16 = 53;
 ///     tunnels and sending the retry straight back into it. Same generation:
 ///     the user's proxy no longer has its exit region traced on the warm loop
 ///     (nor when it is added) - the region-400 watch stands it down instead.
-pub const RELAY_VERSION: u32 = 40;
+/// 41 = the third DoH node of dns-ai moved to a new address. An older relay
+///     keeps dialling the withdrawn one and loses a third of the DoH walk.
+pub const RELAY_VERSION: u32 = 41;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -668,6 +670,7 @@ fn warm_forever() {
         // route working at all.
         if since_exits >= PROBE_HEALTHY_EVERY {
             proxy::probe_exits();
+            crate::group::probe_health();
             since_exits = Duration::ZERO;
         }
         // The direct route is timed on the same clock as the others, so the

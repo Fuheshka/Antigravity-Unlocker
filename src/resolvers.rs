@@ -131,10 +131,9 @@ pub const PROVIDERS: &[Provider] = &[
 /// dead address failed safely and therefore failed *quietly*.
 ///
 /// Every entry below is live and was verified answering on `/dns-query` before
-/// being written here. The third, `94.232.43.149`, joined 2026-09-18 at the
-/// service's own request: it was already in the public A record, and measured
-/// the same day it proves the name, speaks h2 (nginx in front, where the other
-/// two run dnsdist) and substitutes both gate names. The walk spreads queries
+/// being written here. The third, `185.251.90.181`, replaced `94.232.43.149`
+/// (msk1, nginx) on 2026-09-27 at the service's request - the old node is being
+/// withdrawn; the new one answered `/dns-query` over h2 the same day. The walk spreads queries
 /// evenly across all three - which is the point of listing a node at all (G43).
 /// When re-checking (P14), check the ADDRESSES too, not only whether the
 /// provider still substitutes: a hardcoded address is a measurement with an
@@ -142,7 +141,7 @@ pub const PROVIDERS: &[Provider] = &[
 pub static DNS_AI: crate::doh::Endpoint = crate::doh::Endpoint {
     host: "dns.dns-ai.ru",
     path: "/dns-query",
-    addrs: &["192.144.59.14", "186.246.49.127", "94.232.43.149"],
+    addrs: &["192.144.59.14", "186.246.49.127", "185.251.90.181"],
 };
 
 /// Resolvers used only to recognise an unsubstituted answer. They must be

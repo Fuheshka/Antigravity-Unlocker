@@ -127,6 +127,10 @@ enum Row {
     Advanced,
     Provider(usize),
     OwnProxyText,
+    GroupProxyText,
+    GroupProxyOpenRoom,
+    GroupProxyCopy,
+    GroupProxyPaste,
     Report,
 }
 
@@ -538,6 +542,23 @@ impl App {
                         .send(Cmd::SetProvider(p.name.clone(), !p.enabled));
                 }
             }
+            Row::GroupProxyOpenRoom => {
+                crate::utils::open_url("https://t.me/nova_txt/69864");
+                self.toast("Открыто в браузере: https://t.me/nova_txt/69864");
+            }
+            Row::GroupProxyCopy => {
+                let cmd = format!("/ag+{}", crate::hwid::pc_code());
+                crate::utils::set_clipboard_text(&cmd);
+                self.toast(format!("Скопировано: {} — отправьте это сообщение в комнате", cmd));
+            }
+            Row::GroupProxyPaste => {
+                if let Some(text) = crate::utils::clipboard_text() {
+                    self.worker.send(Cmd::SetGroupKey(text));
+                } else {
+                    self.toast("Буфер обмена пуст");
+                }
+            }
+            Row::GroupProxyText => {}
             Row::OwnProxyText => {
                 self.input = Some(Input::OwnProxy {
                     text: self.own_proxy_text(),
@@ -686,6 +707,11 @@ impl App {
             }
             rows.push(Row::Cap(Cap::LocalProxy));
             rows.push(Row::Cap(Cap::BuiltinExits));
+            rows.push(Row::Cap(Cap::GroupProxy));
+            rows.push(Row::GroupProxyText);
+            rows.push(Row::GroupProxyOpenRoom);
+            rows.push(Row::GroupProxyCopy);
+            rows.push(Row::GroupProxyPaste);
             rows.push(Row::Cap(Cap::VerifyTls));
             rows.push(Row::Cap(Cap::OwnProxy));
             rows.push(Row::OwnProxyText);
@@ -718,6 +744,10 @@ impl App {
             }
             Row::Advanced => "Детали обхода: DNS-серверы, прокси, выходы.".into(),
             Row::Provider(_) => "Пробел — включить или выключить сервер, +/- — выше или ниже в списке.".into(),
+            Row::GroupProxyText => "Код этого ПК и состояние ключа.".into(),
+            Row::GroupProxyOpenRoom => "Открыть Telegram-комнату для получения ключа.".into(),
+            Row::GroupProxyCopy => "Скопировать команду для получения ключа.".into(),
+            Row::GroupProxyPaste => "Вставить полученный ключ из буфера обмена.".into(),
             Row::OwnProxyText => {
                 "Enter — изменить адрес: логин:пароль@адрес:порт (или адрес:порт без пароля).".into()
             }
@@ -804,6 +834,21 @@ impl App {
                 let name = format!("{}. {}", i + 1, status::provider_name(&p.name));
                 switch_line("      ", &name, &state, busy, width)
             }
+            Row::GroupProxyText => {
+                let pc = crate::hwid::pc_code();
+                let key_text = if crate::settings::group_key().is_empty() {
+                    "ключа нет"
+                } else {
+                    "ключ принят"
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw("      Код ПК: "),
+                    Span::styled(format!("{} - {}", pc, key_text), Style::new().fg(Color::Gray)),
+                ]))
+            }
+            Row::GroupProxyOpenRoom => ListItem::new(Line::from(vec![Span::styled("      > Открыть комнату группы", Style::new().fg(Color::Cyan))])),
+            Row::GroupProxyCopy => ListItem::new(Line::from(vec![Span::styled("      > Скопировать команду", Style::new().fg(Color::Cyan))])),
+            Row::GroupProxyPaste => ListItem::new(Line::from(vec![Span::styled("      > Вставить ключ из буфера", Style::new().fg(Color::Cyan))])),
             Row::OwnProxyText => {
                 let text = self.own_proxy_text();
                 let shown = if text.is_empty() {
