@@ -107,7 +107,7 @@ fn base64_url_decode(s: &str) -> Result<Vec<u8>, KeyError> {
     Ok(out)
 }
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
