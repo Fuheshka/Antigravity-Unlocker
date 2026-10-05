@@ -39,7 +39,14 @@ struct Server {
 
 impl Server {
     fn new(host: String, port: u16) -> Self {
-        Server { host, port, addrs: None, ok: true, tunnel_ok: true, cpu: None }
+        Server {
+            host,
+            port,
+            addrs: None,
+            ok: true,
+            tunnel_ok: true,
+            cpu: None,
+        }
     }
     fn name(&self) -> String {
         format!("{}:{}", self.host, self.port)
@@ -118,14 +125,20 @@ fn choose(cands: &[Cand], current: Option<usize>, active: usize, r: f64) -> Opti
         if active > 0 {
             return Some(c);
         }
-        let best = (0..cands.len()).filter(|&i| cands[i].ok).map(|i| load(cands[i])).min().unwrap_or(0);
+        let best = (0..cands.len())
+            .filter(|&i| cands[i].ok)
+            .map(|i| load(cands[i]))
+            .min()
+            .unwrap_or(0);
         if load(cands[c]) <= best + SWITCH_MARGIN {
             return Some(c);
         }
     }
     // Re-pick among the answering servers, the current one excluded when it is
     // being left for its load.
-    let pool: Vec<usize> = (0..cands.len()).filter(|&i| cands[i].ok && Some(i) != cur).collect();
+    let pool: Vec<usize> = (0..cands.len())
+        .filter(|&i| cands[i].ok && Some(i) != cur)
+        .collect();
     if pool.is_empty() {
         // Nothing answered: keep trying where we were, else the bootstrap.
         return Some(cur.or(current.filter(|&c| c < cands.len())).unwrap_or(0));
@@ -159,7 +172,9 @@ fn valid_server_name(s: &str) -> Option<(String, u16)> {
     let port: u16 = port.parse().ok().filter(|&p| p != 0)?;
     let host_ok = !host.is_empty()
         && host.len() <= 253
-        && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
         && !host.starts_with(['.', '-'])
         && !host.ends_with(['.', '-']);
     host_ok.then(|| (host.to_string(), port))
@@ -185,7 +200,12 @@ fn initial_servers(key: &GroupKey) -> Vec<Server> {
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
     if let Some(v) = saved {
         if v["key"].as_str() == Some(key_id(key).as_str()) {
-            for name in v["servers"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) {
+            for name in v["servers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|n| n.as_str())
+            {
                 if let Some((h, p)) = valid_server_name(name) {
                     if out.len() < MAX_SERVERS && !out.iter().any(|s| s.host == h && s.port == p) {
                         out.push(Server::new(h, p));
@@ -212,7 +232,12 @@ fn ensure_pool(key: &GroupKey) {
     }
     let servers = initial_servers(key);
     let mut state = group_state().lock().unwrap();
-    if state.servers.is_empty() && state.parsed.as_ref().map_or(true, |k| key_id(k) == key_id(key)) {
+    if state.servers.is_empty()
+        && state
+            .parsed
+            .as_ref()
+            .map_or(true, |k| key_id(k) == key_id(key))
+    {
         state.servers = servers;
     }
 }
@@ -225,15 +250,35 @@ fn pick_server(key: &GroupKey) -> (usize, String) {
     if state.servers.is_empty() {
         return (0, format!("{}:{}", key.host, key.port));
     }
-    let cands: Vec<Cand> = state.servers.iter().map(|s| Cand { ok: s.ok && s.tunnel_ok, cpu: s.cpu }).collect();
-    let pick = choose(&cands, state.current, ACTIVE.load(Ordering::SeqCst), unit_random()).unwrap_or(0);
+    let cands: Vec<Cand> = state
+        .servers
+        .iter()
+        .map(|s| Cand {
+            ok: s.ok && s.tunnel_ok,
+            cpu: s.cpu,
+        })
+        .collect();
+    let pick = choose(
+        &cands,
+        state.current,
+        ACTIVE.load(Ordering::SeqCst),
+        unit_random(),
+    )
+    .unwrap_or(0);
     let name = state.servers[pick].name();
     if state.current != Some(pick) {
-        let cpu = state.servers[pick].cpu.map_or("?".to_string(), |c| c.to_string());
+        let cpu = state.servers[pick]
+            .cpu
+            .map_or("?".to_string(), |c| c.to_string());
         let total = state.servers.len();
         state.current = Some(pick);
         drop(state);
-        crate::dns_forwarder::log_proxy(&format!("Прокси из группы: сервер #{} из {} (CPU {}%)", pick + 1, total, cpu));
+        crate::dns_forwarder::log_proxy(&format!(
+            "Прокси из группы: сервер #{} из {} (CPU {}%)",
+            pick + 1,
+            total,
+            cpu
+        ));
     }
     (pick, name)
 }
@@ -248,7 +293,13 @@ fn set_tunnel_ok(name: &str, ok: bool) {
 /// A message for the log with every pool host taken out: errors from TLS or
 /// the resolver can carry the name, and logs name servers by number only (I46).
 fn scrub(msg: &str) -> String {
-    let hosts: Vec<String> = group_state().lock().unwrap().servers.iter().map(|s| s.host.clone()).collect();
+    let hosts: Vec<String> = group_state()
+        .lock()
+        .unwrap()
+        .servers
+        .iter()
+        .map(|s| s.host.clone())
+        .collect();
     let mut out = msg.to_string();
     for h in hosts {
         if !h.is_empty() {
@@ -335,6 +386,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 /// The server's name and addresses, resolved at most every 10 minutes.
 fn server_addrs(server: &str, force_refresh: bool) -> Result<(String, Vec<SocketAddr>), String> {
     let (host, port) = valid_server_name(server).ok_or("нет сервера")?;
+    // (addresses, fresh): a stale answer is kept to fall back on, never dropped.
     let cached = {
         let state = group_state().lock().unwrap();
         state
@@ -342,29 +394,55 @@ fn server_addrs(server: &str, force_refresh: bool) -> Result<(String, Vec<Socket
             .iter()
             .find(|s| s.host == host && s.port == port)
             .and_then(|s| s.addrs.as_ref())
-            .filter(|(_, ts)| !force_refresh && ts.elapsed() < Duration::from_secs(600))
-            .map(|(a, _)| a.clone())
+            .map(|(a, ts)| {
+                (
+                    a.clone(),
+                    !force_refresh && ts.elapsed() < Duration::from_secs(600),
+                )
+            })
     };
-    if let Some(a) = cached {
-        return Ok((host, a));
+    if let Some((a, true)) = &cached {
+        return Ok((host, a.clone()));
     }
     // Outside the lock: a slow resolver must not stall every other tunnel.
-    let resolved: Vec<_> = format!("{}:{}", host, port)
-        .to_socket_addrs()
-        .map_err(|e| e.to_string())?
-        .filter(|a| a.is_ipv4())
+    // The reference resolvers first, asked directly over UDP with a two-second
+    // budget: the system resolver on a machine running this tool is the one
+    // that is slow or lies, and the first connection to the group waited 16 s
+    // for it (measured) while the server itself answered in half a second.
+    let mut resolved: Vec<SocketAddr> = crate::resolvers::genuine_a(&host)
+        .into_iter()
+        .map(|ip| SocketAddr::from((ip, port)))
         .collect();
     if resolved.is_empty() {
-        return Err("нет IPv4 адресов".to_string());
+        resolved = format!("{}:{}", host, port)
+            .to_socket_addrs()
+            .map(|it| it.filter(|a| a.is_ipv4()).collect())
+            .unwrap_or_default();
     }
-    if let Some(s) = group_state().lock().unwrap().servers.iter_mut().find(|s| s.host == host && s.port == port) {
+    if resolved.is_empty() {
+        return match cached {
+            Some((a, _)) => Ok((host, a)),
+            None => Err("нет IPv4 адресов".to_string()),
+        };
+    }
+    if let Some(s) = group_state()
+        .lock()
+        .unwrap()
+        .servers
+        .iter_mut()
+        .find(|s| s.host == host && s.port == port)
+    {
         s.addrs = Some((resolved.clone(), Instant::now()));
     }
     Ok((host, resolved))
 }
 
 /// TCP + TLS (ALPN agu/2) to one pool server, within `budget`.
-fn open_tls(server: &str, force_refresh: bool, budget: Duration) -> Result<(ClientConnection, TcpStream), String> {
+fn open_tls(
+    server: &str,
+    force_refresh: bool,
+    budget: Duration,
+) -> Result<(ClientConnection, TcpStream), String> {
     let (host, addrs) = server_addrs(server, force_refresh)?;
     let deadline = Instant::now() + budget;
 
@@ -697,13 +775,23 @@ pub fn tunnel(mut client: TcpStream, host: &str, _port: u16) -> Result<(), TcpSt
                         return Ok(());
                     }
                     crate::routes::note_used(crate::routes::Kind::Group);
-                    crate::dns_forwarder::log_proxy(&format!("{} #{} -> {}", route.label(), idx + 1, host));
+                    crate::dns_forwarder::log_proxy(&format!(
+                        "{} #{} -> {}",
+                        route.label(),
+                        idx + 1,
+                        host
+                    ));
 
                     tls_pump(client, tls, sock, leftover);
                     return Ok(());
                 }
                 Err(why) => {
-                    crate::dns_forwarder::log_proxy(&format!("{} #{}: {}", route.label(), idx + 1, scrub(&why)));
+                    crate::dns_forwarder::log_proxy(&format!(
+                        "{} #{}: {}",
+                        route.label(),
+                        idx + 1,
+                        scrub(&why)
+                    ));
                     let pool = group_state().lock().unwrap().servers.len();
                     set_tunnel_ok(&server, false);
                     if pool < 2 {
@@ -745,10 +833,17 @@ fn fetch_status(key: &GroupKey, server: &str) -> Result<Status, String> {
     let budget = upstream::PROBE_BUDGET;
     let deadline = Instant::now() + budget;
     let (mut tls, mut sock) = open_tls(server, false, budget)?;
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let nonce_hex = fresh_nonce()?;
-    let auth = crate::group_key::auth_header(key, crate::hwid::pc_code(), ts, &nonce_hex, status_host);
-    let req = format!("GET {} HTTP/1.1\r\nHost: x\r\nProxy-Authorization: {}\r\n\r\n", path, auth);
+    let auth =
+        crate::group_key::auth_header(key, crate::hwid::pc_code(), ts, &nonce_hex, status_host);
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: x\r\nProxy-Authorization: {}\r\n\r\n",
+        path, auth
+    );
     rustls::Stream::new(&mut tls, &mut sock)
         .write_all(req.as_bytes())
         .map_err(|e| e.to_string())?;
@@ -775,7 +870,10 @@ fn fetch_status(key: &GroupKey, server: &str) -> Result<Status, String> {
             Err(e) => return Err(e.to_string()),
         }
     }
-    let end = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or("нет ответа")?;
+    let end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("нет ответа")?;
     let head = String::from_utf8_lossy(&raw[..end]).into_owned();
     let body = &raw[end + 4..];
     if !head.lines().next().unwrap_or("").contains(" 200") {
@@ -806,7 +904,12 @@ fn fetch_status(key: &GroupKey, server: &str) -> Result<Status, String> {
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|e| Some((e["s"].as_str()?.to_string(), e["cpu"].as_i64().unwrap_or(-1))))
+            .filter_map(|e| {
+                Some((
+                    e["s"].as_str()?.to_string(),
+                    e["cpu"].as_i64().unwrap_or(-1),
+                ))
+            })
             .collect(),
     })
 }
@@ -857,7 +960,11 @@ fn poll_pool(key: &GroupKey) {
                 state.servers[i].cpu = Some(st.cpu);
                 for (name, cpu) in &st.pool {
                     if let Some((h, p)) = valid_server_name(name) {
-                        if let Some(s) = state.servers.iter_mut().find(|s| s.host == h && s.port == p) {
+                        if let Some(s) = state
+                            .servers
+                            .iter_mut()
+                            .find(|s| s.host == h && s.port == p)
+                        {
                             s.cpu = (*cpu >= 0).then_some(*cpu);
                         }
                     }
@@ -880,14 +987,24 @@ fn poll_pool(key: &GroupKey) {
         }
     }
     let total = state.servers.len();
-    let saved: Option<Vec<String>> = learned.then(|| state.servers.iter().map(Server::name).collect());
+    let saved: Option<Vec<String>> =
+        learned.then(|| state.servers.iter().map(Server::name).collect());
     // Servers that answer their status but failed a tunnel get one probe to
     // earn `tunnel_ok` back; nothing else sets it.
-    let retry: Vec<String> = state.servers.iter().filter(|s| s.ok && !s.tunnel_ok).map(Server::name).collect();
+    let retry: Vec<String> = state
+        .servers
+        .iter()
+        .filter(|s| s.ok && !s.tunnel_ok)
+        .map(Server::name)
+        .collect();
     drop(state);
 
     for (n, why) in failed {
-        crate::dns_forwarder::log_proxy(&format!("Прокси из группы #{}: статус: {}", n, scrub(&why)));
+        crate::dns_forwarder::log_proxy(&format!(
+            "Прокси из группы #{}: статус: {}",
+            n,
+            scrub(&why)
+        ));
     }
     if let Some(names) = saved {
         crate::dns_forwarder::log_proxy(&format!("Прокси из группы: серверов в пуле {}", total));
@@ -999,17 +1116,24 @@ mod tests {
             let addr2: SocketAddr = addr2.parse().unwrap();
             {
                 let mut st = group_state().lock().unwrap();
-                assert!(st.servers[0].ok && st.servers[0].cpu.is_some(), "status from #1");
+                assert!(
+                    st.servers[0].ok && st.servers[0].cpu.is_some(),
+                    "status from #1"
+                );
                 assert_eq!(st.servers.len(), 2, "peer learned from the status");
                 st.servers[1].addrs = Some((vec![addr2], Instant::now()));
             }
             poll_pool(&key);
             let st = group_state().lock().unwrap();
-            assert!(st.servers[1].ok && st.servers[1].cpu.is_some(), "status from #2");
+            assert!(
+                st.servers[1].ok && st.servers[1].cpu.is_some(),
+                "status from #2"
+            );
             drop(st);
             // A tunnel through #2 directly.
             let second = group_state().lock().unwrap().servers[1].name();
-            open_agu2(&key, &second, false, "daily-cloudcode-pa.googleapis.com").expect("tunnel via #2");
+            open_agu2(&key, &second, false, "daily-cloudcode-pa.googleapis.com")
+                .expect("tunnel via #2");
         }
 
         // A key derived for another PC's code is refused by the server.
@@ -1034,15 +1158,27 @@ mod tests {
             hits[choose(&cands, None, 0, k as f64 / 1000.0).unwrap()] += 1;
         }
         assert!(hits[1] > hits[2] && hits[2] > hits[0], "{:?}", hits);
-        assert!(hits[0] > 0, "a busier server still gets some clients: {:?}", hits);
-        assert!(hits[1] < 800, "not everyone piles onto the idle one: {:?}", hits);
+        assert!(
+            hits[0] > 0,
+            "a busier server still gets some clients: {:?}",
+            hits
+        );
+        assert!(
+            hits[1] < 800,
+            "not everyone piles onto the idle one: {:?}",
+            hits
+        );
     }
 
     #[test]
     fn open_tunnels_keep_the_current_server() {
         let cands = [c(true, Some(95)), c(true, Some(5))];
         assert_eq!(choose(&cands, Some(0), 3, 0.5), Some(0));
-        assert_eq!(choose(&cands, Some(0), 0, 0.5), Some(1), "free to move once idle");
+        assert_eq!(
+            choose(&cands, Some(0), 0, 0.5),
+            Some(1),
+            "free to move once idle"
+        );
     }
 
     #[test]
@@ -1071,8 +1207,19 @@ mod tests {
 
     #[test]
     fn only_plain_host_port_names_are_learned() {
-        assert_eq!(valid_server_name("AG2.Example.com:443"), Some(("ag2.example.com".into(), 443)));
-        for bad in ["ag2.example.com", "ag2.example.com:0", "a b:443", "-x.com:443", "x.com.:443", "x.com:99999", ":443"] {
+        assert_eq!(
+            valid_server_name("AG2.Example.com:443"),
+            Some(("ag2.example.com".into(), 443))
+        );
+        for bad in [
+            "ag2.example.com",
+            "ag2.example.com:0",
+            "a b:443",
+            "-x.com:443",
+            "x.com.:443",
+            "x.com:99999",
+            ":443",
+        ] {
             assert_eq!(valid_server_name(bad), None, "{}", bad);
         }
     }
