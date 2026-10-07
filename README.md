@@ -91,7 +91,16 @@ flowchart LR
 
 Анлокер прямо в терминале: для сервера по SSH, для систем без графической оболочки или для быстрого управления.
 
-**Linux / macOS** - в терминале:
+**macOS** - в терминале:
+```bash
+curl -fsSL https://raw.githubusercontent.com/Fuheshka/Antigravity-Unlocker/main/tui.sh | sh
+```
+*Если приложение уже установлено в `/Applications`:*
+```bash
+"/Applications/Antigravity Unlocker.app/Contents/MacOS/ag_unlocker" --tui
+```
+
+**Linux** - в терминале:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/confeden/Antigravity/main/tui.sh | sh
 ```
@@ -145,14 +154,26 @@ irm https://raw.githubusercontent.com/confeden/Antigravity/main/tui.ps1 | iex
 
 ## Быстрый старт на macOS
 
-### Вариант 1: Загрузка готового установщика .dmg (Рекомендуется)
+### Вариант 1: Установка через Homebrew (Рекомендуется)
+
+```bash
+brew install --cask fuheshka/tap/antigravity-unlocker
+```
+
+### Вариант 2: Загрузка готового установщика .dmg
 
 Скачайте готовый `.dmg` или `.zip` из раздела [Releases](https://github.com/Fuheshka/Antigravity-Unlocker/releases/latest):
 1. Откройте `Antigravity-Unlocker-macOS.dmg`.
 2. Перетащите `Antigravity Unlocker.app` в папку **«Программы»** (`/Applications`).
 3. Запустите приложение из Spotlight или Launchpad.
 
-### Вариант 2: Сборка и установка из исходников в 1 команду
+### Вариант 3: Терминальный TUI-режим в 1 команду
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Fuheshka/Antigravity-Unlocker/main/tui.sh | sh
+```
+
+### Вариант 4: Сборка и установка из исходников в 1 команду
 
 ```bash
 # Клонируйте репозиторий:
@@ -170,13 +191,13 @@ cd Antigravity-Unlocker
 4. Скопирует приложение в `/Applications` (или в `~/Applications`).
 5. Снимет флаги карантина macOS Gatekeeper.
 
-### Вариант 3: Запуск без установки в `/Applications`
+### Вариант 5: Запуск без установки в `/Applications`
 
 ```bash
 ./macos/launch.sh
 ```
 
-### Вариант 4: Сборка напрямую через Cargo
+### Вариант 6: Сборка напрямую через Cargo
 
 ```bash
 cargo build --release
@@ -265,6 +286,13 @@ cargo build --release
 
 # Создано с ❤️
 
-🙋 **Группа в Телеграм:** [@nova_txt](https://t.me/nova_txt) — вопросы, новости, поддержка.
+* **Оригинал и сетевой релей (Windows / Linux):**
+  - Автор: Brent ([@nova_txt](https://t.me/nova_txt))
+  - Официальный репозиторий: [confeden/Antigravity](https://github.com/confeden/Antigravity)
+  - ☕ **[Отблагодарить автора оригинала](https://nova-app.eu/donate)**
 
-☕ **[Отблагодарить](https://nova-app.eu/donate)** — если Анлокер оказался полезным. Это необязательный способ сказать "спасибо".
+* **macOS Edition (Apple Silicon arm64 & Intel x86_64):**
+  - Автор нативного порта: [@Fuheshka](https://github.com/Fuheshka) ([Antigravity-Unlocker](https://github.com/Fuheshka/Antigravity-Unlocker))
+  - Обратная связь: [Telegram @fuheshka](https://t.me/fuheshka) · [me@kuviko.ru](mailto:me@kuviko.ru)
+  - ☕ **[Отблагодарить](https://pay.cloudtips.ru/p/7adeaa28)** — сказать спасибо за нативный Mac-клиент (СБП, T-Pay, карты)
+  - 💎 **[Поддержать в TON](https://tonviewer.com/UQC-DsraaDQRjUjG9oPRkt5nGlMgxKY-pjMC6xeeYGfxiu9a)**

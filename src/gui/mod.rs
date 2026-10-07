@@ -390,6 +390,9 @@ fn first_screen() -> Screen {
 }
 
 fn title() -> String {
+    #[cfg(target_os = "macos")]
+    return format!("Antigravity Unlocker 2 v{} (macOS Edition)", update::current_version());
+    #[cfg(not(target_os = "macos"))]
     format!("Antigravity Unlocker 2 v{}", update::current_version())
 }
 

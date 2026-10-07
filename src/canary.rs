@@ -109,6 +109,17 @@ pub fn file_marker() -> String {
 /// Printed by `--about` / `--license`. Also the live reference that pins
 /// `NOTICE` and the canaries into the linked binary.
 pub fn about_banner() -> String {
+    #[cfg(target_os = "macos")]
+    return format!(
+        "{}\n\nversion: {} (macOS Edition)\nbuild:   {}\nmark:    {}\nauthor:  {} | macOS port: Fuheshka (github.com/Fuheshka)\norigin:  {} | macOS fork: https://github.com/Fuheshka/Antigravity-Unlocker",
+        NOTICE,
+        env!("CARGO_PKG_VERSION"),
+        RELEASE_TOKEN,
+        STATIC_CANARY,
+        AUTHOR,
+        ORIGIN
+    );
+    #[cfg(not(target_os = "macos"))]
     format!(
         "{}\n\nversion: {}\nbuild:   {}\nmark:    {}\nauthor:  {}\norigin:  {}",
         NOTICE,

@@ -69,6 +69,8 @@ cat > "$CONTENTS/Info.plist" << EOF
     <true/>
     <key>NSRequiresAquaSystemAppearance</key>
     <false/>
+    <key>NSHumanReadableCopyright</key>
+    <string>© 2026 Fuheshka. macOS Edition. Open Source.</string>
 </dict>
 </plist>
 EOF

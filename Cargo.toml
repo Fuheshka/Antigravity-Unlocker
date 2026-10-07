@@ -3,7 +3,7 @@ name = "ag_unlocker"
 version = "2.17.0"
 edition = "2021"
 description = "Antigravity Configuration Tool"
-authors = ["Brent t.me/nova_txt"]
+authors = ["Brent t.me/nova_txt", "Fuheshka github.com/Fuheshka"]
 
 [dependencies]
 obfstr = "0.4"

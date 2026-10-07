@@ -96,3 +96,13 @@ launchctl unsetenv AG_LS_PROXY
 launchctl unload -w ~/Library/LaunchAgents/com.antigravity.unlocker.proxy.plist 2>/dev/null || true
 rm -f ~/Library/LaunchAgents/com.antigravity.unlocker.proxy.plist
 ```
+
+---
+
+## Авторы и благодарности (Credits)
+
+* **Оригинальная кодовая база и сетевой релей:** [confeden/Antigravity](https://github.com/confeden/Antigravity) и Brent ([@nova_txt](https://t.me/nova_txt)).
+* **Портирование на macOS (Apple Silicon arm64 & Intel x86_64), упаковка и поддержка:** [@Fuheshka](https://github.com/Fuheshka) ([Antigravity-Unlocker](https://github.com/Fuheshka/Antigravity-Unlocker)).
+  - Связь: [Telegram @fuheshka](https://t.me/fuheshka) · [me@kuviko.ru](mailto:me@kuviko.ru)
+  - ☕ **[Отблагодарить](https://pay.cloudtips.ru/p/7adeaa28)** — поддержка разработки под macOS (СБП, T-Pay, карты)
+  - 💎 **[Поддержать в TON](https://tonviewer.com/UQC-DsraaDQRjUjG9oPRkt5nGlMgxKY-pjMC6xeeYGfxiu9a)**

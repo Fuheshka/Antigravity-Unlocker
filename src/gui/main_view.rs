@@ -800,6 +800,31 @@ fn footer(ui: &mut egui::Ui) {
                 .size(FOOTER_TEXT)
                 .color(theme::MUTED),
         );
+        #[cfg(target_os = "macos")]
+        {
+            ui.label(
+                egui::RichText::new("|")
+                    .size(FOOTER_TEXT)
+                    .color(theme::LINE),
+            );
+            if ui
+                .link(egui::RichText::new("Поддержать macOS ☕").size(FOOTER_TEXT))
+                .clicked()
+            {
+                crate::utils::open_url("https://pay.cloudtips.ru/p/7adeaa28");
+            }
+            ui.label(
+                egui::RichText::new("|")
+                    .size(FOOTER_TEXT)
+                    .color(theme::LINE),
+            );
+            if ui
+                .link(egui::RichText::new("by @Fuheshka").size(FOOTER_TEXT))
+                .clicked()
+            {
+                crate::utils::open_url("https://github.com/Fuheshka/Antigravity-Unlocker");
+            }
+        }
     });
 }
 

@@ -847,8 +847,13 @@ impl App {
     }
 
     fn title_line(&self) -> Line<'static> {
+        #[cfg(target_os = "macos")]
+        let title_str = format!(" Antigravity Unlocker 2 v{} (macOS Edition by @Fuheshka) ", update::current_version());
+        #[cfg(not(target_os = "macos"))]
+        let title_str = format!(" Antigravity Unlocker 2 v{} ", update::current_version());
+
         let mut spans = vec![Span::styled(
-            format!(" Antigravity Unlocker 2 v{} ", update::current_version()),
+            title_str,
             Style::new().add_modifier(Modifier::BOLD),
         )];
         if let Some(rel) = &self.update {
