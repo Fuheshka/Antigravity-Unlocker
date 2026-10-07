@@ -294,5 +294,3 @@ cargo build --release
 * **macOS Edition (Apple Silicon arm64 & Intel x86_64):**
   - Автор нативного порта: [@Fuheshka](https://github.com/Fuheshka) ([Antigravity-Unlocker](https://github.com/Fuheshka/Antigravity-Unlocker))
   - Обратная связь: [Telegram @fuheshka](https://t.me/fuheshka) · [me@kuviko.ru](mailto:me@kuviko.ru)
-  - ☕ **[Отблагодарить](https://pay.cloudtips.ru/p/7adeaa28)** — сказать спасибо за нативный Mac-клиент (СБП, T-Pay, карты)
-  - 💎 **[Поддержать в TON](https://tonviewer.com/UQC-DsraaDQRjUjG9oPRkt5nGlMgxKY-pjMC6xeeYGfxiu9a)**

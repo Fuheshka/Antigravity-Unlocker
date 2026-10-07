@@ -258,6 +258,14 @@ fn antigravity_card(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         bypass_master(app, ui);
 
+        // The group proxy is a way of its own: it can be the only one on, so the
+        // row is always there.
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(8.0);
+        cap_row(app, ui, Cap::GroupProxy);
+        group_proxy_field(app, ui);
+
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(8.0);
@@ -589,6 +597,60 @@ fn providers_list(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+fn group_proxy_field(app: &mut App, ui: &mut egui::Ui) {
+    let busy = app.is_busy();
+    ui.add_space(4.0);
+    widgets::hint(
+        ui,
+        "Для активации прокси из группы Nova — отправьте туда команду и вставьте \
+         полученный код в поле ниже.",
+    );
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui.button("Скопировать команду").clicked() {
+            let cmd = format!("/ag+{}", crate::hwid::pc_code());
+            crate::utils::set_clipboard_text(&cmd);
+            app.log.push((
+                Level::Info,
+                "Команда скопирована — отправьте её в группе.".to_string(),
+            ));
+        }
+        if ui.button("Открыть группу").clicked() {
+            crate::utils::open_url(GROUP_ROOM_URL);
+        }
+    });
+    ui.add_space(4.0);
+    let field = egui::TextEdit::singleline(&mut app.group_key_input)
+        .hint_text("код из группы")
+        .desired_width(ui.available_width());
+    let resp = ui
+        .add_enabled(!busy, field)
+        .on_hover_text("Правая кнопка мыши — вставить код из буфера");
+    // Right click pastes: egui's field has no context menu, and the code
+    // arrives on the clipboard from Telegram.
+    let mut right_pasted = false;
+    if resp.secondary_clicked() && !busy {
+        if let Some(clip) = crate::utils::clipboard_text() {
+            app.group_key_input = clip.trim().to_string();
+            right_pasted = true;
+        }
+    }
+    // The field shows the saved code. Sent when it holds a whole new code (a
+    // paste), or on Enter - and only when it differs from what was sent last.
+    let text = app.group_key_input.trim().to_string();
+    let pasted = (resp.changed() || right_pasted) && text.starts_with("agk1.") && text.len() > 40;
+    let entered =
+        resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !text.is_empty();
+    if (pasted || entered) && text != app.group_key_sent {
+        app.worker.send(Cmd::SetGroupKey(text.clone()));
+        app.group_key_input = text.clone();
+        app.group_key_sent = text;
+    }
+}
+
+/// The group's topic where the bot answers the command.
+const GROUP_ROOM_URL: &str = "https://t.me/nova_txt/69864";
+
 fn own_proxy_field(app: &mut App, ui: &mut egui::Ui) {
     let busy = app.is_busy();
     ui.horizontal(|ui| {
@@ -802,17 +864,6 @@ fn footer(ui: &mut egui::Ui) {
         );
         #[cfg(target_os = "macos")]
         {
-            ui.label(
-                egui::RichText::new("|")
-                    .size(FOOTER_TEXT)
-                    .color(theme::LINE),
-            );
-            if ui
-                .link(egui::RichText::new("Поддержать macOS ☕").size(FOOTER_TEXT))
-                .clicked()
-            {
-                crate::utils::open_url("https://pay.cloudtips.ru/p/7adeaa28");
-            }
             ui.label(
                 egui::RichText::new("|")
                     .size(FOOTER_TEXT)

@@ -93,6 +93,16 @@ mod windows_impl {
     /// the task is there and non-zero when it is not, and the task is registered
     /// in the root folder, so the bare name is the whole query.
     fn task_exists(task_name: &str) -> bool {
+        // The task's own file first: no process to spawn, so no timeout to
+        // misread. A `schtasks` that did not answer in time once read as "no
+        // task", and `ensure_installed` then killed a working relay to copy a
+        // file and never started it again (field report, 2.19.1).
+        let tasks = PathBuf::from(env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
+            .join("System32")
+            .join("Tasks");
+        if tasks.join(task_name).exists() {
+            return true;
+        }
         let mut cmd = Command::new("schtasks");
         cmd.args(["/Query", "/TN", task_name]);
         bounded_output(no_window(&mut cmd), HELPER_LIMIT).is_some_and(|o| o.status.success())
@@ -306,7 +316,12 @@ mod windows_impl {
     /// relay already wanted it is kept current the usual way; otherwise only the
     /// file is copied, and stamped so the copy does not read as an outdated relay.
     pub fn ensure_installed() -> Result<(), String> {
-        if is_enabled() {
+        // A running relay is the bypass, whatever the task query said: it is
+        // replaced and restarted by `ensure_running`, never killed for a copy.
+        // "Running" by its fresh record, not the image name: the watchdog runs
+        // the same exe, and auto-patch alone must not switch the bypass on.
+        let relay_alive = is_running() && crate::gate::read().is_some_and(|r| !r.is_stale());
+        if is_enabled() || relay_alive {
             return ensure_running();
         }
         if installed_copy_is_current() {

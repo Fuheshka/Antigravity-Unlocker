@@ -77,6 +77,11 @@ pub struct App {
     busy: Option<String>,
 
     own_proxy_input: String,
+    /// The group code field; sent once it holds something shaped like a code.
+    group_key_input: String,
+    /// The group code last handed to the worker, so the field (which shows the
+    /// saved code) sends only a code that is actually new.
+    group_key_sent: String,
     /// The provider list as the window is drawing it right now.
     ///
     /// Kept beside the worker's snapshot so a drag can reorder it on the spot.
@@ -127,7 +132,7 @@ impl App {
         // from here on — two writers each saving the whole thing meant whichever
         // saved last silently reverted the other.
         let settings = Settings::load();
-        let screen = first_screen();
+        let screen = first_screen(&settings);
         // A debug build told to skip the key never passes the licence screen,
         // which is where `Unlocked` is otherwise sent from.
         if matches!(screen, Screen::Main) {
@@ -153,6 +158,10 @@ impl App {
             log_all_selected: false,
             busy: None,
             own_proxy_input: settings.own_proxy.clone(),
+            // The saved code stays in the field across restarts and updates,
+            // where it can be seen and replaced.
+            group_key_input: settings.group_key.clone(),
+            group_key_sent: settings.group_key.clone(),
             providers_local: Vec::new(),
             providers_reordering: false,
             path_dialog: None,
@@ -381,9 +390,13 @@ fn without_source_location(msg: &str) -> &str {
 /// `AG_UNLOCKER_DEV_SKIP_KEY` set, so the main screen can be looked at while it
 /// is being worked on. Compiled out of every release build (`build_rust.py`
 /// builds release), so a shipped exe has no way past the key.
-fn first_screen() -> Screen {
+fn first_screen(settings: &Settings) -> Screen {
     #[cfg(debug_assertions)]
     if std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some() {
+        return Screen::Main;
+    }
+    // A key accepted before and still good for this version: no screen.
+    if crate::auth::verify_key(&settings.license_key) {
         return Screen::Main;
     }
     Screen::License

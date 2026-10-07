@@ -465,13 +465,13 @@ pub fn save_text_file(dir: &Path, name: &str, text: &str) -> Option<PathBuf> {
 pub fn reveal_in_explorer(path: &Path) {
     #[cfg(target_os = "windows")]
     {
-        // `/select,<path>` as one argument, and the comma is part of it.
-        // Explorer exits non-zero even when it worked, so the status is not
-        // asked for.
-        let mut arg = std::ffi::OsString::from("/select,");
-        arg.push(path.as_os_str());
+        // `/select,"<path>"` verbatim. `arg()` quotes the whole thing once the
+        // path has a space - `"/select,D:\Desktop\... отчёт.txt"` - which
+        // Explorer does not parse and answers by opening Documents. Explorer
+        // exits non-zero even when it worked, so the status is not asked for.
+        use std::os::windows::process::CommandExt;
         let mut cmd = Command::new("explorer.exe");
-        cmd.arg(arg);
+        cmd.raw_arg(format!("/select,\"{}\"", path.display()));
         no_window(&mut cmd).spawn().ok();
     }
     #[cfg(target_os = "macos")]

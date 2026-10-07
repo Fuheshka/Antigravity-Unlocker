@@ -204,10 +204,12 @@ impl Facts {
             admin: s.admin || !cfg!(target_os = "windows"),
             installs_found: s.installs.iter().any(|r| r.path.is_some()),
             patch_on: s.client_patch.is_on(),
-            bypass_on: s.dns.is_on(),
+            bypass_on: s.bypass_on(),
             relay_running: s.relay_running,
             relay_outdated: s.relay_outdated,
-            rules: s.rules || !cfg!(target_os = "windows"),
+            // Rules are only owed while the DNS switch is on: a route running alone
+            // (own proxy, group, exits) has none by design.
+            rules: s.rules || !s.dns.is_on() || !cfg!(target_os = "windows"),
             relay_reporting: relay.is_some(),
             refusal,
             answer,
@@ -245,8 +247,8 @@ pub fn provider_name(name: &str) -> String {
 /// The master switch of the bypass: what it is called and what it does.
 pub const BYPASS_TEXT: (&str, &str) = (
     "Снять ошибку 400 в чате с ИИ",
-    "«User location is not supported». Сам находит рабочий путь до серверов Google \
-     и переключается, если путь перестал работать — с VPN и без.",
+    "Сам находит рабочий путь до серверов Google и переключается, если путь \
+     перестал работать — с VPN и без.",
 );
 
 /// What a switch is called and what it does, in both front ends.
@@ -276,6 +278,10 @@ pub fn switch_text(cap: Cap) -> (&'static str, &'static str) {
             // Deliberately says what they are and never which they are: a
             // free service that gets named publicly stops being free (I46).
             "Запасной путь до серверов Google — через страну без ограничений.",
+        ),
+        Cap::GroupProxy => (
+            "Прокси из группы",
+            "Выделенный сервер группы: через него идут только запросы к моделям.",
         ),
         Cap::VerifyTls => (
             "Сверять TLS",
@@ -929,7 +935,12 @@ mod tests {
     fn blocker(what: &str, cause: &str, by: &str) -> crate::gate::Blocker {
         crate::gate::Blocker {
             what: what.into(),
-            addr: if what == "door" { "127.65.71.1:443" } else { "127.0.0.1:53129" }.into(),
+            addr: if what == "door" {
+                "127.65.71.1:443"
+            } else {
+                "127.0.0.1:53129"
+            }
+            .into(),
             cause: cause.into(),
             by: by.into(),
             error: "os error 10013".into(),
@@ -949,7 +960,11 @@ mod tests {
         let h = headline(&f);
         assert_eq!(h.tone, Tone::Action);
         assert_eq!(h.title, "Антивирус блокирует обход");
-        assert!(h.detail.contains(r"C:\ProgramData\AGUnlocker\ag_dns.exe"), "{}", h.detail);
+        assert!(
+            h.detail.contains(r"C:\ProgramData\AGUnlocker\ag_dns.exe"),
+            "{}",
+            h.detail
+        );
         assert!(h.detail.contains("53129"), "{}", h.detail);
         assert_eq!(h.action, Some(Action::Repair));
     }

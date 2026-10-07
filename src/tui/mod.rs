@@ -127,6 +127,10 @@ enum Row {
     Advanced,
     Provider(usize),
     OwnProxyText,
+    GroupProxyText,
+    GroupProxyOpenRoom,
+    GroupProxyCopy,
+    GroupProxyPaste,
     Report,
 }
 
@@ -190,7 +194,7 @@ impl App {
                 ));
             }
         }
-        let screen = first_screen();
+        let screen = first_screen(&crate::settings::Settings::load());
         if screen == Screen::Main {
             worker.send(Cmd::Unlocked);
         }
@@ -356,6 +360,7 @@ impl App {
             return;
         }
         if auth::verify_key(self.key.trim()) {
+            self.worker.send(Cmd::RememberLicense(self.key.trim().to_string()));
             self.screen = Screen::Main;
             self.worker.send(Cmd::Unlocked);
         } else {
@@ -538,6 +543,23 @@ impl App {
                         .send(Cmd::SetProvider(p.name.clone(), !p.enabled));
                 }
             }
+            Row::GroupProxyOpenRoom => {
+                crate::utils::open_url("https://t.me/nova_txt/69864");
+                self.toast("Открыто в браузере: https://t.me/nova_txt/69864");
+            }
+            Row::GroupProxyCopy => {
+                let cmd = format!("/ag+{}", crate::hwid::pc_code());
+                crate::utils::set_clipboard_text(&cmd);
+                self.toast(format!("Скопировано: {} — отправьте это сообщение в комнате", cmd));
+            }
+            Row::GroupProxyPaste => {
+                if let Some(text) = crate::utils::clipboard_text() {
+                    self.worker.send(Cmd::SetGroupKey(text));
+                } else {
+                    self.toast("Буфер обмена пуст");
+                }
+            }
+            Row::GroupProxyText => {}
             Row::OwnProxyText => {
                 self.input = Some(Input::OwnProxy {
                     text: self.own_proxy_text(),
@@ -686,6 +708,11 @@ impl App {
             }
             rows.push(Row::Cap(Cap::LocalProxy));
             rows.push(Row::Cap(Cap::BuiltinExits));
+            rows.push(Row::Cap(Cap::GroupProxy));
+            rows.push(Row::GroupProxyText);
+            rows.push(Row::GroupProxyOpenRoom);
+            rows.push(Row::GroupProxyCopy);
+            rows.push(Row::GroupProxyPaste);
             rows.push(Row::Cap(Cap::VerifyTls));
             rows.push(Row::Cap(Cap::OwnProxy));
             rows.push(Row::OwnProxyText);
@@ -718,6 +745,10 @@ impl App {
             }
             Row::Advanced => "Детали обхода: DNS-серверы, прокси, выходы.".into(),
             Row::Provider(_) => "Пробел — включить или выключить сервер, +/- — выше или ниже в списке.".into(),
+            Row::GroupProxyText => "Код этого ПК и состояние ключа.".into(),
+            Row::GroupProxyOpenRoom => "Открыть Telegram-комнату для получения ключа.".into(),
+            Row::GroupProxyCopy => "Скопировать команду для получения ключа.".into(),
+            Row::GroupProxyPaste => "Вставить полученный ключ из буфера обмена.".into(),
             Row::OwnProxyText => {
                 "Enter — изменить адрес: логин:пароль@адрес:порт (или адрес:порт без пароля).".into()
             }
@@ -804,6 +835,21 @@ impl App {
                 let name = format!("{}. {}", i + 1, status::provider_name(&p.name));
                 switch_line("      ", &name, &state, busy, width)
             }
+            Row::GroupProxyText => {
+                let pc = crate::hwid::pc_code();
+                let key_text = if crate::settings::group_key().is_empty() {
+                    "ключа нет"
+                } else {
+                    "ключ принят"
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw("      Код ПК: "),
+                    Span::styled(format!("{} - {}", pc, key_text), Style::new().fg(Color::Gray)),
+                ]))
+            }
+            Row::GroupProxyOpenRoom => ListItem::new(Line::from(vec![Span::styled("      > Открыть комнату группы", Style::new().fg(Color::Cyan))])),
+            Row::GroupProxyCopy => ListItem::new(Line::from(vec![Span::styled("      > Скопировать команду", Style::new().fg(Color::Cyan))])),
+            Row::GroupProxyPaste => ListItem::new(Line::from(vec![Span::styled("      > Вставить ключ из буфера", Style::new().fg(Color::Cyan))])),
             Row::OwnProxyText => {
                 let text = self.own_proxy_text();
                 let shown = if text.is_empty() {
@@ -1194,9 +1240,13 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
 
 /// The licence screen, always — except in a *debug* build started with
 /// `AG_UNLOCKER_DEV_SKIP_KEY`, as in the window.
-fn first_screen() -> Screen {
+fn first_screen(settings: &crate::settings::Settings) -> Screen {
     #[cfg(debug_assertions)]
     if std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some() {
+        return Screen::Main;
+    }
+    // A key accepted before and still good for this version: no screen.
+    if auth::verify_key(&settings.license_key) {
         return Screen::Main;
     }
     Screen::License

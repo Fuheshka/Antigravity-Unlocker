@@ -163,9 +163,9 @@ pub fn probe_exits() {}
 /// minimum and doubles to the maximum, so an active connection never sleeps and
 /// an idle one costs a wakeup every 50 ms.
 #[cfg_attr(not(relay), allow(dead_code))]
-const PUMP_MIN_SLEEP: Duration = Duration::from_millis(1);
+pub(crate) const PUMP_MIN_SLEEP: Duration = Duration::from_millis(1);
 #[cfg_attr(not(relay), allow(dead_code))]
-const PUMP_MAX_SLEEP: Duration = Duration::from_millis(50);
+pub(crate) const PUMP_MAX_SLEEP: Duration = Duration::from_millis(50);
 /// How long a freshly accepted socket may stay silent before it is dropped.
 /// Long, because a pooling client legitimately opens sockets before it has
 /// anything to send; bounded, so an abandoned one does not hold a thread.
@@ -177,7 +177,7 @@ const REQUEST_IDLE: Duration = Duration::from_secs(120);
 /// normalises line endings turns the escape into a bare newline, rustc accepts
 /// that without a word, and the result is a response no HTTP client will parse.
 /// `status_lines_are_crlf_terminated` is what stops that reaching a release.
-const RESP_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+pub const RESP_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 const RESP_BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\n\r\n";
 const RESP_NOT_ALLOWED: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\n\r\n";
 
@@ -642,6 +642,7 @@ fn vpn_usable() -> bool {
 pub fn route_usable(kind: routes::Kind, host: &str) -> bool {
     match kind {
         routes::Kind::Own => upstream::available(),
+        routes::Kind::Group => crate::settings::group_proxy_enabled() && crate::group::available(),
         // The window's switch, checked at the one place the route is offered
         // from. Off means the route is simply not usable, which the table
         // already knows how to deal with - it is the same answer an exit that
@@ -826,7 +827,7 @@ fn parse_connect(head: &str) -> Option<(String, u16)> {
 }
 
 #[cfg_attr(not(relay), allow(dead_code))]
-fn would_block(e: &io::Error) -> bool {
+pub(crate) fn would_block(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
@@ -1037,6 +1038,14 @@ fn try_relay_route(client: TcpStream, _host: &str, _port: u16) -> Result<(), Tcp
     Err(client)
 }
 
+fn try_group(client: TcpStream, host: &str, port: u16) -> Result<(), TcpStream> {
+    if port == 443 && is_gate_host(host) && crate::group::available() {
+        crate::group::tunnel(client, host, port)
+    } else {
+        Err(client)
+    }
+}
+
 /// Tries the built-in exits for a gate host, else hands the client straight back.
 /// The only place the private exits module is touched; a build from the public
 /// source has no such module and falls through to the relay and the DNS route.
@@ -1117,6 +1126,7 @@ fn serve_gate(client: TcpStream, host: &str, port: u16) {
         }
         let attempt = match kind {
             routes::Kind::Own => try_own_proxy(client, host, port),
+            routes::Kind::Group => try_group(client, host, port),
             routes::Kind::Exits => try_builtin_exit(client, host, port),
             routes::Kind::Relay => try_relay_route(client, host, port),
             routes::Kind::Direct => {

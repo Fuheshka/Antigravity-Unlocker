@@ -45,7 +45,7 @@ const PROBE_OPEN_BUDGET: Duration = Duration::from_secs(15);
 /// failure benched it, which is most of what a long "Authenticating" was.
 pub const LIVE_OPEN_BUDGET: Duration = Duration::from_secs(3);
 /// Longest a probe's own request may take once the tunnel is open.
-const PROBE_BUDGET: Duration = Duration::from_secs(20);
+pub(crate) const PROBE_BUDGET: Duration = Duration::from_secs(20);
 
 /// The host a probe asks for: the one the IDE actually uses, so a probe measures
 /// the path a request will take rather than a neighbouring one.
@@ -176,17 +176,18 @@ impl Route {
         // Timed as a whole - reaching the proxy, its CONNECT, the TLS to Google
         // inside it and the answer - because that is what a request through it
         // costs, and the route table ranks routes by exactly that (routes.rs).
+        self.probe_with(|| probe(up))
+    }
+
+    pub(crate) fn probe_with(&self, probe_fn: impl FnOnce() -> Result<(), String>) {
         let started = Instant::now();
-        match probe(up) {
+        match probe_fn() {
             Ok(()) => {
                 crate::routes::record(self.kind, started.elapsed());
                 self.health.revive("проверка прошла");
             }
             Err(why) => {
                 crate::dns_forwarder::log_proxy(&format!("{} не отвечает: {}", self.label, why));
-                // One built-in exit failing says nothing about the pool's speed -
-                // its own bench takes it out of rotation; the row stays as the
-                // other exits measured it.
                 if self.kind != crate::routes::Kind::Exits {
                     crate::routes::record_failure(self.kind);
                 }

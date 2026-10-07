@@ -159,12 +159,28 @@ fn main() {
         bake_secret("exits_gen.rs", "EXITS", &cleaned);
     }
 
+    println!("cargo:rerun-if-changed=.group");
+    let group = if Path::new(".group").exists() {
+        let list = fs::read_to_string(".group").expect("read .group");
+        let cleaned = list
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        bake_secret("group_gen.rs", "GROUP", &cleaned);
+        !cleaned.is_empty()
+    } else {
+        bake_secret("group_gen.rs", "GROUP", "");
+        false
+    };
+
     // Which private routes this build actually got. Printed because the failure
     // mode is silent: a release built with one of the files missing works fine
     // and is simply slower, which is exactly the kind of thing that ships.
     println!(
-        "cargo:warning=private routes: relay={} exits={}",
-        relay, exits
+        "cargo:warning=private routes: relay={} exits={} group={}",
+        relay, exits, group
     );
 
     #[cfg(windows)]

@@ -32,6 +32,8 @@ mod gate;
 mod gui;
 mod health;
 mod hosts_pin;
+mod hwid;
+mod group_key;
 mod loopback;
 mod ls_log;
 mod net;
@@ -46,6 +48,7 @@ mod settings;
 mod tui;
 mod update;
 mod upstream;
+pub mod group;
 mod utils;
 mod watchdog;
 
