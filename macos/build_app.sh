@@ -12,6 +12,12 @@ if grep -q 'VERSION = "' "$DIR/build_rust.py" 2>/dev/null; then
 else
     VERSION=$(grep '^version =' "$DIR/Cargo.toml" | head -n1 | cut -d '"' -f2)
 fi
+# Ревизия форка (macos/FORK_REV) попадает в AG_FULL_VERSION и совпадает с тегом
+# релиза vX.Y.Z-macos.N: по ней приложение сравнивает себя с релизами форка.
+BASE_VERSION="$VERSION"
+if [ -f "$DIR/macos/FORK_REV" ]; then
+    VERSION="$BASE_VERSION-macos.$(tr -d '[:space:]' < "$DIR/macos/FORK_REV")"
+fi
 export AG_FULL_VERSION="$VERSION"
 echo "==> Версия приложения: $VERSION (AG_FULL_VERSION=$AG_FULL_VERSION)"
 
@@ -54,9 +60,9 @@ cat > "$CONTENTS/Info.plist" << EOF
     <key>CFBundleIdentifier</key>
     <string>com.antigravity.unlocker</string>
     <key>CFBundleVersion</key>
-    <string>$VERSION</string>
+    <string>$BASE_VERSION</string>
     <key>CFBundleShortVersionString</key>
-    <string>$VERSION</string>
+    <string>$BASE_VERSION</string>
     <key>CFBundleExecutable</key>
     <string>ag_unlocker</string>
     <key>CFBundleIconFile</key>

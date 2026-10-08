@@ -15,9 +15,9 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
 use serde::{Deserialize, Serialize};
 
-pub const RELEASES_LATEST_URL: &str = "https://github.com/confeden/Antigravity/releases/latest";
+pub const RELEASES_LATEST_URL: &str = "https://github.com/Fuheshka/Antigravity-Unlocker/releases/latest";
 const API_HOST: &str = "api.github.com";
-const API_PATH: &str = "/repos/confeden/Antigravity/releases/latest";
+const API_PATH: &str = "/repos/Fuheshka/Antigravity-Unlocker/releases/latest";
 const CHECK_INTERVAL: Duration = Duration::from_secs(8 * 60 * 60);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -382,6 +382,14 @@ mod tests {
         assert!(!is_newer_version("v2.11.0", "2.11.0"));
         assert!(!is_newer_version("2.11.0_1", "2.11.0_4"));
         assert!(!is_newer_version("2.10.0", "2.11.0"));
+    }
+
+    #[test]
+    fn test_fork_revision_comparison() {
+        assert!(is_newer_version("v2.19.1-macos.2", "2.19.1-macos.1"));
+        assert!(is_newer_version("v2.19.2-macos.1", "2.19.1-macos.3"));
+        assert!(!is_newer_version("v2.19.1-macos.1", "2.19.1-macos.1"));
+        assert!(!is_newer_version("v2.19.1-macos.1", "2.19.1-macos.2"));
     }
 
     #[test]
