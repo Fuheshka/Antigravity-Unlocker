@@ -1681,9 +1681,11 @@ mod tests {
         record(Kind::Direct, ms(300));
         record_failure(Kind::Direct);
         assert_eq!(latency(Kind::Direct), None);
-        let after_loss = order(|_| true);
+        // With the DNS layer, as on Windows: without it (Linux) Direct is last
+        // whatever happened to it, and the test could not tell the two apart.
+        let after_loss = order_with(&snapshot(), true, |_| true);
         probe_failed(Kind::Direct);
-        let after_probe = order(|_| true);
+        let after_probe = order_with(&snapshot(), true, |_| true);
         assert!(
             after_probe.last() == Some(&Kind::Direct) && after_loss.last() != Some(&Kind::Direct),
             "{after_loss:?} then {after_probe:?}"

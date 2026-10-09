@@ -1569,6 +1569,8 @@ mod tests {
     /// P26: a port another program listens on is left at once - no fifteen
     /// seconds of retries for a holder that will not leave - and the proxy
     /// takes the next one, which becomes the port everything names.
+    /// Windows only: on Linux the proxy never moves (`another_port_helps`).
+    #[cfg(windows)]
     #[test]
     fn a_held_port_moves_the_proxy_to_the_next_one_at_once() {
         let holder = TcpListener::bind("127.0.0.1:0").unwrap();
