@@ -127,7 +127,16 @@ pub struct Facts {
     /// The newest time Google asked for the account to be verified: how long
     /// ago, and the page it gave. `headline` decides whether it still stands.
     pub verify: Option<(Duration, String)>,
+    /// The newest 503 "no capacity" in the last ten minutes: how long ago, and
+    /// the model it named (empty if none).
+    pub overloaded: Option<(Duration, String)>,
+    /// The newest 401 in the last ten minutes: how long ago, and how many.
+    pub unauthorized: Option<(Duration, usize)>,
 }
+
+/// One 401 can be a token refreshed a moment late; a credential Google stopped
+/// accepting fails every call, hundreds of times (G11).
+const UNAUTH_LINES: usize = 2;
 
 /// How long a verification demand stays on the card with no answer after it.
 /// The page carries a one-time token; past this the client has usually asked
@@ -222,6 +231,8 @@ impl Facts {
             net_ok: gate.net_ok,
             relay_exe: relay.map(|r| r.exe.clone()).unwrap_or_default(),
             verify: gate.verify.as_ref().map(|v| (aged(v.ago), v.url.clone())),
+            overloaded: gate.overloaded.as_ref().map(|o| (aged(o.ago), o.model.clone())),
+            unauthorized: gate.unauthorized.map(|u| (aged(u.ago), u.count)),
         }
     }
 }
@@ -447,6 +458,50 @@ pub fn headline(f: &Facts) -> Headline {
                 ago_text(*ago)
             ),
             action: Some(Action::Verify),
+        };
+    }
+
+    // Google errors the bypass cannot fix and must not be blamed for: both mean
+    // the request got past the gate. Only while nothing has answered since.
+    let unanswered = |ago: Duration| f.answer.is_none_or(|a| a > ago);
+    let unauthorized = f
+        .unauthorized
+        .filter(|(ago, n)| *ago <= crate::gate::RECENT && *n >= UNAUTH_LINES && unanswered(*ago));
+    if let Some((ago, _)) = unauthorized {
+        return Headline {
+            tone: Tone::Action,
+            title: "Antigravity нужно перезайти в аккаунт".into(),
+            detail: format!(
+                "Google отвечает ошибкой 401 — {}: учётные данные Antigravity перестали \
+                 совпадать. Выйдите из аккаунта в Antigravity и войдите заново. Обход эту \
+                 ошибку не исправит.",
+                ago_text(ago)
+            ),
+            action: None,
+        };
+    }
+    // A refusal newer than the 503 is the news; the 503 was an earlier turn.
+    let overloaded = f.overloaded.as_ref().filter(|(ago, _)| {
+        *ago <= crate::gate::RECENT
+            && unanswered(*ago)
+            && f.refusal.is_none_or(|(r, _)| r > *ago)
+    });
+    if let Some((ago, model)) = overloaded {
+        let which = if model.is_empty() {
+            String::new()
+        } else {
+            format!(" для модели «{model}»")
+        };
+        return Headline {
+            tone: Tone::Action,
+            title: "Серверы Google перегружены".into(),
+            detail: format!(
+                "Google отвечает ошибкой 503 — {}: нет свободных мощностей{which}. Обход тут ни \
+                 при чём — запрос до Google дошёл. Рекомендуется выбрать в Antigravity другую \
+                 модель или повторить позже.",
+                ago_text(*ago)
+            ),
+            action: None,
         };
     }
 
@@ -1058,5 +1113,60 @@ mod tests {
             ..working()
         };
         assert_ne!(headline(&stale).action, Some(Action::Verify));
+    }
+
+    /// A 503 is Google out of capacity, not the bypass: the card says to pick
+    /// another model, and lets go once a model answers or a 400 comes after it.
+    #[test]
+    fn a_503_asks_for_another_model_until_an_answer_follows() {
+        let busy = Facts {
+            overloaded: Some((secs(60), "gemini-3.8-flash-high".into())),
+            answer: Some(secs(900)),
+            ..working()
+        };
+        let h = headline(&busy);
+        assert_eq!(h.title, "Серверы Google перегружены");
+        assert!(h.detail.contains("gemini-3.8-flash-high"), "{}", h.detail);
+        assert!(h.detail.contains("другую"), "{}", h.detail);
+
+        let answered = Facts {
+            overloaded: Some((secs(60), String::new())),
+            answer: Some(secs(10)),
+            ..working()
+        };
+        assert_ne!(headline(&answered).title, "Серверы Google перегружены");
+
+        let refused_after = Facts {
+            overloaded: Some((secs(300), String::new())),
+            refusal: Some((secs(30), 4)),
+            ..working()
+        };
+        assert_ne!(headline(&refused_after).title, "Серверы Google перегружены");
+    }
+
+    /// A 401 that keeps coming is a credential Google no longer accepts: the
+    /// card asks for a re-login; a single one is a token refreshed late.
+    #[test]
+    fn repeated_401_asks_to_sign_in_again() {
+        let bad = Facts {
+            unauthorized: Some((secs(30), 12)),
+            ..working()
+        };
+        let h = headline(&bad);
+        assert_eq!(h.title, "Antigravity нужно перезайти в аккаунт");
+        assert!(h.detail.contains("Выйдите"), "{}", h.detail);
+
+        let once = Facts {
+            unauthorized: Some((secs(30), 1)),
+            ..working()
+        };
+        assert_ne!(headline(&once).title, h.title);
+
+        let answered = Facts {
+            unauthorized: Some((secs(30), 12)),
+            answer: Some(secs(5)),
+            ..working()
+        };
+        assert_ne!(headline(&answered).title, h.title);
     }
 }

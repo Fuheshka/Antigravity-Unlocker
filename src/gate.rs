@@ -392,6 +392,10 @@ pub struct View {
     pub refused_long: Option<crate::ls_log::Sighting>,
     /// Google asking the account to verify itself, with the page to do it on.
     pub verify: Option<crate::ls_log::Verification>,
+    /// Google out of capacity for the chosen model (503), inside `RECENT`.
+    pub overloaded: Option<crate::ls_log::Overload>,
+    /// The account's credentials refused (401), inside `RECENT`.
+    pub unauthorized: Option<crate::ls_log::Sighting>,
     /// The relay's record, or `None` when there is none or it has gone stale.
     pub relay: Option<Report>,
     /// Whether this window reaches the internet, asked only while the relay is
@@ -478,6 +482,8 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
     let mut answered: Option<(crate::ls_log::Sighting, Instant)> = None;
     let mut refused_long: Option<(crate::ls_log::Sighting, Instant)> = None;
     let mut verify: Option<(crate::ls_log::Verification, Instant)> = None;
+    let mut overloaded: Option<(crate::ls_log::Overload, Instant)> = None;
+    let mut unauthorized: Option<(crate::ls_log::Sighting, Instant)> = None;
     // The first tick scans whatever is already there: a user who hits the gate
     // and *then* opens this window is the case this whole path exists for.
     let mut scan = true;
@@ -520,6 +526,8 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
             answered = h.answered.map(|s| (s, at)).or(answered);
             refused_long = h.refused.map(|s| (s, at)).or(refused_long);
             verify = h.verify.map(|v| (v, at)).or(verify);
+            overloaded = h.overloaded.map(|o| (o, at)).or(overloaded);
+            unauthorized = h.unauthorized.map(|s| (s, at)).or(unauthorized);
         }
 
         let view = View {
@@ -545,6 +553,14 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
                     ago,
                     url: v.url.clone(),
                 })
+            }),
+            overloaded: overloaded.as_ref().and_then(|(o, at)| {
+                let ago = o.ago + at.elapsed();
+                (ago <= RECENT).then(|| crate::ls_log::Overload { ago, ..o.clone() })
+            }),
+            unauthorized: unauthorized.and_then(|(s, at)| {
+                let ago = s.ago + at.elapsed();
+                (ago <= RECENT).then_some(crate::ls_log::Sighting { ago, ..s })
             }),
             relay: read().filter(|r| !r.is_stale()),
             net_ok: None,
@@ -616,10 +632,16 @@ fn worth_sending(fresh: &View, shown: &View) -> bool {
         (Some(a), Some(b)) => a.url != b.url || a.ago < b.ago,
         (a, b) => a.is_some() != b.is_some(),
     };
+    let overload_changed = match (&fresh.overloaded, &shown.overloaded) {
+        (Some(a), Some(b)) => a.count != b.count || a.ago < b.ago || a.model != b.model,
+        (a, b) => a.is_some() != b.is_some(),
+    };
     newer(fresh.seen, shown.seen)
         || newer(fresh.answered, shown.answered)
         || newer(fresh.refused_long, shown.refused_long)
+        || newer(fresh.unauthorized, shown.unauthorized)
         || verify_changed
+        || overload_changed
 }
 
 #[cfg(test)]
@@ -643,6 +665,8 @@ mod tests {
             answered: None,
             refused_long: None,
             verify: None,
+            overloaded: None,
+            unauthorized: None,
             relay: None,
             net_ok: None,
         };
@@ -736,6 +760,8 @@ mod tests {
             answered: None,
             refused_long: None,
             verify: None,
+            overloaded: None,
+            unauthorized: None,
             relay: Some(base),
             net_ok: None,
         };
