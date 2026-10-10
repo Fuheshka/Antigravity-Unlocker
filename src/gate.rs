@@ -396,6 +396,8 @@ pub struct View {
     pub overloaded: Option<crate::ls_log::Overload>,
     /// The account's credentials refused (401), inside `RECENT`.
     pub unauthorized: Option<crate::ls_log::Sighting>,
+    /// Google-side failures (503/429/500) over the answers' horizon, for the report.
+    pub server_errors: Option<crate::ls_log::Sighting>,
     /// The relay's record, or `None` when there is none or it has gone stale.
     pub relay: Option<Report>,
     /// Whether this window reaches the internet, asked only while the relay is
@@ -483,6 +485,7 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
     let mut refused_long: Option<(crate::ls_log::Sighting, Instant)> = None;
     let mut verify: Option<(crate::ls_log::Verification, Instant)> = None;
     let mut overloaded: Option<(crate::ls_log::Overload, Instant)> = None;
+    let mut server_errors: Option<(crate::ls_log::Sighting, Instant)> = None;
     let mut unauthorized: Option<(crate::ls_log::Sighting, Instant)> = None;
     // The first tick scans whatever is already there: a user who hits the gate
     // and *then* opens this window is the case this whole path exists for.
@@ -528,6 +531,7 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
             verify = h.verify.map(|v| (v, at)).or(verify);
             overloaded = h.overloaded.map(|o| (o, at)).or(overloaded);
             unauthorized = h.unauthorized.map(|s| (s, at)).or(unauthorized);
+            server_errors = h.server_errors.map(|s| (s, at)).or(server_errors);
         }
 
         let view = View {
@@ -561,6 +565,10 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
             unauthorized: unauthorized.and_then(|(s, at)| {
                 let ago = s.ago + at.elapsed();
                 (ago <= RECENT).then_some(crate::ls_log::Sighting { ago, ..s })
+            }),
+            server_errors: server_errors.and_then(|(s, at)| {
+                let ago = s.ago + at.elapsed();
+                (ago <= ANSWER_RECENT).then_some(crate::ls_log::Sighting { ago, ..s })
             }),
             relay: read().filter(|r| !r.is_stale()),
             net_ok: None,
@@ -666,6 +674,7 @@ mod tests {
             refused_long: None,
             verify: None,
             overloaded: None,
+            server_errors: None,
             unauthorized: None,
             relay: None,
             net_ok: None,
@@ -761,6 +770,7 @@ mod tests {
             refused_long: None,
             verify: None,
             overloaded: None,
+            server_errors: None,
             unauthorized: None,
             relay: Some(base),
             net_ok: None,

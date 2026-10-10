@@ -947,6 +947,17 @@ fn silence(kind: Kind, streaming: bool) -> Option<Duration> {
     Some(bench)
 }
 
+/// The client's log says a generation request died under its connection (EOF)
+/// again and again with no answer between: the route said `200`, completed the
+/// handshake and then closed on the request, which neither the probe nor the
+/// silent-tunnel check can see. Same bench and same protections as `silence` -
+/// not while an answer streams through it, not within `PROOF_PROTECTS_FOR` of
+/// one - because one EOF is a connection reaped and the retry belongs on the
+/// same route. Returns the bench, `None` when nothing was done.
+pub fn bench_dropping(kind: Kind) -> Option<Duration> {
+    silence(kind, live_answer(kind).is_some())
+}
+
 /// Notes that a gate tunnel was just opened on `kind`. Called where the `200`
 /// goes out, i.e. once the route is the one the client is actually on.
 pub fn note_used(kind: Kind) {

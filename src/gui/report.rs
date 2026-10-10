@@ -77,6 +77,14 @@ pub fn build(status: Option<&Status>, view: &View) -> String {
             o.count
         );
     }
+    if let Some(e) = &view.server_errors {
+        let _ = writeln!(
+            out,
+            "Ошибки на стороне Google (503/429/500) за 12 ч: {}, последняя {}",
+            e.count,
+            super::status::ago_text(e.ago)
+        );
+    }
     if let Some(u) = &view.unauthorized {
         let _ = writeln!(
             out,
