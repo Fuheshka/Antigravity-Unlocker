@@ -3,6 +3,7 @@
 //! No region probe because the server refuses trace hosts (cloudflare etc.) by design;
 //! its region is known to be correct.
 
+use std::cell::Cell;
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -437,13 +438,23 @@ fn server_addrs(server: &str, force_refresh: bool) -> Result<(String, Vec<Socket
     Ok((host, resolved))
 }
 
+thread_local! {
+    /// Milliseconds the last `open_agu2` on this thread spent: name lookup,
+    /// TCP connect, and TLS + CONNECT up to the server's `200`. Read by the
+    /// probe so its log line says where the time went (numbers only, I46).
+    static STAGES: Cell<[u64; 3]> = const { Cell::new([0; 3]) };
+}
+
 /// TCP + TLS (ALPN agu/2) to one pool server, within `budget`.
 fn open_tls(
     server: &str,
     force_refresh: bool,
     budget: Duration,
 ) -> Result<(ClientConnection, TcpStream), String> {
+    let t_dns = Instant::now();
     let (host, addrs) = server_addrs(server, force_refresh)?;
+    let dns_ms = t_dns.elapsed().as_millis() as u64;
+    let t_tcp = Instant::now();
     let deadline = Instant::now() + budget;
 
     let mut sock = None;
@@ -460,6 +471,7 @@ fn open_tls(
     let sock = sock.ok_or_else(|| "не удалось подключиться".to_string())?;
     sock.set_read_timeout(Some(budget)).ok();
     sock.set_write_timeout(Some(budget)).ok();
+    STAGES.with(|c| c.set([dns_ms, t_tcp.elapsed().as_millis() as u64, 0]));
     let name = ServerName::try_from(host).map_err(|_| "недопустимое имя сервера".to_string())?;
     let tls = ClientConnection::new(agu2_config(), name).map_err(|e| e.to_string())?;
     Ok((tls, sock))
@@ -498,6 +510,7 @@ fn open_agu2(
         target_host, target_host, auth_header
     );
 
+    let t_connect = Instant::now();
     let mut stream = rustls::Stream::new(&mut tls, &mut sock);
     stream
         .write_all(req.as_bytes())
@@ -532,6 +545,11 @@ fn open_agu2(
         return Err(format!("сервер группы отказал: {}", status));
     }
 
+    STAGES.with(|c| {
+        let mut v = c.get();
+        v[2] = t_connect.elapsed().as_millis() as u64;
+        c.set(v);
+    });
     sock.set_read_timeout(None).ok();
     sock.set_write_timeout(None).ok();
 
@@ -1043,7 +1061,10 @@ fn probe_via(key: &GroupKey, server: &str, force_refresh: bool) -> Result<(), St
         );
         let mut buf = [0u8; 64];
 
+        let t_all = Instant::now();
         let (outer_tls, outer_sock, leftover) = open_agu2(key, server, force_refresh, target)?;
+        let outer_ms = t_all.elapsed().as_millis() as u64;
+        let [dns_ms, tcp_ms, connect_ms] = STAGES.with(|c| c.get());
         outer_sock.set_read_timeout(Some(budget)).ok();
         outer_sock.set_write_timeout(Some(budget)).ok();
 
@@ -1059,6 +1080,19 @@ fn probe_via(key: &GroupKey, server: &str, force_refresh: bool) -> Result<(), St
             .map_err(|e| e.to_string())?;
         let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
         if n > 0 && buf.starts_with(b"HTTP/") {
+            let total = t_all.elapsed().as_millis() as u64;
+            // The system resolver timed apart from the probe, for comparison.
+            let t_sys = Instant::now();
+            let _ = server.to_socket_addrs();
+            crate::dns_forwarder::log_proxy(&format!(
+                "замер группы: всего {} мс = имя {} + TCP {} + TLS/CONNECT {} + внутренний TLS и ответ {}; системный DNS для сервера {} мс",
+                total,
+                dns_ms,
+                tcp_ms,
+                connect_ms,
+                total.saturating_sub(outer_ms),
+                t_sys.elapsed().as_millis()
+            ));
             Ok(())
         } else {
             Err("ответ не похож на HTTP".to_string())

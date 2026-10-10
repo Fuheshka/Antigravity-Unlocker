@@ -64,6 +64,27 @@ pub fn build(status: Option<&Status>, view: &View) -> String {
             let _ = writeln!(out, "Ошибок 400 за 12 ч в логах нет.");
         }
     }
+    if let Some(o) = &view.overloaded {
+        let model = if o.model.is_empty() {
+            String::new()
+        } else {
+            format!(", модель {}", o.model)
+        };
+        let _ = writeln!(
+            out,
+            "Ошибка 503 (нет мощностей у Google{model}): {}, строк за 10 мин: {}",
+            super::status::ago_text(o.ago),
+            o.count
+        );
+    }
+    if let Some(u) = &view.unauthorized {
+        let _ = writeln!(
+            out,
+            "Ошибка 401 (учётные данные не приняты): {}, строк за 10 мин: {}",
+            super::status::ago_text(u.ago),
+            u.count
+        );
+    }
     // When, and on which host - never the link: it carries a one-time token,
     // and the report is made to be sent to someone else.
     if let Some(v) = &view.verify {

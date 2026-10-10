@@ -51,6 +51,18 @@ const REGION_400: &str = "user location is not supported";
 const ANSWER_CALL: &str = "streamgeneratecontent";
 const ANSWER_ID: &str = "responseid:";
 
+/// Google had no capacity for the model the user picked: `UNAVAILABLE (code
+/// 503): No capacity available for model <name> on the server`, logged by the
+/// language server on every retry of the turn. Not the gate and not the route -
+/// the request got past both - so the only thing that helps is another model.
+const OVERLOAD_503: &str = "unavailable (code 503)";
+const OVERLOAD_MODEL: &[u8] = b"for model ";
+
+/// The account's credentials stopped being accepted: `UNAUTHENTICATED (code
+/// 401): Request had invalid authentication credentials` on every call (G11).
+/// A re-login is the fix; no route changes it.
+const UNAUTH_401: &str = "unauthenticated (code 401)";
+
 /// Longest slice of appended log read in one pass. Anything beyond it is a log
 /// that grew by megabytes between two passes, which is not a session anyone is
 /// working in; the tail is what carries the news.
@@ -455,6 +467,33 @@ pub struct History {
     pub answered: Option<Sighting>,
     /// The newest account-verification demand inside `horizon`.
     pub verify: Option<Verification>,
+    /// Google out of capacity for the chosen model (503) inside `recent`.
+    pub overloaded: Option<Overload>,
+    /// The account's credentials refused (401) inside `recent`.
+    pub unauthorized: Option<Sighting>,
+}
+
+/// The newest 503 "no capacity" a client log carries, and for which model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Overload {
+    pub ago: Duration,
+    pub count: usize,
+    /// The model named in the newest line; empty when the line names none.
+    pub model: String,
+}
+
+/// The model a 503 line names (`… for model <name> on the server`).
+fn overload_model(line: &[u8]) -> String {
+    let lower = line.to_ascii_lowercase();
+    let Some(at) = find(&lower, OVERLOAD_MODEL) else {
+        return String::new();
+    };
+    let rest = &line[at + OVERLOAD_MODEL.len()..];
+    let end = rest
+        .iter()
+        .position(|&c| !(c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.')))
+        .unwrap_or(rest.len());
+    String::from_utf8_lossy(&rest[..end]).into_owned()
 }
 
 /// `newest_refusal` and `newest_answer` over two windows, from a single pass:
@@ -481,7 +520,9 @@ pub fn history(paths: &[PathBuf], recent: Duration, horizon: Duration) -> Histor
         for line in text.lines() {
             let refusals = count_refusals(line.as_bytes());
             let answered = is_answer(line.as_bytes());
-            if refusals == 0 && !answered {
+            let overloaded = contains_ci(line.as_bytes(), OVERLOAD_503.as_bytes());
+            let unauthorized = contains_ci(line.as_bytes(), UNAUTH_401.as_bytes());
+            if refusals == 0 && !answered && !overloaded && !unauthorized {
                 continue;
             }
             let Some(ago) = parse_stamp(line).and_then(|at| age_secs(at, now)) else {
@@ -490,6 +531,25 @@ pub fn history(paths: &[PathBuf], recent: Duration, horizon: Duration) -> Histor
             let ago = Duration::from_secs(ago as u64);
             if ago > horizon {
                 continue;
+            }
+            if overloaded && ago <= recent {
+                let newest = out.overloaded.as_ref().is_none_or(|o| ago <= o.ago);
+                let o = out.overloaded.get_or_insert(Overload {
+                    ago,
+                    count: 0,
+                    model: String::new(),
+                });
+                o.count += 1;
+                if newest {
+                    o.ago = ago;
+                    let model = overload_model(line.as_bytes());
+                    if !model.is_empty() {
+                        o.model = model;
+                    }
+                }
+            }
+            if unauthorized && ago <= recent {
+                bump(&mut out.unauthorized, ago, 1);
             }
             if refusals > 0 {
                 bump(&mut out.refused, ago, refusals);
@@ -1329,5 +1389,54 @@ mod tests {
         assert_eq!(verify_in(unstamped), None);
         let old = "E0925 09:00:00.000000 1 x.go:1] {\"reason\": \"VALIDATION_REQUIRED\", \"validation_url\": \"https://accounts.google.com/x\"}\n";
         assert_eq!(verify_in(old), None);
+    }
+
+    /// A 503 and a 401 are read out with the newest 503's model, and only
+    /// inside the recent window.
+    #[test]
+    fn history_reads_overload_and_unauthorized() {
+        let Some(now) = crate::utils::local_clock() else {
+            return;
+        };
+        if now.second_of_day < 3600 {
+            return;
+        }
+        let stamp = |back: u32| {
+            let sod = now.second_of_day - back;
+            format!(
+                "ERROR: logging before google.Init: I{:02}{:02} {:02}:{:02}:{:02}.368290    4601 run.go:395] ",
+                now.month,
+                now.day,
+                sod / 3600,
+                (sod / 60) % 60,
+                sod % 60
+            )
+        };
+        let path = temp_log("overload");
+        let busy = |m: &str| format!("Run: attempt 1 failed (UNAVAILABLE (code 503): No capacity available for model {m} on the server), retrying in 4s\n");
+        append(&path, &format!("{}{}", stamp(1500), busy("old-model")));
+        append(&path, &format!("{}{}", stamp(200), busy("gemini-3.6-flash-high")));
+        append(&path, &format!("{}{}", stamp(100), busy("gemini-3.8-flash-high")));
+        append(&path, &format!("{}UNAUTHENTICATED (code 401): Request had invalid authentication credentials.\n", stamp(50)));
+        append(&path, &format!("{}UNAUTHENTICATED (code 401): Request had invalid authentication credentials.\n", stamp(40)));
+
+        let h = history(std::slice::from_ref(&path), Duration::from_secs(600), Duration::from_secs(3600));
+        let o = h.overloaded.expect("two 503s inside the window");
+        assert_eq!(o.count, 2, "the 25-minute-old one is outside it");
+        assert_eq!(o.model, "gemini-3.8-flash-high");
+        assert!((95..=115).contains(&o.ago.as_secs()), "{:?}", o.ago);
+        let u = h.unauthorized.expect("two 401s");
+        assert_eq!(u.count, 2);
+        assert!(h.refused.is_none() && h.answered.is_none());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn overload_model_is_read_up_to_the_name_end() {
+        assert_eq!(
+            overload_model(b"(UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-low on the server"),
+            "gemini-3.8-flash-low"
+        );
+        assert_eq!(overload_model(b"UNAVAILABLE (code 503): The service is currently unavailable."), "");
     }
 }

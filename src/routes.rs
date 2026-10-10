@@ -1678,14 +1678,16 @@ mod tests {
     fn a_failed_probe_keeps_the_route_back_where_a_lost_measurement_did_not() {
         let _turn = turn();
         set_context(0x5555);
-        record(Kind::Exits, ms(300));
-        record_failure(Kind::Exits);
-        assert_eq!(latency(Kind::Exits), None);
-        let after_loss = order(|_| true);
-        probe_failed(Kind::Exits);
-        let after_probe = order(|_| true);
+        record(Kind::Direct, ms(300));
+        record_failure(Kind::Direct);
+        assert_eq!(latency(Kind::Direct), None);
+        // With the DNS layer, as on Windows: without it (Linux) Direct is last
+        // whatever happened to it, and the test could not tell the two apart.
+        let after_loss = order_with(&snapshot(), true, |_| true);
+        probe_failed(Kind::Direct);
+        let after_probe = order_with(&snapshot(), true, |_| true);
         assert!(
-            after_probe.last() == Some(&Kind::Exits) && after_loss.last() != Some(&Kind::Exits),
+            after_probe.last() == Some(&Kind::Direct) && after_loss.last() != Some(&Kind::Direct),
             "{after_loss:?} then {after_probe:?}"
         );
         assert!(PROBE_STUMBLE_FOR > STUMBLE_FOR, "a probe runs every 2 min");
