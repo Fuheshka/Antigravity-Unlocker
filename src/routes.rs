@@ -1226,6 +1226,8 @@ pub fn rows(usable: impl Fn(Kind) -> bool) -> Vec<Row> {
     let order = order_with(&s, cfg!(target_os = "windows"), &usable);
     let mut kinds: Vec<Kind> = order.clone();
     kinds.extend(ALL.iter().copied().filter(|k| !order.contains(k)));
+    // A build without the relay has no such route at all - not an unusable one.
+    kinds.retain(|&k| k != Kind::Relay || cfg!(relay));
     kinds
         .into_iter()
         .map(|k| {
@@ -1618,12 +1620,17 @@ mod tests {
         assert!(matches!(blame(Kind::Relay), Blamed::Proven(_)));
         assert!(!is_penalised(Kind::Relay), "a proven route is not benched");
         assert!(is_proven(Kind::Relay), "and it keeps its place");
-        assert!(
-            rows(|k| k == Kind::Relay)
-                .iter()
-                .any(|r| r.label == Kind::Relay.label() && r.refused_ago.is_some()),
-            "but the refusal is still on the record the window shows"
-        );
+        let relay_row = rows(|k| k == Kind::Relay)
+            .into_iter()
+            .find(|r| r.label == Kind::Relay.label());
+        if cfg!(relay) {
+            assert!(
+                relay_row.is_some_and(|r| r.refused_ago.is_some()),
+                "but the refusal is still on the record the window shows"
+            );
+        } else {
+            assert!(relay_row.is_none(), "a build without the relay shows no relay row");
+        }
         // Once the proof has aged out, the same refusal benches - at the first
         // step, because the answer reset the streak.
         age_out_answer(Kind::Relay);
