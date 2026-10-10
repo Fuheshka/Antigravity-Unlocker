@@ -858,7 +858,7 @@ fn footer(ui: &mut egui::Ui) {
             crate::utils::open_url(DONATE_URL);
         }
         ui.label(
-            egui::RichText::new("Отблагодарить копеечкой:")
+            egui::RichText::new("Донат:")
                 .size(FOOTER_TEXT)
                 .color(theme::MUTED),
         );

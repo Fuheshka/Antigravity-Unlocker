@@ -82,7 +82,8 @@ cat > "$CONTENTS/Info.plist" << EOF
 EOF
 
 echo "==> Выполнение ad-hoc подписи (codesign)..."
-codesign --force --deep -s - "$APP_DIR"
+# Requirement по bundle id, а не по cdhash: macOS сохраняет выданные разрешения между пересборками
+codesign --force --deep -s - -r='designated => identifier "com.antigravity.unlocker"' "$APP_DIR"
 
 echo "==> Готово! Бандл создан в: $APP_DIR"
 echo "Для установки в систему выполните: ./macos/install.sh"

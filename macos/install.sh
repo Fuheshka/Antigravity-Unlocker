@@ -28,7 +28,7 @@ cp -R "$BUILT_APP" "$DEST_APP"
 xattr -dr com.apple.quarantine "$DEST_APP" 2>/dev/null || true
 
 # Повторная ad-hoc подпись после копирования
-codesign --force --deep -s - "$DEST_APP" 2>/dev/null || true
+codesign --force --deep -s - -r='designated => identifier "com.antigravity.unlocker"' "$DEST_APP" 2>/dev/null || true
 
 # Обновление LaunchServices и сброс кэша иконок Dock
 echo "==> Обновление системного кэша иконок..."
