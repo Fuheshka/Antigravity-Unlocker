@@ -730,6 +730,9 @@ fn answer_log(hits: &[(std::path::PathBuf, ls_log::Tally)]) {
     let mut answered_ago: Option<Duration> = None;
     let mut refused_host: Option<String> = None;
     let mut answered_host: Option<String> = None;
+    let mut drops = 0usize;
+    let mut dropped_ago: Option<Duration> = None;
+    let mut dropped_host: Option<String> = None;
     for (path, t) in hits {
         let file = path
             .file_name()
@@ -749,6 +752,11 @@ fn answer_log(hits: &[(std::path::PathBuf, ls_log::Tally)]) {
         }
         refusals += t.refusals;
         answers += t.answers;
+        drops += t.drops;
+        if t.dropped_ago.is_some() && newest(dropped_ago, t.dropped_ago) == t.dropped_ago {
+            dropped_host = t.dropped_host.clone();
+        }
+        dropped_ago = newest(dropped_ago, t.dropped_ago);
         if t.refused_ago.is_some() && newest(refused_ago, t.refused_ago) == t.refused_ago {
             refused_host = t.refused_host.clone();
         }
@@ -768,6 +776,7 @@ fn answer_log(hits: &[(std::path::PathBuf, ls_log::Tally)]) {
     };
     let refusal = (refusals > 0).then(|| when(refused_ago)).flatten();
     let answer = (answers > 0).then(|| when(answered_ago)).flatten();
+    let drop = (drops > 0).then(|| when(dropped_ago)).flatten();
     match (refusal, answer) {
         (Some(r), Some(a)) if a < r => {
             on_answers(answers, a, answered_host.as_deref());
@@ -781,6 +790,59 @@ fn answer_log(hits: &[(std::path::PathBuf, ls_log::Tally)]) {
                 on_answers(answers, a, answered_host.as_deref());
             }
         }
+    }
+    // After the answers and refusals: an answer older than the drop must not
+    // wipe the streak the drop is about to add to.
+    if let Some(d) = drop {
+        on_drops(drops, d, dropped_host.as_deref(), answer.is_some_and(|a| a > d));
+    }
+}
+
+/// Consecutive failed generation attempts the connection died under, with no
+/// model answer between. Reset by an answer.
+static DROP_STREAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A drop this many attempts in a row moves the route; fewer is the client's
+/// own retry (4 s later) doing what it should.
+const DROP_BENCH_AT: usize = 2;
+
+/// The connection died under a generation request (EOF): once, the client's
+/// own retry is the right answer - a pooled connection reaped, a backend
+/// restart - and the same route is fine. Twice in a row with no answer in
+/// between, the route is accepting the connection and closing on the request,
+/// and retrying on it is what kept a client failing for twenty minutes
+/// (2026-10-10): it is put behind the others, and the next dial goes elsewhere.
+fn on_drops(count: usize, at: Instant, host: Option<&str>, answered_after: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if answered_after {
+        DROP_STREAK.store(0, Relaxed);
+        return;
+    }
+    let streak = DROP_STREAK.fetch_add(count, Relaxed) + count;
+    let carried = routes::attribute_tunnel(at, host);
+    let label = carried.map_or("не наш", |(k, _)| k.label());
+    if streak < DROP_BENCH_AT {
+        log_proxy(&format!(
+            "обрыв соединения при ответе модели (маршрут «{label}») — первый, повтор клиента идёт тем же путём"
+        ));
+        return;
+    }
+    let Some((kind, _)) = carried else {
+        log_proxy(&format!(
+            "обрыв соединения при ответе модели {streak} раз подряд, но не через наш маршрут — переключать нечего"
+        ));
+        return;
+    };
+    match routes::bench_dropping(kind) {
+        Some(bench) => log_proxy(&format!(
+            "маршрут «{}» рвёт соединение при ответе модели {streak} раз подряд — отложен на {} мин, следующее соединение пойдёт другим",
+            kind.label(),
+            bench.as_secs() / 60
+        )),
+        None => log_proxy(&format!(
+            "обрыв соединения при ответе модели {streak} раз подряд по «{}», но маршрут уже отложен или недавно отвечал — не тронут",
+            kind.label()
+        )),
     }
 }
 
@@ -953,6 +1015,7 @@ fn on_refusals(count: usize, at: Instant, host: Option<&str>) {
 }
 
 fn on_answers(count: usize, at: Instant, host: Option<&str>) {
+    DROP_STREAK.store(0, std::sync::atomic::Ordering::Relaxed);
     let carried = routes::attribute_tunnel(at, host);
     if let Some((kind, tunnel)) = carried {
         routes::credit(kind);

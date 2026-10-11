@@ -121,7 +121,14 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(relay)");
     println!("cargo:rerun-if-changed=.relay_key");
     println!("cargo:rerun-if-changed=src/relay.rs");
-    let relay = Path::new("src/relay.rs").exists() && Path::new(".relay_key").exists();
+    // Off by default since 2.22.0: xbox took the relay down (2026-10-09 - its
+    // address now serves an unrelated nginx and answers CONNECT with 400), so the
+    // route only cost a failed handshake before benching itself. The files stay
+    // local; `AG_WITH_RELAY=1` compiles the route back in if it returns.
+    println!("cargo:rerun-if-env-changed=AG_WITH_RELAY");
+    let relay = std::env::var("AG_WITH_RELAY").is_ok_and(|v| v == "1")
+        && Path::new("src/relay.rs").exists()
+        && Path::new(".relay_key").exists();
     if relay {
         println!("cargo:rustc-cfg=relay");
         let cred = fs::read_to_string(".relay_key")

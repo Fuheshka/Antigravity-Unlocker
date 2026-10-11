@@ -480,7 +480,13 @@ mod tests {
     #[ignore = "needs a live network; run with --ignored"]
     fn resolves_past_the_tunnel() {
         let eg = detect().expect("physical egress");
-        let server: Ipv4Addr = crate::resolvers::PROVIDERS[0].v4[0].parse().unwrap();
+        // The first provider with a UDP address - a DoH one has none (I49).
+        let server: Ipv4Addr = crate::resolvers::PROVIDERS
+            .iter()
+            .find_map(|p| p.v4.first())
+            .expect("a provider answering on UDP")
+            .parse()
+            .unwrap();
         let host = "cloudcode-pa.googleapis.com";
         let isp = dns_client::resolve_a_via(host, server, eg.if_index);
         let tunnelled = dns_client::resolve_a_via(host, server, 0);

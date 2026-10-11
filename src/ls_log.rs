@@ -56,12 +56,29 @@ const ANSWER_ID: &str = "responseid:";
 /// language server on every retry of the turn. Not the gate and not the route -
 /// the request got past both - so the only thing that helps is another model.
 const OVERLOAD_503: &str = "unavailable (code 503)";
+/// The same condition under the other names Google gives it: a quota-style 429
+/// and the text the client shows the user (`Our servers are experiencing high
+/// traffic`). Either way the request got past the gate and the route.
+const OVERLOAD_429: &str = "resource_exhausted (code 429)";
+const OVERLOAD_TRAFFIC: &str = "experiencing high traffic";
+/// Google's own fault, not a capacity one: `INTERNAL (code 500)`. Counted for
+/// the report only - the card does not tell anyone to pick another model for it.
+const SERVER_500: &str = "internal (code 500)";
 const OVERLOAD_MODEL: &[u8] = b"for model ";
 
 /// The account's credentials stopped being accepted: `UNAUTHENTICATED (code
 /// 401): Request had invalid authentication credentials` on every call (G11).
 /// A re-login is the fix; no route changes it.
 const UNAUTH_401: &str = "unauthenticated (code 401)";
+
+/// A generation request the connection died under: `Run: attempt N failed
+/// (request failed: Post ".../streamGenerateContent?alt=sse": EOF)` before a
+/// byte came back, or `(stream reading error: unexpected EOF)` in the middle of
+/// the answer. One line per attempt - the executor's own final report repeats
+/// the last one without the word `attempt`, and is not counted.
+const DROP_ATTEMPT: &str = "attempt";
+const DROP_FAILED: &str = "failed (";
+const DROP_STREAM_EOF: &str = "stream reading error: unexpected eof";
 
 /// Longest slice of appended log read in one pass. Anything beyond it is a log
 /// that grew by megabytes between two passes, which is not a session anyone is
@@ -107,16 +124,27 @@ pub struct Tally {
     pub refused_host: Option<String>,
     /// The host the newest answer's own line names.
     pub answered_host: Option<String>,
+    /// Generation attempts the connection died under (EOF), and the newest.
+    pub drops: usize,
+    pub dropped_ago: Option<Duration>,
+    pub dropped_host: Option<String>,
 }
 
 impl Tally {
     pub fn is_empty(&self) -> bool {
-        self.refusals == 0 && self.answers == 0
+        self.refusals == 0 && self.answers == 0 && self.drops == 0
     }
 
     fn add(&mut self, other: Tally) {
         self.refusals += other.refusals;
         self.answers += other.answers;
+        self.drops += other.drops;
+        if other.dropped_ago.is_some() && newer(self.dropped_ago, other.dropped_ago) == other.dropped_ago {
+            self.dropped_host = other.dropped_host.clone();
+        } else if self.dropped_host.is_none() {
+            self.dropped_host = other.dropped_host.clone();
+        }
+        self.dropped_ago = newer(self.dropped_ago, other.dropped_ago);
         // The host goes with whichever event is newer - an unplaceable one
         // (no age) never displaces a placed one.
         if other.refused_ago.is_some() && newer(self.refused_ago, other.refused_ago) == other.refused_ago {
@@ -241,7 +269,8 @@ fn tally(
         }
         let refusals = count_refusals(line);
         let answered = is_answer(line);
-        if refusals == 0 && !answered {
+        let dropped = is_stream_drop(line);
+        if refusals == 0 && !answered && !dropped {
             continue;
         }
         let ago = now.and_then(|now| {
@@ -255,6 +284,14 @@ fn tally(
                 refusals,
                 refused_ago: ago,
                 refused_host: last_host.clone(),
+                ..Tally::default()
+            });
+        }
+        if dropped {
+            out.add(Tally {
+                drops: 1,
+                dropped_ago: ago,
+                dropped_host: last_host.clone(),
                 ..Tally::default()
             });
         }
@@ -282,6 +319,15 @@ fn url_host(line: &[u8]) -> Option<String> {
         .unwrap_or(rest.len());
     let host = String::from_utf8_lossy(&rest[..end]).to_ascii_lowercase();
     crate::proxy::is_gate_host(&host).then_some(host)
+}
+
+/// Whether a line is one failed generation attempt the connection died under.
+fn is_stream_drop(line: &[u8]) -> bool {
+    if !(contains_ci(line, DROP_ATTEMPT.as_bytes()) && contains_ci(line, DROP_FAILED.as_bytes())) {
+        return false;
+    }
+    contains_ci(line, DROP_STREAM_EOF.as_bytes())
+        || (contains_ci(line, ANSWER_CALL.as_bytes()) && contains_ci(line, b"eof"))
 }
 
 /// Whether a line is a model answer that started streaming.
@@ -471,6 +517,10 @@ pub struct History {
     pub overloaded: Option<Overload>,
     /// The account's credentials refused (401) inside `recent`.
     pub unauthorized: Option<Sighting>,
+    /// Every Google-side failure (503, 429, 500, "high traffic") inside
+    /// `horizon`: the newest and how many. The report's 12 h line; `overloaded`
+    /// is the ten-minute one the card is drawn from.
+    pub server_errors: Option<Sighting>,
 }
 
 /// The newest 503 "no capacity" a client log carries, and for which model.
@@ -480,6 +530,13 @@ pub struct Overload {
     pub count: usize,
     /// The model named in the newest line; empty when the line names none.
     pub model: String,
+}
+
+/// A line that says Google had no room for the request.
+fn is_overload(line: &[u8]) -> bool {
+    [OVERLOAD_503, OVERLOAD_429, OVERLOAD_TRAFFIC]
+        .iter()
+        .any(|n| contains_ci(line, n.as_bytes()))
 }
 
 /// The model a 503 line names (`… for model <name> on the server`).
@@ -520,9 +577,10 @@ pub fn history(paths: &[PathBuf], recent: Duration, horizon: Duration) -> Histor
         for line in text.lines() {
             let refusals = count_refusals(line.as_bytes());
             let answered = is_answer(line.as_bytes());
-            let overloaded = contains_ci(line.as_bytes(), OVERLOAD_503.as_bytes());
+            let overloaded = is_overload(line.as_bytes());
+            let server_error = overloaded || contains_ci(line.as_bytes(), SERVER_500.as_bytes());
             let unauthorized = contains_ci(line.as_bytes(), UNAUTH_401.as_bytes());
-            if refusals == 0 && !answered && !overloaded && !unauthorized {
+            if refusals == 0 && !answered && !server_error && !unauthorized {
                 continue;
             }
             let Some(ago) = parse_stamp(line).and_then(|at| age_secs(at, now)) else {
@@ -531,6 +589,9 @@ pub fn history(paths: &[PathBuf], recent: Duration, horizon: Duration) -> Histor
             let ago = Duration::from_secs(ago as u64);
             if ago > horizon {
                 continue;
+            }
+            if server_error {
+                bump(&mut out.server_errors, ago, 1);
             }
             if overloaded && ago <= recent {
                 let newest = out.overloaded.as_ref().is_none_or(|o| ago <= o.ago);
@@ -1429,6 +1490,26 @@ mod tests {
         assert_eq!(u.count, 2);
         assert!(h.refused.is_none() && h.answered.is_none());
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_dead_connection_under_a_generation_attempt_is_a_drop() {
+        let a = b"Run: attempt 3 failed (request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": EOF), retrying in 11s";
+        let b = b"Run: attempt 1 failed (stream reading error: unexpected EOF), retrying in 4s";
+        assert!(is_stream_drop(a) && is_stream_drop(b));
+        // The final report repeats it without the attempt; the cache refreshers
+        // log EOF too and are not a generation.
+        assert!(!is_stream_drop(b"E1010 errorreport.go:224] generating and executing: request failed: Post \".../streamGenerateContent?alt=sse\": EOF"));
+        assert!(!is_stream_drop(b"W1010 cache.go:163] Failed to refresh cache in background: Post \".../fetchAvailableModels\": EOF"));
+        assert!(!is_stream_drop(b"Run: attempt 1 failed (INTERNAL (code 500): Internal error encountered.), retrying in 4s"));
+    }
+
+    #[test]
+    fn overload_names_and_server_errors() {
+        assert!(is_overload(b"Run: attempt 2 failed (RESOURCE_EXHAUSTED (code 429): quota)"));
+        assert!(is_overload(b"Error Our servers are experiencing high traffic right now"));
+        assert!(!is_overload(b"Run: attempt 1 failed (INTERNAL (code 500): Internal error encountered.)"));
+        assert!(contains_ci(b"attempt 1 failed (INTERNAL (code 500): x", SERVER_500.as_bytes()));
     }
 
     #[test]
