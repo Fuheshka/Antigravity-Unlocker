@@ -21,8 +21,10 @@ fi
 export AG_FULL_VERSION="$VERSION"
 echo "==> Версия приложения: $VERSION (AG_FULL_VERSION=$AG_FULL_VERSION)"
 
-echo "==> Сборка релизного бинарника для macOS (Apple Silicon / Intel)..."
-cargo build --release
+echo "==> Сборка релизного бинарника для macOS (Apple Silicon + Intel, universal)..."
+for T in aarch64-apple-darwin x86_64-apple-darwin; do
+    cargo build --release --target "$T"
+done
 
 APP_NAME="Antigravity Unlocker.app"
 APP_DIR="$DIR/target/release/$APP_NAME"
@@ -35,7 +37,9 @@ rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 # Копирование исполняемого файла
-cp "$DIR/target/release/ag_unlocker" "$MACOS_DIR/ag_unlocker"
+lipo -create -output "$MACOS_DIR/ag_unlocker" \
+    "$DIR/target/aarch64-apple-darwin/release/ag_unlocker" \
+    "$DIR/target/x86_64-apple-darwin/release/ag_unlocker"
 chmod +x "$MACOS_DIR/ag_unlocker"
 
 # Копирование иконки приложения

@@ -1,0 +1,21 @@
+name: macOS Intel
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  intel:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Tests (native x86_64)
+        run: cargo test
+      - name: Universal bundle
+        run: |
+          ./macos/build_app.sh
+          lipo -archs "target/release/Antigravity Unlocker.app/Contents/MacOS/ag_unlocker"
+          codesign --verify --deep --strict "target/release/Antigravity Unlocker.app"
