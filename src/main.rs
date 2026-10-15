@@ -33,6 +33,7 @@ mod gui;
 mod health;
 mod hosts_pin;
 mod hwid;
+mod instances;
 mod group_key;
 mod loopback;
 mod ls_log;
@@ -588,9 +589,16 @@ fn main() {
         if let Some(i) = args.iter().position(|a| a == elevate::PATCH_ROOT_FLAG) {
             elevate::run_helper(args.get(i + 1).cloned());
         }
+        if let Some(i) = args.iter().position(|a| a == elevate::UNPATCH_ROOT_FLAG) {
+            elevate::run_unpatch_helper(args.get(i + 1).cloned());
+        }
     }
 
     canary::handle_cli_flags();
+
+    // A window of an older release left open would keep re-applying its own
+    // state under this one.
+    instances::close_others();
 
     if tui::requested() {
         run_tui(None);

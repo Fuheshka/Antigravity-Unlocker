@@ -373,6 +373,10 @@ fn discover() -> Vec<PathBuf> {
             }
         }
     }
+    // A root-owned Linux install (`/opt`) is not this process's to write: every
+    // poll would fail with a permission error and be logged as a retry. The
+    // window patches it through pkexec when the user asks (`elevate`).
+    installs.retain(|inst| !crate::elevate::needs_root(inst));
     installs
 }
 

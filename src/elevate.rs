@@ -21,6 +21,47 @@ use std::path::PathBuf;
 /// The helper's flag: patch the install that follows, print the result, exit.
 pub const PATCH_ROOT_FLAG: &str = "--patch-root";
 
+/// The helper's other flag: take the patch off the install that follows.
+pub const UNPATCH_ROOT_FLAG: &str = "--unpatch-root";
+
+/// What taking the patch off one install did, file by file.
+#[derive(Debug, Default, PartialEq)]
+pub struct Reverted {
+    pub files: usize,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Puts one install's own files back: the language server and CLI binaries, the
+/// IDE's `main.js`, and the extracted `resources/app` of an older patch. Every
+/// step runs and is judged on its own (I45) - a failure is reported, never a
+/// reason to skip the rest. The user-level leftovers (`endpoint::remove_ide`,
+/// the proxy variable) are not here: they belong to the user, not to the
+/// install, and the root helper must not touch them.
+pub fn revert_files(inst: &Path) -> Reverted {
+    let mut out = Reverted::default();
+    for (label, res) in crate::patch_binary::unpatch_all_binaries(inst) {
+        match res {
+            Ok(0) => {}
+            Ok(_) => out.files += 1,
+            Err(e) => out.errors.push(format!("{label}: {e}")),
+        }
+    }
+    for (label, res) in crate::patch_ide::unpatch_ide_js(inst) {
+        match res {
+            Ok(true) => out.files += 1,
+            Ok(false) => out
+                .warnings
+                .push(format!("{label}: бэкапа нет, снят только маркер")),
+            Err(e) => out.errors.push(format!("{label}: {e}")),
+        }
+    }
+    if let Err(e) = crate::restore_pristine_asar(&inst.join("resources")) {
+        out.warnings.push(format!("app.asar не восстановлен: {e}"));
+    }
+    out
+}
+
 /// What the helper reported for its install.
 #[derive(Debug, Default)]
 pub struct Elevated {
@@ -90,13 +131,18 @@ fn can_write(dir: &Path) -> bool {
 /// The command a user can run by hand when no password prompt can be shown.
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 pub fn manual_command(inst: &Path) -> String {
+    manual_command_for(PATCH_ROOT_FLAG, inst)
+}
+
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn manual_command_for(flag: &str, inst: &Path) -> String {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "./ag_unlocker".to_string());
     format!(
         "sudo {} {} {}",
         shell_quote(&exe),
-        PATCH_ROOT_FLAG,
+        flag,
         shell_quote(&inst.display().to_string())
     )
 }
@@ -218,8 +264,103 @@ fn parse_report(stdout: &str) -> Result<Elevated, String> {
     }
 }
 
+/// Takes the patch off a root-owned install through `pkexec`, the way
+/// `patch_as_root` puts it on. Without it the switch could be turned on for such
+/// an install and never off: the revert failed with `Permission denied`, the
+/// binary stayed patched, and the row read On again after every refresh.
+#[cfg(not(target_os = "windows"))]
+pub fn unpatch_as_root(inst: &Path) -> Result<Reverted, String> {
+    use std::process::Command;
+    let exe = std::env::current_exe().map_err(|e| format!("не найден путь к exe: {e}"))?;
+    let out = Command::new("pkexec")
+        .arg("--disable-internal-agent")
+        .arg(&exe)
+        .arg(UNPATCH_ROOT_FLAG)
+        .arg(inst)
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "установка принадлежит root, а pkexec в системе нет. Выполните в терминале: {}",
+                    manual_command_for(UNPATCH_ROOT_FLAG, inst)
+                )
+            } else {
+                format!("pkexec не запустился: {e}")
+            }
+        })?;
+    match (
+        out.status.code(),
+        parse_reverted(&String::from_utf8_lossy(&out.stdout)),
+    ) {
+        (Some(0), Some(done)) => Ok(done),
+        (Some(126), _) => Err("пароль не введён — патч не снят".to_string()),
+        (Some(127), _) => Err(format!(
+            "окно запроса пароля недоступно. Выполните в терминале: {}",
+            manual_command_for(UNPATCH_ROOT_FLAG, inst)
+        )),
+        (code, _) => Err(format!(
+            "снятие патча от имени root не удалось (код {}): {}",
+            code.map_or("—".to_string(), |c| c.to_string()),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn unpatch_as_root(_inst: &Path) -> Result<Reverted, String> {
+    Err("не нужно на Windows".to_string())
+}
+
+/// The helper's side of `unpatch_as_root`, run as root.
+pub fn run_unpatch_helper(arg: Option<String>) -> ! {
+    let Some(inst) = arg
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute() && p.is_dir())
+    else {
+        println!("ERR\tне указана папка установки");
+        std::process::exit(2);
+    };
+    let done = revert_files(&inst);
+    println!("FILES\t{}", done.files);
+    for e in &done.errors {
+        println!("BAD\t{}", one_line(e));
+    }
+    for w in &done.warnings {
+        println!("WARN\t{}", one_line(w));
+    }
+    println!("DONE");
+    std::process::exit(0);
+}
+
+/// `None` unless the helper got as far as `DONE`: output cut short is a failure.
+fn parse_reverted(stdout: &str) -> Option<Reverted> {
+    let mut done = Reverted::default();
+    let mut finished = false;
+    for line in stdout.lines() {
+        let mut parts = line.split('\t');
+        match (parts.next(), parts.next()) {
+            (Some("FILES"), Some(n)) => done.files = n.parse().unwrap_or(0),
+            (Some("BAD"), Some(m)) => done.errors.push(m.to_string()),
+            (Some("WARN"), Some(m)) => done.warnings.push(m.to_string()),
+            (Some("DONE"), _) => finished = true,
+            _ => {}
+        }
+    }
+    finished.then_some(done)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_unpatch_report_reads_back_and_needs_its_last_line() {
+        let done = super::parse_reverted("FILES\t2\nBAD\tlanguage_server: отказано\nWARN\tapp.asar\nDONE\n")
+            .expect("done");
+        assert_eq!(done.files, 2);
+        assert_eq!(done.errors, vec!["language_server: отказано".to_string()]);
+        assert_eq!(done.warnings, vec!["app.asar".to_string()]);
+        assert!(super::parse_reverted("FILES\t2\n").is_none());
+    }
+
     use super::*;
 
     #[test]
