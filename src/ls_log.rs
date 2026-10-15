@@ -79,6 +79,11 @@ const UNAUTH_401: &str = "unauthenticated (code 401)";
 const DROP_ATTEMPT: &str = "attempt";
 const DROP_FAILED: &str = "failed (";
 const DROP_STREAM_EOF: &str = "stream reading error: unexpected eof";
+/// What the client's retries say once the first EOF has killed its connection
+/// to our proxy: attempts 2..N fail on `write tcp …: use of closed network
+/// connection`, never EOF again. Counting only EOF left the streak at 1 for six
+/// attempts and the dead route in place (2026-10-15).
+const DROP_CLOSED_CONN: &str = "use of closed network connection";
 
 /// Longest slice of appended log read in one pass. Anything beyond it is a log
 /// that grew by megabytes between two passes, which is not a session anyone is
@@ -139,7 +144,9 @@ impl Tally {
         self.refusals += other.refusals;
         self.answers += other.answers;
         self.drops += other.drops;
-        if other.dropped_ago.is_some() && newer(self.dropped_ago, other.dropped_ago) == other.dropped_ago {
+        if other.dropped_ago.is_some()
+            && newer(self.dropped_ago, other.dropped_ago) == other.dropped_ago
+        {
             self.dropped_host = other.dropped_host.clone();
         } else if self.dropped_host.is_none() {
             self.dropped_host = other.dropped_host.clone();
@@ -147,7 +154,9 @@ impl Tally {
         self.dropped_ago = newer(self.dropped_ago, other.dropped_ago);
         // The host goes with whichever event is newer - an unplaceable one
         // (no age) never displaces a placed one.
-        if other.refused_ago.is_some() && newer(self.refused_ago, other.refused_ago) == other.refused_ago {
+        if other.refused_ago.is_some()
+            && newer(self.refused_ago, other.refused_ago) == other.refused_ago
+        {
             self.refused_host = other.refused_host.clone();
         } else if self.refused_host.is_none() {
             self.refused_host = other.refused_host.clone();
@@ -195,7 +204,8 @@ pub fn poll() -> Vec<(PathBuf, Tally)> {
             .and_then(|h| h.get_or_insert_with(HashMap::new).get(&path).cloned());
         let (next, tally) = scan(&path, from, now, &mut last_host);
         if let (Some(h), Some(host)) = (hosts.as_mut(), last_host) {
-            h.get_or_insert_with(HashMap::new).insert(path.clone(), host);
+            h.get_or_insert_with(HashMap::new)
+                .insert(path.clone(), host);
         }
         offsets.insert(path.clone(), next);
         if (!first_sight || started) && !tally.is_empty() {
@@ -327,7 +337,8 @@ fn is_stream_drop(line: &[u8]) -> bool {
         return false;
     }
     contains_ci(line, DROP_STREAM_EOF.as_bytes())
-        || (contains_ci(line, ANSWER_CALL.as_bytes()) && contains_ci(line, b"eof"))
+        || (contains_ci(line, ANSWER_CALL.as_bytes())
+            && (contains_ci(line, b"eof") || contains_ci(line, DROP_CLOSED_CONN.as_bytes())))
 }
 
 /// Whether a line is a model answer that started streaming.
@@ -336,7 +347,10 @@ fn is_answer(line: &[u8]) -> bool {
 }
 
 fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
-    hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+    hay.len() >= needle.len()
+        && hay
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 /// Occurrences of the refusal in a chunk of log, case-insensitively. Byte-wise,
@@ -1098,7 +1112,11 @@ mod tests {
         append(&path, &REFUSAL[cut..]);
         let (off4, hits) = refusals_in(&path, Some(off3));
         assert_eq!(hits, 1, "the halves must be read together");
-        assert_eq!(refusals_in(&path, Some(off4)), (off4, 0), "and not counted again");
+        assert_eq!(
+            refusals_in(&path, Some(off4)),
+            (off4, 0),
+            "and not counted again"
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -1159,11 +1177,20 @@ mod tests {
         assert_eq!(t.refused_ago, None);
         // Hosts: the answer names its own; the refusal takes the last URL line
         // before it, the `loadCodeAssist` one.
-        assert_eq!(t.answered_host.as_deref(), Some("daily-cloudcode-pa.googleapis.com"));
-        assert_eq!(t.refused_host.as_deref(), Some("daily-cloudcode-pa.googleapis.com"));
+        assert_eq!(
+            t.answered_host.as_deref(),
+            Some("daily-cloudcode-pa.googleapis.com")
+        );
+        assert_eq!(
+            t.refused_host.as_deref(),
+            Some("daily-cloudcode-pa.googleapis.com")
+        );
         assert_eq!(host.as_deref(), Some("daily-cloudcode-pa.googleapis.com"));
         // A URL line for some other host is not a gate host and changes nothing.
-        assert_eq!(url_host(b"I0918 x] URL: https://oauth2.googleapis.com/token"), None);
+        assert_eq!(
+            url_host(b"I0918 x] URL: https://oauth2.googleapis.com/token"),
+            None
+        );
         assert_eq!(
             url_host(b"I0918 x] URL: https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist Trace"),
             Some("cloudcode-pa.googleapis.com".to_string())
@@ -1255,19 +1282,51 @@ mod tests {
             )
         };
         let path = temp_log("history");
-        let refusal = "FAILED_PRECONDITION (code 400): User location is not supported for the API use.";
+        let refusal =
+            "FAILED_PRECONDITION (code 400): User location is not supported for the API use.";
         let answer = "URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x1 ResponseID: abc";
-        append(&path, &format!("{}{}
-", stamp(1800, 'E'), refusal));
-        append(&path, &format!("{}{}
-", stamp(900, 'I'), answer));
-        append(&path, &format!("{}{}
-", stamp(120, 'E'), refusal));
-        append(&path, &format!("{}{}
-", stamp(60, 'E'), refusal));
+        append(
+            &path,
+            &format!(
+                "{}{}
+",
+                stamp(1800, 'E'),
+                refusal
+            ),
+        );
+        append(
+            &path,
+            &format!(
+                "{}{}
+",
+                stamp(900, 'I'),
+                answer
+            ),
+        );
+        append(
+            &path,
+            &format!(
+                "{}{}
+",
+                stamp(120, 'E'),
+                refusal
+            ),
+        );
+        append(
+            &path,
+            &format!(
+                "{}{}
+",
+                stamp(60, 'E'),
+                refusal
+            ),
+        );
         let files = [path.clone()];
         let h = history(&files, Duration::from_secs(600), Duration::from_secs(3600));
-        assert_eq!(h.refused_recent, newest_refusal(&files, Duration::from_secs(600)));
+        assert_eq!(
+            h.refused_recent,
+            newest_refusal(&files, Duration::from_secs(600))
+        );
         assert_eq!(h.refused, newest_refusal(&files, Duration::from_secs(3600)));
         assert_eq!(h.answered, newest_answer(&files, Duration::from_secs(3600)));
         assert_eq!(h.refused_recent.map(|s| s.count), Some(2));
@@ -1305,7 +1364,10 @@ mod tests {
         assert_eq!(parse_stamp(IDE_LINE), expected);
         // The IDE's own `2026-09-12 03:57:46.735` must not be mistaken for it:
         // what is read is the language server's stamp, inside the wrapper.
-        assert_eq!(parse_stamp("2026-09-12 03:57:46.735 [info] [LS Main] Args"), None);
+        assert_eq!(
+            parse_stamp("2026-09-12 03:57:46.735 [info] [LS Main] Args"),
+            None
+        );
         // And a stamp-shaped run deep inside a message is out of reach.
         let deep = format!("{}E0102 03:04:05.000000 x", "y".repeat(HEADER_SEARCH));
         assert_eq!(parse_stamp(&deep), None);
@@ -1474,14 +1536,38 @@ mod tests {
             )
         };
         let path = temp_log("overload");
-        let busy = |m: &str| format!("Run: attempt 1 failed (UNAVAILABLE (code 503): No capacity available for model {m} on the server), retrying in 4s\n");
+        let busy = |m: &str| {
+            format!("Run: attempt 1 failed (UNAVAILABLE (code 503): No capacity available for model {m} on the server), retrying in 4s\n")
+        };
         append(&path, &format!("{}{}", stamp(1500), busy("old-model")));
-        append(&path, &format!("{}{}", stamp(200), busy("gemini-3.6-flash-high")));
-        append(&path, &format!("{}{}", stamp(100), busy("gemini-3.8-flash-high")));
-        append(&path, &format!("{}UNAUTHENTICATED (code 401): Request had invalid authentication credentials.\n", stamp(50)));
-        append(&path, &format!("{}UNAUTHENTICATED (code 401): Request had invalid authentication credentials.\n", stamp(40)));
+        append(
+            &path,
+            &format!("{}{}", stamp(200), busy("gemini-3.6-flash-high")),
+        );
+        append(
+            &path,
+            &format!("{}{}", stamp(100), busy("gemini-3.8-flash-high")),
+        );
+        append(
+            &path,
+            &format!(
+                "{}UNAUTHENTICATED (code 401): Request had invalid authentication credentials.\n",
+                stamp(50)
+            ),
+        );
+        append(
+            &path,
+            &format!(
+                "{}UNAUTHENTICATED (code 401): Request had invalid authentication credentials.\n",
+                stamp(40)
+            ),
+        );
 
-        let h = history(std::slice::from_ref(&path), Duration::from_secs(600), Duration::from_secs(3600));
+        let h = history(
+            std::slice::from_ref(&path),
+            Duration::from_secs(600),
+            Duration::from_secs(3600),
+        );
         let o = h.overloaded.expect("two 503s inside the window");
         assert_eq!(o.count, 2, "the 25-minute-old one is outside it");
         assert_eq!(o.model, "gemini-3.8-flash-high");
@@ -1504,12 +1590,30 @@ mod tests {
         assert!(!is_stream_drop(b"Run: attempt 1 failed (INTERNAL (code 500): Internal error encountered.), retrying in 4s"));
     }
 
+    /// Field log 2026-10-15: one EOF, then five retries each failing on the
+    /// client's own dead socket to our proxy - the streak must keep growing.
+    #[test]
+    fn a_closed_connection_retry_is_a_drop_too() {
+        let a = b"Run: attempt 2 failed (request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": write tcp 127.0.0.1:1834->127.0.0.1:53129: use of closed network connection), retrying in 6.9s";
+        assert!(is_stream_drop(a));
+        assert!(!is_stream_drop(b"Run: attempt 2 failed (request failed: Post \".../fetchAvailableModels\": write tcp 127.0.0.1:1->127.0.0.1:2: use of closed network connection), retrying in 4s"));
+    }
+
     #[test]
     fn overload_names_and_server_errors() {
-        assert!(is_overload(b"Run: attempt 2 failed (RESOURCE_EXHAUSTED (code 429): quota)"));
-        assert!(is_overload(b"Error Our servers are experiencing high traffic right now"));
-        assert!(!is_overload(b"Run: attempt 1 failed (INTERNAL (code 500): Internal error encountered.)"));
-        assert!(contains_ci(b"attempt 1 failed (INTERNAL (code 500): x", SERVER_500.as_bytes()));
+        assert!(is_overload(
+            b"Run: attempt 2 failed (RESOURCE_EXHAUSTED (code 429): quota)"
+        ));
+        assert!(is_overload(
+            b"Error Our servers are experiencing high traffic right now"
+        ));
+        assert!(!is_overload(
+            b"Run: attempt 1 failed (INTERNAL (code 500): Internal error encountered.)"
+        ));
+        assert!(contains_ci(
+            b"attempt 1 failed (INTERNAL (code 500): x",
+            SERVER_500.as_bytes()
+        ));
     }
 
     #[test]
@@ -1518,6 +1622,9 @@ mod tests {
             overload_model(b"(UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-low on the server"),
             "gemini-3.8-flash-low"
         );
-        assert_eq!(overload_model(b"UNAVAILABLE (code 503): The service is currently unavailable."), "");
+        assert_eq!(
+            overload_model(b"UNAVAILABLE (code 503): The service is currently unavailable."),
+            ""
+        );
     }
 }

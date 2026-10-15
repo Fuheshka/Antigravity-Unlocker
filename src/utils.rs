@@ -277,13 +277,18 @@ pub fn open_url(url: &str) {
 /// The window usually runs elevated, and a browser started from it would be an
 /// elevated one - not necessarily the session signed in to the account the page
 /// is about. `explorer.exe` hands the link to the running, unelevated shell
-/// instead. Explorer reads a comma as an argument separator, so a link holding
-/// one takes the ordinary path.
+/// instead. Explorer splits an unquoted argument at `,` *and* `=`, then opens
+/// whichever piece looks like a URL - for Google's verification link that is
+/// the bare `continue=` target with `&plt` glued on, a 404 (measured). So the
+/// link always goes in double quotes, which `Command::arg` adds only for
+/// spaces; a link holding a quote of its own, or ending in a backslash (which
+/// would escape the closing quote), takes the ordinary path.
 pub fn open_url_as_user(url: &str) {
     #[cfg(target_os = "windows")]
-    if is_admin() && !url.contains(',') {
+    if is_admin() && !url.contains('"') && !url.ends_with('\\') {
+        use std::os::windows::process::CommandExt;
         let mut cmd = Command::new("explorer.exe");
-        cmd.arg(url);
+        cmd.raw_arg(format!("\"{url}\""));
         if no_window(&mut cmd).spawn().is_ok() {
             return;
         }
