@@ -262,7 +262,12 @@ impl Status {
 pub fn bypass_order(on: bool) -> Vec<Cap> {
     if on {
         // The user's own proxy is theirs to switch on: it needs an address.
-        vec![Cap::Dns, Cap::LocalProxy, Cap::BuiltinExits, Cap::GroupProxy]
+        vec![
+            Cap::Dns,
+            Cap::LocalProxy,
+            Cap::BuiltinExits,
+            Cap::GroupProxy,
+        ]
     } else {
         vec![
             Cap::LocalProxy,
@@ -1870,6 +1875,13 @@ fn disable_dns(ctx: &mut Ctx) {
         );
     } else {
         stop_relay(ctx);
+        // Again, after: the relay's own maintainer re-reads the settings on a
+        // timer and may have put the variable back between the removal above and
+        // the stop, leaving it on a port nothing answers (the window's switch
+        // read off while Antigravity still died on `actively refused`).
+        if endpoint::proxy_env_is_ours() {
+            disable_local_proxy(ctx);
+        }
     }
 }
 
