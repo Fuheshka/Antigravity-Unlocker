@@ -7,7 +7,7 @@ cask "antigravity-unlocker" do
   desc "Native macOS unlocker tool for Google Antigravity IDE and CLI"
   homepage "https://github.com/Fuheshka/Antigravity-Unlocker"
 
-  depends_on macos: ">= :big_sur"
+  depends_on macos: :big_sur
 
   app "Antigravity Unlocker.app"
   binary "#{appdir}/Antigravity Unlocker.app/Contents/MacOS/ag_unlocker", target: "ag_unlocker"
