@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use crate::settings::Settings;
 use crate::utils::is_admin;
-use crate::{background, dns, endpoint, patch_binary, patch_ide, proxy, upstream};
+use crate::{background, dns, endpoint, patch_binary, proxy, upstream};
 
 /// Everything the UI can flip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -262,7 +262,12 @@ impl Status {
 pub fn bypass_order(on: bool) -> Vec<Cap> {
     if on {
         // The user's own proxy is theirs to switch on: it needs an address.
-        vec![Cap::Dns, Cap::LocalProxy, Cap::BuiltinExits, Cap::GroupProxy]
+        vec![
+            Cap::Dns,
+            Cap::LocalProxy,
+            Cap::BuiltinExits,
+            Cap::GroupProxy,
+        ]
     } else {
         vec![
             Cap::LocalProxy,
@@ -1002,6 +1007,14 @@ fn vpn_change_line(now: VpnSeen) -> Option<&'static str> {
     }
 }
 
+/// Windows registers the watcher as a machine task, which takes UAC; on Linux
+/// it is a user unit and anyone may have it. Without this the «Включить всё»
+/// path and the patch switch skipped auto-patch for every non-root user, and the
+/// row stayed off for good.
+fn watchdog_allowed(admin: bool) -> bool {
+    admin || !cfg!(target_os = "windows")
+}
+
 fn read_watchdog(admin: bool) -> State {
     if background::is_watchdog_enabled() {
         State::On
@@ -1227,7 +1240,9 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
             // gone, so without the task back the switch would read off while
             // patching went on. `set_watchdog` no longer starts the relay, so
             // this does not depend on the bypass being wanted.
-            if is_admin() && ctx.settings.auto_patch_wanted() && !background::is_watchdog_enabled()
+            if watchdog_allowed(is_admin())
+                && ctx.settings.auto_patch_wanted()
+                && !background::is_watchdog_enabled()
             {
                 set_watchdog(ctx, true);
             }
@@ -1399,7 +1414,7 @@ fn enable_all(ctx: &mut Ctx) {
     }
     // Whether or not the patch found anything to patch: auto-patch is what
     // patches the Antigravity installed after this click (D27).
-    if admin && !background::is_watchdog_enabled() {
+    if watchdog_allowed(admin) && !background::is_watchdog_enabled() {
         apply(ctx, Cap::Watchdog, true);
     }
     ctx.log(
@@ -1698,30 +1713,39 @@ fn disable_client_patch(ctx: &mut Ctx) {
     // I45: every step runs, each judged on its own. No `?` between them.
     for inst in &targets {
         let where_ = crate::utils::mask_path(&inst.display().to_string());
-        let mut reverted = 0usize;
         // Each file is judged on its own (I45), and a failure is said out loud:
         // a count alone turned "one of two files could not be written" into a
-        // clean revert, and the user kept a half-patched install.
-        for (label, res) in patch_binary::unpatch_all_binaries(inst) {
-            match res {
-                Ok(0) => {}
-                Ok(_) => reverted += 1,
-                Err(e) => ctx.log(Level::Err, format!("{} — {}: {}", where_, label, e)),
+        // clean revert, and the user kept a half-patched install. A root-owned
+        // install (`/opt`) is reverted through pkexec, as it was patched: written
+        // from here it only ever failed with `Permission denied`.
+        // Asked only when there is something to take off: a clean root-owned
+        // install does not deserve a password prompt.
+        let patched_here = patch_binary::inspect_install(inst)
+            .files
+            .iter()
+            .any(|(_, st)| *st == patch_binary::FileState::Patched);
+        let done = if patched_here && crate::elevate::needs_root(inst) {
+            ctx.log(
+                Level::Info,
+                format!("{} — установка принадлежит root, запрашиваю пароль", where_),
+            );
+            match crate::elevate::unpatch_as_root(inst) {
+                Ok(d) => d,
+                Err(e) => {
+                    ctx.log(Level::Err, format!("{} — {}", where_, e));
+                    continue;
+                }
             }
+        } else {
+            crate::elevate::revert_files(inst)
+        };
+        for e in &done.errors {
+            ctx.log(Level::Err, format!("{} — {}", where_, e));
         }
-        for (label, res) in patch_ide::unpatch_ide_js(inst) {
-            match res {
-                Ok(true) => reverted += 1,
-                Ok(false) => ctx.log(
-                    Level::Warn,
-                    format!("{} — {}: бэкапа нет, снят только маркер", where_, label),
-                ),
-                Err(e) => ctx.log(Level::Err, format!("{} — {}: {}", where_, label, e)),
-            }
+        for w in &done.warnings {
+            ctx.log(Level::Warn, format!("{} — {}", where_, w));
         }
-        if let Err(e) = crate::restore_pristine_asar(&inst.join("resources")) {
-            ctx.log(Level::Warn, format!("app.asar не восстановлен: {}", e));
-        }
+        let reverted = done.files;
         if let Err(e) = endpoint::remove_ide(inst) {
             ctx.log(Level::Warn, format!("Оверрайд эндпоинта не снят: {}", e));
         }
@@ -1851,6 +1875,13 @@ fn disable_dns(ctx: &mut Ctx) {
         );
     } else {
         stop_relay(ctx);
+        // Again, after: the relay's own maintainer re-reads the settings on a
+        // timer and may have put the variable back between the removal above and
+        // the stop, leaving it on a port nothing answers (the window's switch
+        // read off while Antigravity still died on `actively refused`).
+        if endpoint::proxy_env_is_ours() {
+            disable_local_proxy(ctx);
+        }
     }
 }
 

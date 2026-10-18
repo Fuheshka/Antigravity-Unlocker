@@ -670,9 +670,10 @@ mod unix_impl {
     use std::path::PathBuf;
     use std::process::Command;
 
-    use super::PROXY_FLAG;
+    use super::{PROXY_FLAG, WATCHDOG_FLAG};
 
     const UNIT_NAME: &str = "ag-unlocker-proxy.service";
+    const WATCHDOG_UNIT_NAME: &str = "ag-unlocker-watchdog.service";
 
     fn home() -> String {
         std::env::var("HOME").unwrap_or_default()
@@ -703,6 +704,12 @@ mod unix_impl {
             .join(UNIT_NAME)
     }
 
+    fn watchdog_unit_path() -> PathBuf {
+        xdg("XDG_CONFIG_HOME", ".config")
+            .join("systemd/user")
+            .join(WATCHDOG_UNIT_NAME)
+    }
+
     /// Runs `systemctl --user ...`; true on success. Best-effort: a machine
     /// without a user systemd manager (rare on a desktop) just fails the enable.
     fn systemctl(args: &[&str]) -> bool {
@@ -719,12 +726,13 @@ mod unix_impl {
         unit_path().exists()
     }
 
-    /// Linux does not have a separate watchdog task or systemd unit: the proxy
-    /// unit's own `Restart=` handles crash restarts, and auto-update does not
-    /// replace binaries out from under the running user on Linux.
-    #[allow(dead_code)]
+    /// The auto-patch watcher is a user unit of its own, beside the proxy's: the
+    /// switch must be able to stand without the 400 bypass (it is the whole
+    /// reason `ensure_installed` exists), and an update that replaces
+    /// `language_server` under a running Antigravity is as real here as on
+    /// Windows. The unit file existing is what "enabled" means, as for the proxy.
     pub fn is_watchdog_enabled() -> bool {
-        false
+        watchdog_unit_path().exists()
     }
 
     pub fn is_running() -> bool {
@@ -745,6 +753,70 @@ mod unix_impl {
     /// the caller's own session manager, which is why the whole Linux flow runs
     /// unprivileged (and "Run as a Program" works without a password prompt).
     pub fn ensure_running() -> Result<(), String> {
+        let replaced = install_copy()?;
+
+        let up = unit_path();
+        if let Some(p) = up.parent() {
+            fs::create_dir_all(p).map_err(|e| format!("не создать {}: {}", p.display(), e))?;
+        }
+        // The window finds the service's `gate.json` through `log_dir()`, which
+        // follows `XDG_DATA_HOME`. The systemd user manager does not always carry
+        // the desktop session's value, and a service writing into a different
+        // directory than the window reads leaves the card on «Служба запускается»
+        // for good - so the unit is given the directory the window uses.
+        let unit = unit_text("Antigravity Unlocker local proxy", PROXY_FLAG);
+        // A unit from an older build lacks the data-dir line; running on under
+        // it keeps the service writing where the window does not look.
+        let unit_changed = fs::read_to_string(&up).map_or(true, |old| old != unit);
+        fs::write(&up, unit).map_err(|e| format!("не записать юнит: {}", e))?;
+
+        systemctl(&["daemon-reload"]);
+        if !systemctl(&["enable", "--now", UNIT_NAME]) {
+            return Err("не удалось запустить systemd-юнит (systemctl --user)".to_string());
+        }
+        // `enable --now` leaves a unit that is already running alone, so a copy
+        // just replaced would sit unused until the next login.
+        if (replaced || unit_changed) && !systemctl(&["restart", UNIT_NAME]) {
+            return Err(
+                "новая версия прокси записана, но служба не перезапустилась (systemctl --user)"
+                    .to_string(),
+            );
+        }
+        // The watcher runs the same copy: left on the old inode it would keep
+        // the previous version's patch routines until the next login.
+        if replaced && is_watchdog_enabled() {
+            systemctl(&["restart", WATCHDOG_UNIT_NAME]);
+        }
+        Ok(())
+    }
+
+    /// A user unit running the installed copy with `flag`.
+    fn unit_text(description: &str, flag: &str) -> String {
+        let data_home = crate::dns_forwarder::log_dir()
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%");
+        format!(
+            "[Unit]\n\
+             Description={description}\n\
+             After=default.target\n\n\
+             [Service]\n\
+             Environment=\"XDG_DATA_HOME={data_home}\"\n\
+             ExecStart={exe} {flag}\n\
+             Restart=on-failure\n\
+             RestartSec=5\n\n\
+             [Install]\n\
+             WantedBy=default.target\n",
+            exe = installed_exe().display(),
+        )
+    }
+
+    /// Puts this exe where the units run it from. True when the copy on disk
+    /// changed (a unit already running it then has to be restarted).
+    fn install_copy() -> Result<bool, String> {
         let src = std::env::current_exe().map_err(|e| format!("нет пути к exe: {}", e))?;
         let dir = install_dir();
         let exe = installed_exe();
@@ -770,55 +842,7 @@ mod unix_impl {
                 format!("замена exe: {}", e)
             })?;
         }
-
-        let up = unit_path();
-        if let Some(p) = up.parent() {
-            fs::create_dir_all(p).map_err(|e| format!("не создать {}: {}", p.display(), e))?;
-        }
-        // The window finds the service's `gate.json` through `log_dir()`, which
-        // follows `XDG_DATA_HOME`. The systemd user manager does not always carry
-        // the desktop session's value, and a service writing into a different
-        // directory than the window reads leaves the card on «Служба запускается»
-        // for good - so the unit is given the directory the window uses.
-        let data_home = crate::dns_forwarder::log_dir()
-            .parent()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('%', "%%");
-        let unit = format!(
-            "[Unit]\n\
-             Description=Antigravity Unlocker local proxy\n\
-             After=default.target\n\n\
-             [Service]\n\
-             Environment=\"XDG_DATA_HOME={data_home}\"\n\
-             ExecStart={exe} {flag}\n\
-             Restart=on-failure\n\
-             RestartSec=5\n\n\
-             [Install]\n\
-             WantedBy=default.target\n",
-            exe = exe.display(),
-            flag = PROXY_FLAG,
-        );
-        // A unit from an older build lacks the data-dir line; running on under
-        // it keeps the service writing where the window does not look.
-        let unit_changed = fs::read_to_string(&up).map_or(true, |old| old != unit);
-        fs::write(&up, unit).map_err(|e| format!("не записать юнит: {}", e))?;
-
-        systemctl(&["daemon-reload"]);
-        if !systemctl(&["enable", "--now", UNIT_NAME]) {
-            return Err("не удалось запустить systemd-юнит (systemctl --user)".to_string());
-        }
-        // `enable --now` leaves a unit that is already running alone, so a copy
-        // just replaced would sit unused until the next login.
-        if (replaced || unit_changed) && !systemctl(&["restart", UNIT_NAME]) {
-            return Err(
-                "новая версия прокси записана, но служба не перезапустилась (systemctl --user)"
-                    .to_string(),
-            );
-        }
-        Ok(())
+        Ok(replaced)
     }
 
     /// Whether two files hold the same bytes. Unreadable counts as different, so
@@ -840,19 +864,40 @@ mod unix_impl {
         Ok(())
     }
 
-    /// No separate watchdog on Linux yet - the proxy unit's own `Restart=` covers
-    /// the crash case, and there is no auto-updater story to fight here.
+    /// Writes the watcher's user unit and starts it. Only the file and the unit:
+    /// the proxy unit is not touched, so auto-patch on its own never switches the
+    /// 400 bypass on.
     pub fn enable_watchdog() -> Result<(), String> {
+        let replaced = install_copy()?;
+        let up = watchdog_unit_path();
+        if let Some(p) = up.parent() {
+            fs::create_dir_all(p).map_err(|e| format!("не создать {}: {}", p.display(), e))?;
+        }
+        let unit = unit_text("Antigravity Unlocker auto-patch", WATCHDOG_FLAG);
+        let unit_changed = fs::read_to_string(&up).map_or(true, |old| old != unit);
+        fs::write(&up, unit).map_err(|e| format!("не записать юнит: {}", e))?;
+        systemctl(&["daemon-reload"]);
+        if !systemctl(&["enable", "--now", WATCHDOG_UNIT_NAME]) {
+            return Err("не удалось запустить systemd-юнит (systemctl --user)".to_string());
+        }
+        if (replaced || unit_changed) && !systemctl(&["restart", WATCHDOG_UNIT_NAME]) {
+            return Err("автопатч записан, но служба не перезапустилась (systemctl --user)".to_string());
+        }
         Ok(())
     }
 
-    /// Nothing to install for a watchdog Linux does not have - and starting the
-    /// proxy unit here would switch the 400 bypass on behind the user's back.
+    /// The copy the units run from has to be there before either of them starts.
+    /// Starting the proxy here would switch the 400 bypass on behind the user's
+    /// back, so this is only the file.
     pub fn ensure_installed() -> Result<(), String> {
-        Ok(())
+        install_copy().map(|_| ())
     }
 
-    pub fn disable_watchdog() {}
+    pub fn disable_watchdog() {
+        systemctl(&["disable", "--now", WATCHDOG_UNIT_NAME]);
+        let _ = fs::remove_file(watchdog_unit_path());
+        systemctl(&["daemon-reload"]);
+    }
 
     /// Stops and removes the user unit and the installed copy. Quiet success even
     /// when nothing was installed, so the undo menus never error.
@@ -860,8 +905,11 @@ mod unix_impl {
         systemctl(&["disable", "--now", UNIT_NAME]);
         let _ = fs::remove_file(unit_path());
         systemctl(&["daemon-reload"]);
-        let _ = fs::remove_file(installed_exe());
-        let _ = fs::remove_dir(install_dir());
+        // The watcher runs the same copy: while its unit is there the file stays.
+        if !is_watchdog_enabled() {
+            let _ = fs::remove_file(installed_exe());
+            let _ = fs::remove_dir(install_dir());
+        }
         Ok(())
     }
 }

@@ -6,6 +6,7 @@
 [![Tests](https://img.shields.io/badge/Tests-304%20passed-brightgreen)](Cargo.toml)
 [![License](https://img.shields.io/badge/License-Open%20Source-blue)](Cargo.toml)
 [![UI](https://img.shields.io/badge/UI-egui%20%2F%20eframe-purple)](src/gui/mod.rs)
+[![Downloads](https://img.shields.io/github/downloads/Fuheshka/Antigravity-Unlocker/total?label=Downloads&logo=github)](https://github.com/Fuheshka/Antigravity-Unlocker/releases)
 
 Разблокировка Antigravity IDE и CLI в России и регионах с ограничениями без VPN, без смены региона аккаунта Google и без внешних платных сервисов.
 
@@ -222,7 +223,7 @@ cargo build --release
 ### Linux:
 1. Соберите проект: `cargo build --release`.
 2. Запустите `./target/release/ag_unlocker` (или запустите `tui.sh` / `launch.sh`).
-3. Права root не требуются: фоновый сервис регистрируется как пользовательский systemd unit (`systemctl --user`).
+3. Права root не требуются: фоновый сервис регистрируется как пользовательский systemd unit (`systemctl --user`). Если Antigravity установлен в системную папку (`/opt`), анлокер сам запросит пароль через pkexec только для записи патча.
 
 ---
 
