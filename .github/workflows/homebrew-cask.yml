@@ -1,0 +1,51 @@
+name: Homebrew Cask
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  cask:
+    if: contains(github.event.release.tag_name, '-macos.')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Update local cask
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          curl -fsSL --retry 5 --retry-delay 10 -o Antigravity-Unlocker-macOS.zip "https://github.com/Fuheshka/Antigravity-Unlocker/releases/download/${TAG}/Antigravity-Unlocker-macOS.zip"
+          SHA256=$(sha256sum Antigravity-Unlocker-macOS.zip | awk '{print $1}')
+
+          sed -i "s|^  version \".*\"|  version \"${VERSION}\"|" macos/antigravity-unlocker.rb
+          sed -i "s|^  sha256 \".*\"|  sha256 \"${SHA256}\"|" macos/antigravity-unlocker.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet macos/antigravity-unlocker.rb; then
+            git add macos/antigravity-unlocker.rb
+            git commit -m "chore(cask): bump to ${VERSION}"
+            git push origin main
+          fi
+
+      - name: Sync homebrew-tap
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          git clone https://x-access-token:${{ secrets.HOMEBREW_TAP_TOKEN }}@github.com/Fuheshka/homebrew-tap.git tap
+          mkdir -p tap/Casks
+          cp macos/antigravity-unlocker.rb tap/Casks/antigravity-unlocker.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain Casks/antigravity-unlocker.rb)" ]; then
+            git add Casks/antigravity-unlocker.rb
+            git commit -m "chore(cask): bump to ${VERSION}"
+            git push origin main
+          fi
