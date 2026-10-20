@@ -80,6 +80,14 @@ pub struct Settings {
     pub builtin_exits: bool,
     pub group_proxy: bool,
 
+    /// Diagnostics only, set by hand in `settings.json`, never by the window:
+    /// the one route the gate hosts may take (`own`, `group`, `exits`, `relay`,
+    /// `direct`, `vpn`), so a measurement can say which path it timed. Empty =
+    /// the normal route table. A named route that is not usable yields no route
+    /// at all rather than quietly measuring another one.
+    #[serde(default)]
+    pub debug_route: String,
+
     /// Providers the user turned off by name. A deny-list rather than an
     /// allow-list on purpose: a provider added in a later release is then on by
     /// default instead of silently missing from everyone's saved settings.
@@ -149,6 +157,7 @@ impl Default for Settings {
             local_proxy: true,
             builtin_exits: true,
             group_proxy: true,
+            debug_route: String::new(),
             disabled_providers: Vec::new(),
             rotate_providers: true,
             provider_order: Vec::new(),
@@ -438,6 +447,10 @@ pub fn own_proxy_first() -> bool {
 
 pub fn group_key() -> String {
     cached().group_key.clone()
+}
+
+pub fn debug_route() -> String {
+    cached().debug_route.clone()
 }
 
 pub fn builtin_exits_enabled() -> bool {

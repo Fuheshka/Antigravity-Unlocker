@@ -135,13 +135,29 @@ pub const PROVIDERS: &[Provider] = &[
 /// (msk1, nginx) on 2026-09-27 at the service's request - the old node is being
 /// withdrawn; the new one answered `/dns-query` over h2 the same day. The walk spreads queries
 /// evenly across all three - which is the point of listing a node at all (G43).
+/// 2026-10-20: `192.144.59.14` (timeout) and `186.246.49.127` (refused) were
+/// both dead, so two of every three walks paid the full `PER_ADDR_BUDGET` before
+/// an answer - the slow "400 bypass" start. Replaced by the service's current
+/// `194.87.196.13` and `45.151.102.219` (owner's list), both h2 with a valid
+/// `*.dns-ai.ru` certificate in 0.22-0.26 s over the ISP link. Its IPv6 pair
+/// (`2a00:b700:5::3:62`, `2a12:5940:d4ef::219`) is listed too, but unmeasured:
+/// the dev machine has no working IPv6. `doh.rs` decides at runtime - an address
+/// that fails sits out (30 s, doubling to 15 min) and is retried later, an IPv6
+/// one with a 1.2 s slice - so a line without IPv6 pays that once per bench, not
+/// per query (the G43 mistake), and a line with it uses it.
 /// When re-checking (P14), check the ADDRESSES too, not only whether the
 /// provider still substitutes: a hardcoded address is a measurement with an
 /// expiry date.
 pub static DNS_AI: crate::doh::Endpoint = crate::doh::Endpoint {
     host: "dns.dns-ai.ru",
     path: "/dns-query",
-    addrs: &["192.144.59.14", "186.246.49.127", "185.251.90.181"],
+    addrs: &[
+        "194.87.196.13",
+        "45.151.102.219",
+        "185.251.90.181",
+        "2a00:b700:5::3:62",
+        "2a12:5940:d4ef::219",
+    ],
 };
 
 /// Resolvers used only to recognise an unsubstituted answer. They must be

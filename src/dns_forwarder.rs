@@ -151,7 +151,11 @@ pub const LISTEN_PORT: u16 = 53;
 ///     (nor when it is added) - the region-400 watch stands it down instead.
 /// 41 = the third DoH node of dns-ai moved to a new address. An older relay
 ///     keeps dialling the withdrawn one and loses a third of the DoH walk.
-pub const RELAY_VERSION: u32 = 41;
+/// 42 = dns-ai's two dead IPv4 nodes replaced by the live ones, its IPv6 pair
+///     added, and an address that fails sits out of the DoH walk for a while
+///     (`doh::plan`). An older relay still spends 2.5 s of every walk on two
+///     dead addresses - the slow start of the 400 bypass.
+pub const RELAY_VERSION: u32 = 42;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
