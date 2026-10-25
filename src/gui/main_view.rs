@@ -408,15 +408,13 @@ fn advanced_card(app: &mut App, ui: &mut egui::Ui) {
 
             cap_row(app, ui, Cap::Dns);
             providers_list(app, ui);
+            custom_dns_field(app, ui);
 
             ui.add_space(10.0);
             cap_row(app, ui, Cap::LocalProxy);
 
             ui.add_space(10.0);
             cap_row(app, ui, Cap::BuiltinExits);
-
-            ui.add_space(10.0);
-            cap_row(app, ui, Cap::VerifyTls);
 
             ui.add_space(10.0);
             cap_row(app, ui, Cap::OwnProxy);
@@ -650,6 +648,33 @@ fn group_proxy_field(app: &mut App, ui: &mut egui::Ui) {
 
 /// The group's topic where the bot answers the command.
 const GROUP_ROOM_URL: &str = "https://t.me/nova_txt/69864";
+
+/// The user's own DNS server(s) for the bypass: joins the pool as one more provider.
+fn custom_dns_field(app: &mut App, ui: &mut egui::Ui) {
+    let busy = app.is_busy();
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new("Свой DNS для обхода (IPv4 через пробел)")
+            .size(12.0)
+            .color(theme::MUTED),
+    );
+    ui.horizontal(|ui| {
+        ui.add_space(10.0);
+        let field = egui::TextEdit::singleline(&mut app.custom_dns_input)
+            .hint_text("например 77.88.8.8")
+            .desired_width(ui.available_width() - 110.0);
+        let resp = ui.add_enabled(!busy, field);
+        let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if ui
+            .add_enabled(!busy, egui::Button::new("Применить"))
+            .clicked()
+            || entered
+        {
+            let text = app.custom_dns_input.clone();
+            app.worker.send(Cmd::SetCustomDns(text));
+        }
+    });
+}
 
 fn own_proxy_field(app: &mut App, ui: &mut egui::Ui) {
     let busy = app.is_busy();

@@ -705,6 +705,11 @@ const LOG_WATCH_EVERY: Duration = Duration::from_secs(2);
 fn watch_client_logs() {
     loop {
         thread::sleep(LOG_WATCH_EVERY);
+        // The user switched their own proxy off: its open tunnels go too. A pooled
+        // client connection would otherwise keep using it for as long as it lives.
+        if upstream::configured().is_none() {
+            routes::cut_kind(routes::Kind::Own);
+        }
         let hits = ls_log::poll();
         if !hits.is_empty() {
             answer_log(&hits);

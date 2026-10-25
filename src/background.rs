@@ -224,17 +224,33 @@ mod windows_impl {
             if is_running() {
                 return Ok(());
             }
-            if attempt + 1 < RELAY_START_TRIES {
+            // Re-poke the task only twice, a few seconds apart: a cold first start
+            // (antivirus scan of a fresh exe in ProgramData) is slow, and a start
+            // request on top of a still-starting instance is ignored anyway.
+            if attempt + 1 < RELAY_START_TRIES && attempt % 4 == 3 {
                 powershell(&format!("Start-ScheduledTask -TaskName '{}'", TASK_NAME));
             }
         }
-        Err("задача создана, но релей не запустился".to_string())
+        // Say what the task scheduler knows: 0x80070002 = the exe was blocked,
+        // 0x1 = it ran and exited, 0x41303 = it never ran.
+        let last = powershell(&format!(
+            "'{{0:X}}' -f (Get-ScheduledTaskInfo -TaskName '{}').LastTaskResult",
+            TASK_NAME
+        ))
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+        Err(match last {
+            Some(code) => format!(
+                "задача создана, но релей не запустился (код задачи 0x{code}; подробности в forwarder.log)"
+            ),
+            None => "задача создана, но релей не запустился".to_string(),
+        })
     }
 
-    /// How long to give the relay to appear before trying again. Generous enough
-    /// for a UPX-packed exe to unpack and bind, short enough not to stall the menu.
-    const RELAY_START_SETTLE: Duration = Duration::from_millis(1200);
-    const RELAY_START_TRIES: usize = 3;
+    /// How long to give the relay to appear: about 18 s in all. A cold start of a
+    /// fresh exe under antivirus can take well over the 3.6 s this used to allow.
+    const RELAY_START_SETTLE: Duration = Duration::from_millis(1500);
+    const RELAY_START_TRIES: usize = 12;
 
     /// Replaces `dst` with `src`, retrying while the old file is still held.
     ///
@@ -730,7 +746,9 @@ mod unix_impl {
             return Err("не удалось запустить systemd-юнит (systemctl --user)".to_string());
         }
         if (replaced || unit_changed) && !systemctl(&["restart", WATCHDOG_UNIT_NAME]) {
-            return Err("автопатч записан, но служба не перезапустилась (systemctl --user)".to_string());
+            return Err(
+                "автопатч записан, но служба не перезапустилась (systemctl --user)".to_string(),
+            );
         }
         Ok(())
     }

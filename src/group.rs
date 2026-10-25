@@ -574,12 +574,17 @@ enum End {
     NoAnswer,
 }
 
-fn drain_tls_reader(conn: &mut ClientConnection, pending: &mut Vec<u8>) -> bool {
+/// `closed` is set when the server ended the stream cleanly (close_notify): rustls
+/// then stops asking to read, so the socket never reports EOF by itself.
+fn drain_tls_reader(conn: &mut ClientConnection, pending: &mut Vec<u8>, closed: &mut bool) -> bool {
     let mut moved = false;
     let mut buf = [0u8; 16 * 1024];
     loop {
         match conn.reader().read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => {
+                *closed = true;
+                break;
+            }
             Ok(n) => {
                 pending.extend_from_slice(&buf[..n]);
                 moved = true;
@@ -606,6 +611,7 @@ fn tls_pump(
     let mut backoff = crate::proxy::PUMP_MIN_SLEEP;
     let mut client_eof = false;
     let mut upstream_eof = false;
+    let mut closed = false;
     let mut _delivered: u64 = 0;
     let mut _sent: u64 = 0;
     let mut awaiting = false;
@@ -619,7 +625,7 @@ fn tls_pump(
             match conn.read_tls(&mut upstream_sock) {
                 Ok(0) => {
                     let _ = conn.process_new_packets();
-                    let m = drain_tls_reader(&mut conn, &mut pending);
+                    let m = drain_tls_reader(&mut conn, &mut pending, &mut closed);
                     moved |= m;
                     if m {
                         payload = true;
@@ -630,7 +636,7 @@ fn tls_pump(
                 Ok(_) => match conn.process_new_packets() {
                     Ok(_) => moved = true,
                     Err(_) => {
-                        let _ = drain_tls_reader(&mut conn, &mut pending);
+                        let _ = drain_tls_reader(&mut conn, &mut pending, &mut closed);
                         client_eof = true;
                         upstream_eof = true;
                         _why = End::Upstream;
@@ -638,7 +644,7 @@ fn tls_pump(
                 },
                 Err(e) if crate::proxy::would_block(&e) => {}
                 Err(_) => {
-                    let _ = drain_tls_reader(&mut conn, &mut pending);
+                    let _ = drain_tls_reader(&mut conn, &mut pending, &mut closed);
                     client_eof = true;
                     upstream_eof = true;
                     _why = End::Upstream;
@@ -648,13 +654,15 @@ fn tls_pump(
 
         // Drain reader unconditionally if there are decrypted packets waiting
         if pending.is_empty() {
-            let m = drain_tls_reader(&mut conn, &mut pending);
+            let m = drain_tls_reader(&mut conn, &mut pending, &mut closed);
             if m {
                 moved = true;
                 payload = true;
                 awaiting = false;
-            } else if upstream_eof {
-                // we have hit upstream eof and there's really nothing left to drain
+            }
+            if closed && !upstream_eof {
+                upstream_eof = true;
+                _why = End::Upstream;
             }
         }
 
@@ -730,7 +738,7 @@ fn tls_pump(
         if upstream_eof {
             // Plaintext rustls already decrypted is still owed to the client:
             // take all of it before calling the upstream finished.
-            if drain_tls_reader(&mut conn, &mut pending) {
+            if drain_tls_reader(&mut conn, &mut pending, &mut closed) {
                 moved = true;
             }
             if pending.is_empty() && !conn.wants_write() {

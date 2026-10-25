@@ -61,8 +61,6 @@ pub enum Cap {
     // `VpnDetect` is gone (D25): the layer no longer stands down for a tunnel,
     // so there is nothing left for that switch to decide. `settings.vpn_detect`
     // stays in the file so an older build reading it still finds the field.
-    /// Whether a substituted address must present a valid Google certificate.
-    VerifyTls,
 }
 
 impl Cap {
@@ -83,7 +81,6 @@ impl Cap {
             Cap::BuiltinExits => "Встроенные выходы",
             Cap::GroupProxy => "Прокси из группы",
             Cap::DnsRotation => "Ротация DNS-серверов",
-            Cap::VerifyTls => "Сверять TLS",
         }
     }
 }
@@ -201,11 +198,11 @@ pub struct Status {
     pub builtin_exits: State,
     pub group_proxy: State,
     pub dns_rotation: State,
-    pub verify_tls: State,
     /// What the last measurement saw. `None` means it has not been taken yet;
     /// taking it spawns PowerShell, so it is not done on every refresh.
     pub vpn: Option<VpnSeen>,
     pub own_proxy_text: String,
+    pub custom_dns_text: String,
     pub relay_outdated: bool,
     /// Whether the relay task is registered *and* running. The raw fact, kept
     /// beside the `dns` row that already folds it into a verdict: the gate strip
@@ -238,7 +235,6 @@ impl Status {
             Cap::BuiltinExits => &self.builtin_exits,
             Cap::GroupProxy => &self.group_proxy,
             Cap::DnsRotation => &self.dns_rotation,
-            Cap::VerifyTls => &self.verify_tls,
         }
     }
 
@@ -333,6 +329,7 @@ pub enum Cmd {
     AddPath(PathBuf),
     ForgetPath(PathBuf),
     SetOwnProxy(String),
+    SetCustomDns(String),
     SetGroupKey(String),
     SetProvider(String, bool),
     /// The whole pool in the order the user dragged it into.
@@ -591,6 +588,11 @@ fn run_worker(
                 push_status(&mut ctx, Scan::System);
                 ctx.busy(None);
             }
+            Cmd::SetCustomDns(text) => {
+                set_custom_dns(&mut ctx, &text);
+                ctx.settings.save();
+                push_status(&mut ctx, Scan::Settings);
+            }
             Cmd::SetGroupKey(text) => {
                 ctx.busy(Some("Проверка ключа"));
                 match crate::group_key::parse_key(&text) {
@@ -754,7 +756,7 @@ fn scan_after(cap: Cap) -> Scan {
         Cap::Watchdog | Cap::Dns | Cap::LocalProxy | Cap::OwnProxy | Cap::DnsRotation => {
             Scan::System
         }
-        Cap::BuiltinExits | Cap::GroupProxy | Cap::VerifyTls => Scan::Settings,
+        Cap::BuiltinExits | Cap::GroupProxy => Scan::Settings,
     }
 }
 
@@ -837,14 +839,7 @@ impl Status {
     fn with_settings_switches(mut self, s: &Settings) -> Self {
         self.builtin_exits = on_off(s.builtin_exits);
         self.group_proxy = on_off(s.group_proxy);
-        self.verify_tls = if s.verify_tls {
-            State::On
-        } else {
-            // `OffNote`, not `Partial`: off is off. As a `Partial` this switch
-            // could not be turned off at all — the log said it had been and the
-            // next snapshot drew it back on (`State::OffNote`).
-            State::OffNote("подменённые адреса не проверяются".into())
-        };
+        self.custom_dns_text = s.custom_dns.clone();
         self.dns_rotation = if s.rotate_providers {
             State::On
         } else {
@@ -942,9 +937,9 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
         local_proxy,
         own_proxy,
         own_proxy_text,
+        custom_dns_text: ctx.settings.custom_dns.clone(),
         builtin_exits: State::Off,
         group_proxy: State::Off,
-        verify_tls: State::Off,
         vpn: ctx.vpn,
         dns_rotation: State::Off,
         relay_outdated,
@@ -1323,17 +1318,6 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
                         ),
                         None => "Ротация выключена, но все серверы отключены.".to_string(),
                     }
-                },
-            );
-        }
-        (Cap::VerifyTls, on) => {
-            ctx.settings.verify_tls = on;
-            ctx.log(
-                Level::Ok,
-                if on {
-                    "Сверка TLS включена: адрес принимается, только если предъявил настоящий сертификат Google."
-                } else {
-                    "Сверка TLS выключена. Подменённый адрес больше не проверяется — остаётся только проверка, что он вообще отвечает."
                 },
             );
         }
@@ -2099,6 +2083,43 @@ fn disable_local_proxy(ctx: &mut Ctx) {
 
 // --- own proxy -------------------------------------------------------------
 
+/// Saves the user's own DNS server(s). Anything that is not an IPv4 address is
+/// refused with the reason; the slot stays as it was.
+fn set_custom_dns(ctx: &mut Ctx, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        ctx.settings.custom_dns.clear();
+        ctx.settings.set_provider_enabled("свой DNS", true);
+        ctx.log(Level::Ok, "Свой DNS убран.");
+        return;
+    }
+    let found = crate::resolvers::parse_custom_dns(text);
+    let words = text
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .filter(|w| !w.is_empty())
+        .count();
+    if found.is_empty() || found.len() < words {
+        ctx.log(
+            Level::Err,
+            "Нужны IPv4-адреса DNS-серверов через пробел или запятую (не 127.x и не 0.0.0.0), например 77.88.8.8.",
+        );
+        return;
+    }
+    ctx.settings.custom_dns = found
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    ctx.settings.set_provider_enabled("свой DNS", true);
+    ctx.log(
+        Level::Ok,
+        format!(
+            "Свой DNS сохранён ({}). Он участвует в пуле наравне с остальными: ответ сверяется с эталонным.",
+            ctx.settings.custom_dns
+        ),
+    );
+}
+
 fn set_own_proxy(ctx: &mut Ctx, text: &str) {
     ctx.settings.own_proxy = text.trim().to_string();
     if ctx.settings.own_proxy.is_empty() {
@@ -2260,20 +2281,17 @@ mod tests {
     #[test]
     fn a_switch_that_is_off_with_a_note_is_off() {
         let mut s = Settings::default();
-        s.verify_tls = false;
         s.rotate_providers = false;
         s.builtin_exits = false;
         let st = blank_status().with_settings_switches(&s);
 
-        assert!(!st.verify_tls.is_on(), "off with a note is still off");
         assert!(!st.dns_rotation.is_on());
         assert!(!st.builtin_exits.is_on());
         // The note itself must survive — it is what the row says underneath.
-        assert!(st.verify_tls.note().is_some());
         assert!(st.dns_rotation.note().is_some());
 
         let on = blank_status().with_settings_switches(&Settings::default());
-        assert!(on.verify_tls.is_on() && on.dns_rotation.is_on() && on.builtin_exits.is_on());
+        assert!(on.dns_rotation.is_on() && on.builtin_exits.is_on());
     }
 
     /// A settings-only refresh must produce the same switches a full one does,
@@ -2281,10 +2299,9 @@ mod tests {
     #[test]
     fn the_cheap_refresh_and_the_full_one_agree_about_the_settings_switches() {
         let mut s = Settings::default();
-        s.verify_tls = false;
+        s.rotate_providers = false;
         let a = blank_status().with_settings_switches(&s);
         let b = blank_status().with_settings_switches(&s);
-        assert_eq!(a.verify_tls, b.verify_tls);
         assert_eq!(a.dns_rotation, b.dns_rotation);
         assert_eq!(a.providers.len(), crate::resolvers::provider_names().len());
     }
@@ -2293,7 +2310,6 @@ mod tests {
     /// to Windows for scheduled tasks and environment variables.
     #[test]
     fn only_the_switches_that_touch_the_system_pay_for_a_system_scan() {
-        assert_eq!(scan_after(Cap::VerifyTls), Scan::Settings);
         assert_eq!(scan_after(Cap::BuiltinExits), Scan::Settings);
         assert_eq!(scan_after(Cap::GroupProxy), Scan::Settings);
         assert_eq!(scan_after(Cap::Dns), Scan::System);
@@ -2405,9 +2421,9 @@ mod tests {
             builtin_exits: State::Off,
             group_proxy: State::Off,
             dns_rotation: State::Off,
-            verify_tls: State::Off,
             vpn: None,
             own_proxy_text: String::new(),
+            custom_dns_text: String::new(),
             relay_outdated: false,
             relay_running: false,
             rules: false,

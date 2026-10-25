@@ -43,9 +43,23 @@ case "$VER" in
             mkdir -p "$DIR"
             TMP=$(mktemp -d)
             trap 'rm -rf "$TMP"' EXIT
-            curl -fsSL "https://github.com/$REPO/releases/download/$TAG/AG_${VER}_linux.tar.gz" |
+            # The tag spells a fourth number with a dot (v2.24.0.1), the asset with
+            # an underscore (AG_2.24.0_1_linux.tar.gz): try both.
+            ALT=$(echo "$VER" | sed -E 's/\.([0-9]+)$/_\1/')
+            NAME=""
+            for cand in "$VER" "$ALT"; do
+                if curl -fsIL "https://github.com/$REPO/releases/download/$TAG/AG_${cand}_linux.tar.gz" >/dev/null 2>&1; then
+                    NAME="$cand"
+                    break
+                fi
+            done
+            if [ -z "$NAME" ]; then
+                echo "В релизе $TAG нет сборки для Linux." >&2
+                exit 1
+            fi
+            curl -fsSL "https://github.com/$REPO/releases/download/$TAG/AG_${NAME}_linux.tar.gz" |
                 tar xz -C "$TMP"
-            mv -f "$TMP/AG_${VER}_linux/ag_unlocker" "$BIN"
+            mv -f "$TMP/AG_${NAME}_linux/ag_unlocker" "$BIN"
             chmod +x "$BIN"
             echo "$VER" >"$BIN.version"
             rm -rf "$TMP"

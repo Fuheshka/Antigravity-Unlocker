@@ -77,6 +77,7 @@ pub struct App {
     busy: Option<String>,
 
     own_proxy_input: String,
+    custom_dns_input: String,
     /// The group code field; sent once it holds something shaped like a code.
     group_key_input: String,
     /// The group code last handed to the worker, so the field (which shows the
@@ -158,6 +159,7 @@ impl App {
             log_all_selected: false,
             busy: None,
             own_proxy_input: settings.own_proxy.clone(),
+            custom_dns_input: settings.custom_dns.clone(),
             // The saved code stays in the field across restarts and updates,
             // where it can be seen and replaced.
             group_key_input: settings.group_key.clone(),
@@ -237,6 +239,9 @@ impl App {
                     // The field is only refilled when the user is not mid-typing,
                     // otherwise a status push landing between keystrokes would
                     // overwrite what they are entering.
+                    if self.custom_dns_input.is_empty() && !status.custom_dns_text.is_empty() {
+                        self.custom_dns_input = status.custom_dns_text.clone();
+                    }
                     if self.own_proxy_input.is_empty() && !status.own_proxy_text.is_empty() {
                         self.own_proxy_input = status.own_proxy_text.clone();
                     }

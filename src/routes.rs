@@ -1065,6 +1065,18 @@ fn cut_tunnels(kind: Kind) {
     }
 }
 
+/// Closes every open gate tunnel on `kind`, answered or not. Only for the user's
+/// own switch-off of a route: D32 guards a live answer against *our* mistaken
+/// cuts, and a route the user turned off must not keep carrying traffic.
+pub fn cut_kind(kind: Kind) {
+    let Ok(mut list) = TUNNELS.lock() else { return };
+    for t in list.iter_mut().filter(|t| t.kind == kind && t.closed.is_none()) {
+        for sock in [t.client.take(), t.upstream.take()].into_iter().flatten() {
+            sock.shutdown(std::net::Shutdown::Both).ok();
+        }
+    }
+}
+
 /// The route that carried a request answered at `at`: the one with a tunnel
 /// open around that moment, for `host` when the log line named it. When tunnels
 /// on several routes were open, the one opened most recently before it - a

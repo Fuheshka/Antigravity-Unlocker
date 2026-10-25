@@ -3,7 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::dns_forwarder;
 use crate::patch_binary::{self, RepatchOutcome};
@@ -105,10 +105,39 @@ fn run() {
     let mut installs = discover();
     let mut cycles: u32 = 0;
     let mut listener = ListenerGuard::default();
+    let mut updaters = updater_dirs();
+    let mut fast_until: Option<Instant> = None;
+    let mut fast_polls: u32 = 0;
 
     loop {
+        // An update being installed is the one moment a poll every two seconds
+        // is too slow: the installer starts the new app the instant it has
+        // written the files, and the app starts its Language Server at once.
+        // While a downloaded update is staged (and for a minute after it goes)
+        // the files are looked at every 150 ms instead.
+        if updater_busy(&updaters) {
+            fast_until = Some(Instant::now() + FAST_FOR);
+        }
+        let fast = fast_until.is_some_and(|t| Instant::now() < t);
+        if fast {
+            fast_polls = fast_polls.wrapping_add(1);
+            if fast_polls % FAST_REDISCOVER_EVERY == 0 {
+                installs = discover();
+                updaters = updater_dirs();
+            }
+            if crate::settings::auto_patch_wanted() {
+                for inst in &installs {
+                    for target in targets(inst) {
+                        inspect(&target, states.entry(target.clone()).or_default());
+                    }
+                }
+            }
+            thread::sleep(FAST_POLL);
+            continue;
+        }
         if cycles % REDISCOVER_EVERY == 0 {
             installs = discover();
+            updaters = updater_dirs();
         }
         // Not on the first poll: at logon this task and the relay's start
         // together, and a miss before the relay has bound would start the count
@@ -137,6 +166,46 @@ fn run() {
 
         thread::sleep(POLL);
     }
+}
+
+/// Poll interval while an update is staged, and how long that lasts after the
+/// staged installer is gone. Re-discovery stays at about nine seconds.
+const FAST_POLL: Duration = Duration::from_millis(150);
+const FAST_FOR: Duration = Duration::from_secs(90);
+const FAST_REDISCOVER_EVERY: u32 = 60;
+
+/// Antigravity's updater keeps a downloaded installer in
+/// `%LOCALAPPDATA%\<name>-updater\pending` until it runs it (measured: electron
+/// -updater, `antigravity-updater\pending\Antigravity-x64.exe`). Filesystem
+/// checks only.
+fn updater_dirs() -> Vec<PathBuf> {
+    let Some(base) = std::env::var_os("LOCALAPPDATA") else {
+        return Vec::new();
+    };
+    let Ok(rd) = fs::read_dir(PathBuf::from(base)) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_lowercase();
+            n.contains("antigravity") && n.ends_with("-updater")
+        })
+        .map(|e| e.path().join("pending"))
+        .collect()
+}
+
+/// True while a staged installer is in use: opening a running exe for writing
+/// fails with a sharing violation, a file that merely waits for the user opens
+/// fine (and is left untouched). Without this a downloaded update would keep
+/// the fast poll on for as long as it waits - days, if the user never quits.
+fn updater_busy(dirs: &[PathBuf]) -> bool {
+    dirs.iter().any(|d| {
+        let Ok(rd) = fs::read_dir(d) else { return false };
+        rd.flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "exe"))
+            .any(|p| OpenOptions::new().append(true).open(&p).is_err())
+    })
 }
 
 /// How often the proxy listener is looked at, in polls. 15 x 2 s = 30 s.
