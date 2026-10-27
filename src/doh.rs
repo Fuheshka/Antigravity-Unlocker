@@ -308,22 +308,90 @@ fn query_via(pool: &Pool, ep: &Endpoint, wire: &[u8], budget: Duration) -> Resul
         return Err(last);
     }
     let start = NEXT_ADDR.fetch_add(1, Ordering::Relaxed);
-    for idx in walk(n, start) {
+    let ips: Vec<IpAddr> = ep.addrs.iter().filter_map(|a| a.parse().ok()).collect();
+    for ip in plan(&ips, start, Instant::now()) {
         let now = Instant::now();
         if now >= deadline {
             break;
         }
-        let addr = ep.addrs[idx];
-        let slice = PER_ADDR_BUDGET.min(deadline - now);
-        let Ok(ip) = addr.parse::<IpAddr>() else {
-            continue;
+        // An IPv6 address is tried with a short slice: a line without IPv6 either
+        // refuses at once or blackholes, and a blackhole must not cost the full
+        // slice of a healthy sibling. A working one completes in well under it.
+        let cap = if ip.is_ipv6() {
+            V6_BUDGET
+        } else {
+            PER_ADDR_BUDGET
         };
+        let slice = cap.min(deadline - now);
         match query_one(pool, ep, ip, wire, slice) {
-            Ok(reply) => return Ok(reply),
-            Err(e) => last = e,
+            Ok(reply) => {
+                unbench(ip);
+                return Ok(reply);
+            }
+            Err(e) => {
+                // A slice cut short by the caller's deadline says nothing about
+                // the address.
+                if slice >= V6_BUDGET {
+                    bench(ip, Instant::now());
+                }
+                last = e;
+            }
         }
     }
     Err(last)
+}
+
+/// What an IPv6 address gets for connect + TLS + exchange.
+const V6_BUDGET: Duration = Duration::from_millis(1200);
+
+/// First and longest a failed address sits out, doubling per consecutive failure.
+/// Short first step so a blip costs little; the cap keeps a line that gains IPv6
+/// later (or a node that returns) from being forgotten for long.
+const BENCH_FIRST: Duration = Duration::from_secs(30);
+const BENCH_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// Address -> (benched until, consecutive failures). Process-wide like `POOL`:
+/// whether `2a00:...` is reachable is a fact about this machine's line, not
+/// about one endpoint or one caller.
+static BENCH: Mutex<Option<HashMap<IpAddr, (Instant, u32)>>> = Mutex::new(None);
+
+fn bench(ip: IpAddr, now: Instant) {
+    let mut g = BENCH.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(HashMap::new);
+    let fails = map.get(&ip).map_or(0, |&(_, f)| f).saturating_add(1);
+    map.insert(ip, (now + bench_for(fails), fails));
+}
+
+fn unbench(ip: IpAddr) {
+    let mut g = BENCH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = g.as_mut() {
+        map.remove(&ip);
+    }
+}
+
+fn bench_for(fails: u32) -> Duration {
+    BENCH_FIRST
+        .saturating_mul(1u32 << fails.saturating_sub(1).min(5))
+        .min(BENCH_MAX)
+}
+
+/// The addresses to try, in walk order, minus the ones sitting out. When every
+/// address is benched the whole list is tried anyway: a bench is a preference,
+/// never a reason to answer nothing.
+fn plan(ips: &[IpAddr], start: usize, now: Instant) -> Vec<IpAddr> {
+    let g = BENCH.lock().unwrap_or_else(|e| e.into_inner());
+    let out: Vec<IpAddr> = walk(ips.len(), start)
+        .map(|i| ips[i])
+        .filter(|ip| {
+            g.as_ref()
+                .and_then(|m| m.get(ip))
+                .is_none_or(|&(until, _)| until <= now)
+        })
+        .collect();
+    if out.is_empty() {
+        return walk(ips.len(), start).map(|i| ips[i]).collect();
+    }
+    out
 }
 
 /// One address, one query: on a kept connection if there is one, and once
@@ -856,6 +924,37 @@ impl ReadWrite for rustls::Stream<'_, ClientConnection, Bounded> {
 }
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_benched_address_leaves_the_plan_and_returns_when_the_bench_ends() {
+        let a: IpAddr = "203.0.113.1".parse().unwrap();
+        let b: IpAddr = "2001:db8::1".parse().unwrap();
+        let t0 = Instant::now();
+        bench(b, t0);
+        assert_eq!(plan(&[a, b], 0, t0), vec![a]);
+        assert_eq!(plan(&[a, b], 0, t0 + BENCH_FIRST + Duration::from_secs(1)), vec![a, b]);
+        unbench(b);
+        assert_eq!(plan(&[a, b], 1, t0), vec![b, a]);
+    }
+
+    #[test]
+    fn when_every_address_is_benched_all_are_still_tried() {
+        let a: IpAddr = "203.0.113.7".parse().unwrap();
+        let b: IpAddr = "2001:db8::7".parse().unwrap();
+        let t0 = Instant::now();
+        bench(a, t0);
+        bench(b, t0);
+        assert_eq!(plan(&[a, b], 0, t0).len(), 2);
+        unbench(a);
+        unbench(b);
+    }
+
+    #[test]
+    fn the_bench_doubles_and_is_capped() {
+        assert_eq!(bench_for(1), BENCH_FIRST);
+        assert_eq!(bench_for(2), BENCH_FIRST * 2);
+        assert_eq!(bench_for(40), BENCH_MAX);
+    }
     use super::*;
 
     /// The rotation must not cost an address its turn: whatever the start, the

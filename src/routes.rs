@@ -551,8 +551,24 @@ pub fn set_context(fingerprint: u64) -> bool {
 /// non-reentrant lock held across that call deadlocked the very first live
 /// connection (G30, I50).
 pub fn order(usable: impl Fn(Kind) -> bool) -> Vec<Kind> {
+    if let Some(k) = forced(&crate::settings::debug_route()) {
+        return if usable(k) { vec![k] } else { Vec::new() };
+    }
     let s = snapshot();
     order_with(&s, cfg!(target_os = "windows"), usable)
+}
+
+/// The route a diagnostic run pinned in `settings.json` (`debug_route`).
+fn forced(name: &str) -> Option<Kind> {
+    Some(match name.trim().to_ascii_lowercase().as_str() {
+        "own" => Kind::Own,
+        "group" => Kind::Group,
+        "exits" => Kind::Exits,
+        "relay" => Kind::Relay,
+        "direct" => Kind::Direct,
+        "vpn" => Kind::Vpn,
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1049,6 +1065,18 @@ fn cut_tunnels(kind: Kind) {
     }
 }
 
+/// Closes every open gate tunnel on `kind`, answered or not. Only for the user's
+/// own switch-off of a route: D32 guards a live answer against *our* mistaken
+/// cuts, and a route the user turned off must not keep carrying traffic.
+pub fn cut_kind(kind: Kind) {
+    let Ok(mut list) = TUNNELS.lock() else { return };
+    for t in list.iter_mut().filter(|t| t.kind == kind && t.closed.is_none()) {
+        for sock in [t.client.take(), t.upstream.take()].into_iter().flatten() {
+            sock.shutdown(std::net::Shutdown::Both).ok();
+        }
+    }
+}
+
 /// The route that carried a request answered at `at`: the one with a tunnel
 /// open around that moment, for `host` when the log line named it. When tunnels
 /// on several routes were open, the one opened most recently before it - a
@@ -1263,6 +1291,14 @@ fn note(message: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_pinned_route_name_maps_to_its_kind_and_junk_to_none() {
+        assert_eq!(forced(" Relay "), Some(Kind::Relay));
+        assert_eq!(forced("vpn"), Some(Kind::Vpn));
+        assert_eq!(forced(""), None);
+        assert_eq!(forced("proxy"), None);
+    }
     use super::*;
 
     fn ms(n: u64) -> Duration {

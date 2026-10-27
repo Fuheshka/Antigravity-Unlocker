@@ -80,10 +80,26 @@ pub struct Settings {
     pub builtin_exits: bool,
     pub group_proxy: bool,
 
+    /// Diagnostics only, set by hand in `settings.json`, never by the window:
+    /// the one route the gate hosts may take (`own`, `group`, `exits`, `relay`,
+    /// `direct`, `vpn`), so a measurement can say which path it timed. Empty =
+    /// the normal route table. A named route that is not usable yields no route
+    /// at all rather than quietly measuring another one.
+    #[serde(default)]
+    pub debug_route: String,
+
     /// Providers the user turned off by name. A deny-list rather than an
     /// allow-list on purpose: a provider added in a later release is then on by
     /// default instead of silently missing from everyone's saved settings.
     pub disabled_providers: Vec<String>,
+
+    /// The user's own DNS server(s) for the bypass: IPv4 addresses separated by
+    /// spaces, commas or semicolons. They join the pool as one more provider
+    /// («свой DNS»): raced with the others, every answer judged against the
+    /// reference resolver, so a server that does not substitute the gate hosts
+    /// costs nothing. Empty means the slot is unused.
+    #[serde(default)]
+    pub custom_dns: String,
 
     /// Whether every enabled provider may answer, or only the first one.
     ///
@@ -110,15 +126,10 @@ pub struct Settings {
     /// a newer file still finds its field.
     pub vpn_detect: bool,
 
-    /// Whether a substituted address must prove itself with a real certificate
-    /// before it is handed to the client.
-    ///
-    /// On (the default): the liveness probe completes a full TLS handshake for
-    /// the gate hostname against the public CA roots, so an address that fronts
-    /// anything other than a genuine Google endpoint is dropped from the answer.
-    /// That is the one check standing between an unblock service and a listener
-    /// that could read the traffic. Off: TCP on 443 only — faster on a slow link,
-    /// and no protection against a substituted address that is not what it says.
+    /// No longer a switch: the certificate of a substituted address is always
+    /// verified, and an address that passed is trusted for a day (`resolvers.rs`,
+    /// `TLS_VERIFIED_FOR`). Stays in the file so an older build still finds it.
+    #[allow(dead_code)]
     pub verify_tls: bool,
 
     /// The user's own HTTP proxy ("bring your own exit"). Kept even while off so
@@ -149,7 +160,9 @@ impl Default for Settings {
             local_proxy: true,
             builtin_exits: true,
             group_proxy: true,
+            debug_route: String::new(),
             disabled_providers: Vec::new(),
+            custom_dns: String::new(),
             rotate_providers: true,
             provider_order: Vec::new(),
             vpn_detect: true,
@@ -370,6 +383,10 @@ fn cached_from_disk() -> Settings {
     fresh
 }
 
+pub fn custom_dns_cached() -> String {
+    cached().custom_dns
+}
+
 pub fn disabled_providers_cached() -> Vec<String> {
     cached().disabled_providers
 }
@@ -388,12 +405,6 @@ pub fn rotation_enabled() -> bool {
 ///
 /// Read from `dns.rs`, which runs in the window *and* in the relay, so it goes
 /// through the cache like every other cross-process setting.
-/// Whether a substituted address must present a valid certificate for the gate
-/// host before it is used. Read on the resolver's hot path, so it goes through
-/// the cache like every other cross-process setting.
-pub fn verify_tls_enabled() -> bool {
-    cached().verify_tls
-}
 
 /// Whether the watchdog may patch what it finds: auto-patch on, and the patch
 /// not switched off by hand (D27).
@@ -438,6 +449,10 @@ pub fn own_proxy_first() -> bool {
 
 pub fn group_key() -> String {
     cached().group_key.clone()
+}
+
+pub fn debug_route() -> String {
+    cached().debug_route.clone()
 }
 
 pub fn builtin_exits_enabled() -> bool {

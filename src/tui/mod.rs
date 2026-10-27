@@ -112,6 +112,7 @@ enum Screen {
 enum Input {
     Path { text: String, error: Option<String> },
     OwnProxy { text: String },
+    CustomDns { text: String },
 }
 
 /// One selectable line of the main list.
@@ -127,6 +128,7 @@ enum Row {
     Advanced,
     Provider(usize),
     OwnProxyText,
+    CustomDnsText,
     GroupProxyText,
     GroupProxyOpenRoom,
     GroupProxyCopy,
@@ -321,7 +323,9 @@ impl App {
         if self.screen == Screen::License {
             self.key = text.to_string();
             self.key_error = false;
-        } else if let Some(Input::Path { text: t, .. } | Input::OwnProxy { text: t }) =
+        } else if let Some(Input::Path { text: t, .. }
+            | Input::OwnProxy { text: t }
+            | Input::CustomDns { text: t }) =
             &mut self.input
         {
             t.push_str(text);
@@ -373,7 +377,7 @@ impl App {
     fn on_input_key(&mut self, k: KeyEvent, ctrl: bool) {
         let Some(input) = &mut self.input else { return };
         let text = match input {
-            Input::Path { text, .. } | Input::OwnProxy { text } => text,
+            Input::Path { text, .. } | Input::OwnProxy { text } | Input::CustomDns { text } => text,
         };
         match k.code {
             KeyCode::Esc => self.input = None,
@@ -406,6 +410,9 @@ impl App {
             }
             Some(Input::OwnProxy { text }) => {
                 self.worker.send(Cmd::SetOwnProxy(text.trim().to_string()))
+            }
+            Some(Input::CustomDns { text }) => {
+                self.worker.send(Cmd::SetCustomDns(text.trim().to_string()))
             }
             None => {}
         }
@@ -565,6 +572,11 @@ impl App {
                     text: self.own_proxy_text(),
                 })
             }
+            Row::CustomDnsText => {
+                self.input = Some(Input::CustomDns {
+                    text: self.custom_dns_text(),
+                })
+            }
             Row::Report => self.save_report(),
         }
     }
@@ -643,6 +655,13 @@ impl App {
         self.worker.send(Cmd::ReorderProviders(order));
     }
 
+    fn custom_dns_text(&self) -> String {
+        self.status
+            .as_ref()
+            .map(|s| s.custom_dns_text.clone())
+            .unwrap_or_default()
+    }
+
     fn own_proxy_text(&self) -> String {
         self.status
             .as_ref()
@@ -706,6 +725,7 @@ impl App {
             if providers > 0 {
                 rows.push(Row::Cap(Cap::DnsRotation));
             }
+            rows.push(Row::CustomDnsText);
             rows.push(Row::Cap(Cap::LocalProxy));
             rows.push(Row::Cap(Cap::BuiltinExits));
             rows.push(Row::Cap(Cap::GroupProxy));
@@ -713,7 +733,6 @@ impl App {
             rows.push(Row::GroupProxyOpenRoom);
             rows.push(Row::GroupProxyCopy);
             rows.push(Row::GroupProxyPaste);
-            rows.push(Row::Cap(Cap::VerifyTls));
             rows.push(Row::Cap(Cap::OwnProxy));
             rows.push(Row::OwnProxyText);
         }
@@ -749,6 +768,7 @@ impl App {
             Row::GroupProxyOpenRoom => "Открыть Telegram-комнату для получения ключа.".into(),
             Row::GroupProxyCopy => "Скопировать команду для получения ключа.".into(),
             Row::GroupProxyPaste => "Вставить полученный ключ из буфера обмена.".into(),
+            Row::CustomDnsText => "Enter — задать свой DNS: IPv4-адреса через пробел.".into(),
             Row::OwnProxyText => {
                 "Enter — изменить адрес: логин:пароль@адрес:порт (или адрес:порт без пароля).".into()
             }
@@ -850,6 +870,18 @@ impl App {
             Row::GroupProxyOpenRoom => ListItem::new(Line::from(vec![Span::styled("      > Открыть комнату группы", Style::new().fg(Color::Cyan))])),
             Row::GroupProxyCopy => ListItem::new(Line::from(vec![Span::styled("      > Скопировать команду", Style::new().fg(Color::Cyan))])),
             Row::GroupProxyPaste => ListItem::new(Line::from(vec![Span::styled("      > Вставить ключ из буфера", Style::new().fg(Color::Cyan))])),
+            Row::CustomDnsText => {
+                let text = self.custom_dns_text();
+                let shown = if text.is_empty() {
+                    "не задан".to_string()
+                } else {
+                    text
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw("      Свой DNS: "),
+                    Span::styled(shown, Style::new().fg(Color::Gray)),
+                ]))
+            }
             Row::OwnProxyText => {
                 let text = self.own_proxy_text();
                 let shown = if text.is_empty() {
@@ -1130,6 +1162,12 @@ impl App {
                 "Папка установки Antigravity, IDE или CLI. Можно указать вложенную — корень будет найден сам.",
                 text,
                 error.as_deref(),
+            ),
+            Some(Input::CustomDns { text }) => (
+                " Свой DNS ",
+                "IPv4-адреса DNS-серверов через пробел. Сервер участвует в пуле наравне с остальными, ответ сверяется с эталонным. Пустая строка — убрать.",
+                text,
+                None,
             ),
             Some(Input::OwnProxy { text }) => (
                 " Свой HTTP-прокси ",

@@ -177,7 +177,6 @@ fn status_part(out: &mut String, s: &Status) {
         crate::hwid::pc_code()
     );
     let _ = writeln!(out, "Свой прокси: {}", onoff(&s.own_proxy));
-    let _ = writeln!(out, "Сверять TLS: {}", onoff(&s.verify_tls));
     let _ = writeln!(
         out,
         "Служба: {}{}; правила DNS: {}",

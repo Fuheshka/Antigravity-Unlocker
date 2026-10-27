@@ -42,6 +42,34 @@ pub enum Transport {
     Udp,
     /// DNS-over-HTTPS. Reachable only through the relay, never by Windows.
     Doh(&'static crate::doh::Endpoint),
+    /// The user's own DNS server(s), read from `settings.custom_dns` at query
+    /// time (`custom_dns_servers`). Like a DoH provider it carries empty `v4`/`v6`:
+    /// the addresses are not ours to put into an NRPT rule, only the relay asks.
+    Custom,
+}
+
+/// The user's own DNS servers: IPv4 literals split on whitespace, commas and
+/// semicolons. Loopback, unspecified and multicast addresses are dropped - the
+/// relay itself listens on 127.0.0.53, and pointing it at itself would loop.
+pub fn parse_custom_dns(text: &str) -> Vec<Ipv4Addr> {
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+    for part in text.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Ok(ip) = part.parse::<Ipv4Addr>() {
+            if !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() && !out.contains(&ip)
+            {
+                out.push(ip);
+            }
+        }
+    }
+    out
+}
+
+pub fn custom_dns_servers() -> Vec<Ipv4Addr> {
+    parse_custom_dns(&crate::settings::custom_dns_cached())
 }
 
 /// One unblock service. Addresses are tried in order; the first that answers
@@ -105,6 +133,13 @@ pub const PROVIDERS: &[Provider] = &[
         v6: &["2a0c:9300:0:54::1"],
         transport: Transport::Udp,
     },
+    // Last on purpose: the user's own server, empty until they type one in.
+    Provider {
+        name: "свой DNS",
+        v4: &[],
+        v6: &[],
+        transport: Transport::Custom,
+    },
     // xbox-dns.ru is not here any more (owner, 2.14.0_1). Measured over the ISP
     // link on 2026-09-18, both its resolvers answer both gate hosts with genuine
     // Google (`172.217.x`, the set 8.8.8.8 gives) and substitute only
@@ -135,13 +170,29 @@ pub const PROVIDERS: &[Provider] = &[
 /// (msk1, nginx) on 2026-09-27 at the service's request - the old node is being
 /// withdrawn; the new one answered `/dns-query` over h2 the same day. The walk spreads queries
 /// evenly across all three - which is the point of listing a node at all (G43).
+/// 2026-10-20: `192.144.59.14` (timeout) and `186.246.49.127` (refused) were
+/// both dead, so two of every three walks paid the full `PER_ADDR_BUDGET` before
+/// an answer - the slow "400 bypass" start. Replaced by the service's current
+/// `194.87.196.13` and `45.151.102.219` (owner's list), both h2 with a valid
+/// `*.dns-ai.ru` certificate in 0.22-0.26 s over the ISP link. Its IPv6 pair
+/// (`2a00:b700:5::3:62`, `2a12:5940:d4ef::219`) is listed too, but unmeasured:
+/// the dev machine has no working IPv6. `doh.rs` decides at runtime - an address
+/// that fails sits out (30 s, doubling to 15 min) and is retried later, an IPv6
+/// one with a 1.2 s slice - so a line without IPv6 pays that once per bench, not
+/// per query (the G43 mistake), and a line with it uses it.
 /// When re-checking (P14), check the ADDRESSES too, not only whether the
 /// provider still substitutes: a hardcoded address is a measurement with an
 /// expiry date.
 pub static DNS_AI: crate::doh::Endpoint = crate::doh::Endpoint {
     host: "dns.dns-ai.ru",
     path: "/dns-query",
-    addrs: &["192.144.59.14", "186.246.49.127", "185.251.90.181"],
+    addrs: &[
+        "194.87.196.13",
+        "45.151.102.219",
+        "185.251.90.181",
+        "2a00:b700:5::3:62",
+        "2a12:5940:d4ef::219",
+    ],
 };
 
 /// Resolvers used only to recognise an unsubstituted answer. They must be
@@ -498,7 +549,47 @@ fn cached_liveness(addr: &IpAddr) -> Option<bool> {
     (at.elapsed() < ttl).then_some(*alive)
 }
 
+/// How long a certificate check that passed is believed (once a day).
+///
+/// The chain and the name are verified against the public roots, always. Doing it
+/// on every 20-second liveness probe costs a full handshake each time for an
+/// answer that changes about as often as a provider rebuilds its proxy, so an
+/// address that passed is only re-checked after this long; in between, the probe
+/// is the connection alone. A failure is never remembered: it is retried at the
+/// liveness cadence like any dead address.
+const TLS_VERIFIED_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+
+static TLS_VERIFIED: Mutex<Option<HashMap<(IpAddr, String), Instant>>> = Mutex::new(None);
+
+fn tls_verified_recently(addr: IpAddr, name: &str) -> bool {
+    let Ok(guard) = TLS_VERIFIED.lock() else {
+        return false;
+    };
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&(addr, name.to_string())))
+        .is_some_and(|at| at.elapsed() < TLS_VERIFIED_FOR)
+}
+
+fn remember_tls_verified(addr: IpAddr, name: &str) {
+    if let Ok(mut guard) = TLS_VERIFIED.lock() {
+        guard
+            .get_or_insert_with(HashMap::new)
+            .insert((addr, name.to_string()), Instant::now());
+    }
+}
+
 fn remember_liveness(addr: IpAddr, alive: bool) {
+    // An address that stopped answering has to prove itself again when it comes
+    // back: the day's trust was for the endpoint that was there, not for
+    // whatever is listening after an outage.
+    if !alive {
+        if let Ok(mut guard) = TLS_VERIFIED.lock() {
+            if let Some(m) = guard.as_mut() {
+                m.retain(|(a, _), _| *a != addr);
+            }
+        }
+    }
     if let Ok(mut guard) = LIVENESS.lock() {
         guard
             .get_or_insert_with(HashMap::new)
@@ -520,8 +611,8 @@ fn remember_liveness(addr: IpAddr, alive: bool) {
 /// paths below answer `false`: giving an unverifiable address the benefit of the
 /// doubt is exactly the doubt the check exists to remove.
 ///
-/// With no `sni` — the user switched the check off — it falls back to the
-/// connection alone.
+/// With no `sni` it falls back to the connection alone. A handshake that
+/// verified is remembered for `TLS_VERIFIED_FOR`.
 fn reachable(addr: IpAddr, budget: Duration, sni: Option<&str>) -> bool {
     let Ok(sock) =
         std::net::TcpStream::connect_timeout(&SocketAddr::new(addr, LIVENESS_PORT), budget)
@@ -531,6 +622,9 @@ fn reachable(addr: IpAddr, budget: Duration, sni: Option<&str>) -> bool {
     let Some(name) = sni else {
         return true;
     };
+    if tls_verified_recently(addr, name) {
+        return true;
+    }
     let Ok(server) = ServerName::try_from(name.to_string()) else {
         return false;
     };
@@ -562,6 +656,7 @@ fn reachable(addr: IpAddr, budget: Duration, sni: Option<&str>) -> bool {
             }
         }
     }
+    remember_tls_verified(addr, name);
     true
 }
 
@@ -601,14 +696,7 @@ fn dead_addrs(addrs: &[IpAddr], fresh: bool, sni: Option<&str>) -> Vec<IpAddr> {
     for a in &unknown {
         let tx = tx.clone();
         let addr = *a;
-        // The switch is read here, at the one place the probe is started, so an
-        // answer already in the liveness cache is not re-judged by a rule that
-        // changed after it was measured — the cache entry expires on its own.
-        let sni = if crate::settings::verify_tls_enabled() {
-            sni.map(|s| s.to_string())
-        } else {
-            None
-        };
+        let sni = sni.map(|s| s.to_string());
         thread::spawn(move || {
             let ok = reachable(addr, budget, sni.as_deref());
             tx.send((addr, ok)).ok();
@@ -1004,6 +1092,14 @@ fn ask_provider(
             }
             None
         }
+        Transport::Custom => {
+            for ip in custom_dns_servers() {
+                if let Ok(reply) = dns_client::query_raw_via(query, ip, if_index, timeout) {
+                    return Some(reply);
+                }
+            }
+            None
+        }
         Transport::Doh(endpoint) => {
             let mut reply = crate::doh::query(endpoint, query, timeout).ok()?;
             // Re-stamp the transaction id. RFC 8484 tells a DoH client to send 0
@@ -1231,7 +1327,7 @@ fn preferred_provider(name: &str) -> Option<usize> {
 fn one_shot_floor(provider: &Provider, budget: Duration) -> Duration {
     match provider.transport {
         Transport::Doh(_) => budget.max(DOH_FAST_TIMEOUT),
-        Transport::Udp => budget,
+        Transport::Udp | Transport::Custom => budget,
     }
 }
 
@@ -1857,6 +1953,28 @@ mod tests {
             .iter()
             .filter(|p| matches!(p.transport, Transport::Udp))
             .collect()
+    }
+
+    #[test]
+    fn custom_dns_takes_plain_ipv4_and_refuses_loops_and_junk() {
+        let got = parse_custom_dns("77.88.8.8, 77.88.8.8;1.1.1.1  127.0.0.53 0.0.0.0 junk 224.0.0.1");
+        assert_eq!(
+            got,
+            vec!["77.88.8.8".parse::<Ipv4Addr>().unwrap(), "1.1.1.1".parse().unwrap()]
+        );
+        assert!(parse_custom_dns("").is_empty());
+    }
+
+    /// The slot carries no address of its own (like a DoH provider): it must never
+    /// leak into an NRPT nameserver list, and it must be in the pool.
+    #[test]
+    fn the_custom_slot_is_in_the_pool_and_offers_no_nameserver() {
+        let p = PROVIDERS
+            .iter()
+            .find(|p| matches!(p.transport, Transport::Custom))
+            .expect("a custom slot");
+        assert!(p.v4.is_empty() && p.v6.is_empty());
+        assert!(!fallback_v4().iter().any(|a| a.is_empty()));
     }
 
     #[test]
@@ -2511,6 +2629,21 @@ mod tests {
         assert!(dead_addrs(&[addr], false, None).is_empty());
         // ...while the warm path asks the network and finds out otherwise.
         assert_eq!(dead_addrs(&[addr], true, None), vec![addr]);
+    }
+
+    /// A certificate check that passed is remembered for a day, per address and
+    /// name; nothing else is remembered, and another name is checked afresh.
+    #[test]
+    fn a_verified_certificate_is_remembered_for_a_day_and_per_name() {
+        let addr: IpAddr = "203.0.113.77".parse().unwrap();
+        assert!(!tls_verified_recently(addr, "a.example"));
+        remember_tls_verified(addr, "a.example");
+        assert!(tls_verified_recently(addr, "a.example"));
+        assert!(!tls_verified_recently(addr, "b.example"));
+        assert_eq!(TLS_VERIFIED_FOR, Duration::from_secs(86_400));
+        // ...but an outage ends it: the address is checked afresh on its return.
+        remember_liveness(addr, false);
+        assert!(!tls_verified_recently(addr, "a.example"));
     }
 
     /// Believing "alive" for longer than the providers keep an address alive is
