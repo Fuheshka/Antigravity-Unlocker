@@ -39,7 +39,8 @@ if URL=$(curl -fsSLo /dev/null -w '%{url_effective}' "https://github.com/$REPO/r
 fi
 VER="${TAG#v}"
 
-case "$VER" in
+# Теги форка для macOS: 2.26.0-macos.1 — суффикс в проверку не идёт.
+case "${VER%-macos.*}" in
     "" | *[!0-9._]*)
         if [ -x "$BIN" ]; then
             echo "GitHub не ответил — запускаю уже скачанную версию." >&2
