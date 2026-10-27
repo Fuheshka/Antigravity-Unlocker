@@ -1,6 +1,6 @@
 cask "antigravity-unlocker" do
-  version "2.24.0-macos.1"
-  sha256 "bdde79abd9983850d9704f814187894454ca0fb798b56ba342189b39afd8e1a4"
+  version "2.26.0-macos.1"
+  sha256 "19d3b314e103e11950fea560ecc94fb4429d084d929c3c5356ef4c49b89e09aa"
 
   url "https://github.com/Fuheshka/Antigravity-Unlocker/releases/download/v#{version}/Antigravity-Unlocker-macOS.zip"
   name "Antigravity Unlocker"
