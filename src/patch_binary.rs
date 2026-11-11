@@ -56,28 +56,28 @@ fn count_occurrences(data: &[u8], needle: &[u8]) -> usize {
 /// to launch. A running executable is locked on Windows, so the owning process is
 /// killed and the write retried only if the first attempt actually fails.
 fn write_binary(bin_path: &Path, data: &[u8]) -> Result<(), String> {
-    let outcome = if write_atomic(bin_path, data).is_ok() {
-        Ok(())
-    } else {
-        kill_holder(bin_path);
-        thread::sleep(Duration::from_millis(500));
-        write_atomic(bin_path, data).map_err(|e| e.to_string())
+    let res = match write_atomic(bin_path, data) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            kill_holder(bin_path);
+            thread::sleep(Duration::from_millis(500));
+            write_atomic(bin_path, data).map_err(|e| e.to_string())
+        }
     };
-
-    if outcome.is_ok() {
-        #[cfg(target_os = "macos")]
-        resign_macho_ad_hoc(bin_path);
-    }
-    outcome
-}
-
-#[cfg(target_os = "macos")]
-fn resign_macho_ad_hoc(bin_path: &Path) {
-    let _ = Command::new("codesign")
-        .args(["--force", "-s", "-", bin_path.to_string_lossy().as_ref()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    // macOS: a bundle changed under a quarantine flag is "damaged" to
+    // Gatekeeper on its first launch, so the flag goes with the patch; a
+    // refused write into a bundle says which switch macOS wants.
+    #[cfg(target_os = "macos")]
+    let res = match res {
+        Ok(()) => {
+            if let Some(app) = crate::macos::bundle_of(bin_path) {
+                crate::macos::strip_quarantine(&app);
+            }
+            Ok(())
+        }
+        Err(e) => Err(crate::macos::app_management_hint(bin_path, &e)),
+    };
+    res
 }
 
 /// Kills whatever process holds `bin_path` open so the write can be retried.
@@ -188,6 +188,19 @@ fn write_atomic(bin_path: &Path, data: &[u8]) -> std::io::Result<()> {
             .map(|m| m.permissions().mode())
             .unwrap_or(0o755);
         let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(mode));
+    }
+    // macOS: the edited Mach-O no longer matches its signature and Apple
+    // Silicon would kill it at exec. The temp is re-signed before the rename,
+    // so the name never points at a binary the kernel refuses (S80). The
+    // rename also gives it a fresh vnode - an in-place write would keep the
+    // kernel's cached signature of the old one.
+    #[cfg(target_os = "macos")]
+    if crate::macos::is_macho(data) {
+        if let Err(e) = crate::macos::resign(&tmp) {
+            let _ = fs::remove_file(&tmp);
+            return Err(std::io::Error::other(e));
+        }
+        crate::macos::strip_quarantine(&tmp);
     }
     match fs::rename(&tmp, bin_path) {
         Ok(()) => Ok(()),
@@ -387,24 +400,31 @@ pub fn repatch_if_needed(bin_path: &Path) -> RepatchOutcome {
 /// `language_server*` file - whatever the exact suffix, the signature scan then
 /// decides whether it is really a target.
 pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
-    let resources_bin = inst.join("resources").join("bin");
-    let ext_bin = inst
-        .join("resources")
+    // A macOS bundle spells it `Contents/Resources`. Accept both the canonical
+    // `<bundle>/Contents` root and a legacy `<bundle>` path from manual_paths.
+    #[cfg(target_os = "macos")]
+    let resources = {
+        let contents_res = inst.join("Contents").join("Resources");
+        if contents_res.is_dir() {
+            contents_res
+        } else {
+            crate::macos::resources_dir(inst)
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let resources = inst.join("resources");
+    let resources_bin = resources.join("bin");
+    let ext_bin = resources
         .join("app")
         .join("extensions")
         .join("antigravity")
         .join("bin");
-
-    // macOS .app bundle locations
-    let mac_resources_bin = inst.join("Contents").join("Resources").join("bin");
-    let mac_ext_bin = inst
-        .join("Contents")
-        .join("Resources")
-        .join("app")
-        .join("extensions")
-        .join("antigravity")
-        .join("bin");
-    let mac_macos_bin = inst.join("Contents").join("MacOS");
+    #[cfg(target_os = "macos")]
+    let macos_bin = if inst.join("Contents").join("MacOS").is_dir() {
+        inst.join("Contents").join("MacOS")
+    } else {
+        inst.join("MacOS")
+    };
 
     let mut targets: Vec<PathBuf> = vec![
         // CLI: `agy.exe` on Windows, bare `agy` on Linux/macOS.
@@ -414,31 +434,19 @@ pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
         // Desktop's own language server.
         resources_bin.join("language_server.exe"),
         resources_bin.join("language_server"),
-        mac_resources_bin.join("language_server"),
-        mac_resources_bin.join("language_server_macos_arm"),
-        mac_resources_bin.join("language_server_macos_x64"),
-        // IDE's bundled language server, Windows & macOS named.
+        // IDE's bundled language server, Windows named; Linux/macOS names are
+        // picked up by the `language_server*` scan right below.
         ext_bin.join("language_server_windows_x64.exe"),
         ext_bin.join("language_server.exe"),
-        ext_bin.join("language_server_macos_arm"),
-        ext_bin.join("language_server_macos_x64"),
-        mac_ext_bin.join("language_server_macos_arm"),
-        mac_ext_bin.join("language_server_macos_x64"),
-        mac_ext_bin.join("language_server"),
-        mac_macos_bin.join("language_server"),
-        mac_macos_bin.join("language_server_macos_arm"),
     ];
 
     // Any other `language_server*` in candidate bin dirs - catches the Linux/macOS
     // platform-suffixed names (`language_server_linux_x64`, `language_server_macos_arm`, …)
     // without pinning the exact spelling.
-    for dir in [
-        &ext_bin,
-        &resources_bin,
-        &mac_ext_bin,
-        &mac_resources_bin,
-        &mac_macos_bin,
-    ] {
+    let mut scan_dirs = vec![&ext_bin, &resources_bin];
+    #[cfg(target_os = "macos")]
+    scan_dirs.push(&macos_bin);
+    for dir in scan_dirs {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -450,6 +458,28 @@ pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
                     .is_some_and(|n| n.starts_with("language_server") && !n.ends_with(TEMP_SUFFIX));
                 if is_ls && path.is_file() && !targets.contains(&path) {
                     targets.push(path);
+                }
+            }
+        }
+    }
+
+    // IDE 2.6.0 carries no language server of its own: its `agy` extension
+    // downloads the backend into the user's `~/.gemini/bin`. That file is the
+    // IDE's, so the IDE's row reads and patches it (G85).
+    if resources
+        .join("app")
+        .join("extensions")
+        .join("agy")
+        .is_dir()
+    {
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from);
+        if let Some(bin) = home.map(|h| h.join(".gemini").join("bin")) {
+            for name in ["agy.exe", "agy"] {
+                let p = bin.join(name);
+                if !targets.contains(&p) {
+                    targets.push(p);
                 }
             }
         }

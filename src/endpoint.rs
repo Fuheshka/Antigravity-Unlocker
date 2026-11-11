@@ -55,11 +55,18 @@ pub enum Outcome {
 /// Derived from `product.json` rather than hardcoded: the folder is named after
 /// `nameShort`, so a rebranded or renamed build still resolves correctly.
 pub fn ide_settings_path(install: &Path) -> Option<PathBuf> {
-    let product = if install.join("Contents").join("Resources").join("app").join("product.json").exists() {
-        install.join("Contents").join("Resources").join("app").join("product.json")
-    } else {
-        install.join("resources").join("app").join("product.json")
+    #[cfg(target_os = "macos")]
+    let resources = {
+        let bundle_res = install.join("Contents").join("Resources");
+        if bundle_res.is_dir() {
+            bundle_res
+        } else {
+            crate::macos::resources_dir(install)
+        }
     };
+    #[cfg(not(target_os = "macos"))]
+    let resources = install.join("resources");
+    let product = resources.join("app").join("product.json");
     let text = fs::read_to_string(product).ok()?;
     let name = Regex::new(r#""nameShort"\s*:\s*"([^"]+)""#)
         .ok()?
@@ -72,7 +79,7 @@ pub fn ide_settings_path(install: &Path) -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let root = PathBuf::from(std::env::var("APPDATA").ok()?);
     #[cfg(target_os = "macos")]
-    let root = PathBuf::from(std::env::var("HOME").ok()?).join("Library").join("Application Support");
+    let root = crate::macos::application_support();
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     let root = {
         // An empty XDG_CONFIG_HOME (elevation can pass it through blank) is "unset",
@@ -318,9 +325,9 @@ fn legacy_removals(https: Option<&str>, no_proxy: Option<&str>, url: &str) -> (b
 }
 
 #[cfg(target_os = "macos")]
-fn sync_shell_file(path: &Path, name: &str, value: Option<&str>) -> std::io::Result<()> {
+fn sync_shell_file(path: &Path, name: &str, value: Option<&str>) -> std::io::Result<bool> {
     if !path.exists() && value.is_none() {
-        return Ok(());
+        return Ok(false);
     }
     let content = if path.exists() {
         fs::read_to_string(path)?
@@ -332,9 +339,11 @@ fn sync_shell_file(path: &Path, name: &str, value: Option<&str>) -> std::io::Res
 
     let mut new_lines: Vec<String> = Vec::new();
     let mut skipping = false;
+    let mut removed_block = false;
     for line in content.lines() {
         if line.trim() == start_marker {
             skipping = true;
+            removed_block = true;
             continue;
         }
         if line.trim() == end_marker {
@@ -344,6 +353,10 @@ fn sync_shell_file(path: &Path, name: &str, value: Option<&str>) -> std::io::Res
         if !skipping {
             new_lines.push(line.to_string());
         }
+    }
+
+    if !removed_block && value.is_none() {
+        return Ok(false);
     }
 
     if let Some(val) = value {
@@ -356,47 +369,54 @@ fn sync_shell_file(path: &Path, name: &str, value: Option<&str>) -> std::io::Res
     if !result.is_empty() && !result.ends_with('\n') {
         result.push('\n');
     }
+    if result == content {
+        return Ok(false);
+    }
     fs::write(path, result)?;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(target_os = "macos")]
-fn sync_shell_env(name: &str, value: Option<&str>) {
+fn sync_shell_env(name: &str, value: Option<&str>) -> bool {
+    let mut changed = false;
     if let Ok(home) = std::env::var("HOME") {
         let home_path = PathBuf::from(home);
         let zprofile = home_path.join(".zprofile");
-        let _ = sync_shell_file(&zprofile, name, value);
+        if matches!(sync_shell_file(&zprofile, name, value), Ok(true)) {
+            changed = true;
+        }
         let zshrc = home_path.join(".zshrc");
-        if zshrc.exists() || value.is_none() {
-            let _ = sync_shell_file(&zshrc, name, value);
+        if (zshrc.exists() || value.is_none())
+            && matches!(sync_shell_file(&zshrc, name, value), Ok(true))
+        {
+            changed = true;
         }
     }
+    changed
 }
 
-/// macOS: removes legacy proxy variables from launchctl and shell configurations.
+/// macOS: removes legacy proxy variables from launchctl and shell profiles if they
+/// point at our listener; a user's own `HTTPS_PROXY` is never touched.
 #[cfg(target_os = "macos")]
 pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
-    use std::process::Command;
     let mut removed = false;
     for name in [LEGACY_PROXY_ENV_VAR, "https_proxy"] {
-        let val = Command::new("launchctl")
-            .args(["getenv", name])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-        if let Some(ref v) = val {
-            if !v.is_empty() && is_our_proxy_value(v, url) {
-                let _ = Command::new("launchctl").args(["unsetenv", name]).status();
+        if let Some(v) = crate::macos::getenv(name) {
+            if is_ours_on_any_port(&v, url) {
+                crate::macos::unsetenv(name);
                 sync_shell_env(name, None);
                 removed = true;
             }
         }
-    }
-    if let Ok(v) = std::env::var(NO_PROXY_ENV_VAR) {
-        if v.trim() == NO_PROXY_VALUE {
-            let _ = Command::new("launchctl").args(["unsetenv", NO_PROXY_ENV_VAR]).status();
-            sync_shell_env(NO_PROXY_ENV_VAR, None);
+        if sync_shell_env(name, None) {
+            removed = true;
         }
+    }
+    if removed {
+        if crate::macos::getenv(NO_PROXY_ENV_VAR).as_deref() == Some(NO_PROXY_VALUE) {
+            crate::macos::unsetenv(NO_PROXY_ENV_VAR);
+        }
+        sync_shell_env(NO_PROXY_ENV_VAR, None);
     }
     Ok(removed)
 }
@@ -461,19 +481,23 @@ pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
     Ok(removed)
 }
 
-/// macOS: applies PROXY_ENV_VAR to launchd user session and shell profiles (~/.zprofile, ~/.zshrc).
+// ---- macOS (S80): the launchd environment is the session manager. An app
+// started from the Dock or Finder inherits what `launchctl setenv` put there;
+// the `com.agunlocker.env` login agent sets it again after a reboot. Shell
+// profiles are also kept in sync for already-open terminals / CLI sessions.
 #[cfg(target_os = "macos")]
 pub fn apply_proxy(url: &str, ca_path: &str) -> Result<Outcome, String> {
     let migrated = remove_legacy_proxy_env(url).unwrap_or(false);
-    let already = current_env(PROXY_ENV_VAR).as_deref() == Some(url);
-    if already && !migrated {
-        return Ok(Outcome::AlreadySet);
-    }
-    set_env(PROXY_ENV_VAR, Some(url))?;
+    let persisted = crate::macos::persist_env(PROXY_ENV_VAR, url)?;
+    let shell_changed = sync_shell_env(PROXY_ENV_VAR, Some(url));
     if !ca_path.is_empty() {
         set_env(NODE_CA_ENV_VAR, Some(ca_path))?;
     }
-    Ok(Outcome::Applied)
+    if persisted || migrated || shell_changed {
+        Ok(Outcome::Applied)
+    } else {
+        Ok(Outcome::AlreadySet)
+    }
 }
 
 /// The Linux path uses **two** mechanisms so the language server the IDE spawns
@@ -570,28 +594,16 @@ pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
     }
 }
 
-/// macOS: removes proxy variables from launchctl and shell files.
+/// macOS: removes proxy variables from launchctl, login agent plist, and shell files.
 #[cfg(target_os = "macos")]
 pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
-    let mut trouble: Vec<String> = Vec::new();
-    if current_env(PROXY_ENV_VAR).is_some() {
-        if let Err(e) = set_env(PROXY_ENV_VAR, None) {
-            trouble.push(e);
-        }
-    }
-    if let Err(e) = remove_legacy_proxy_env(url) {
-        trouble.push(e);
-    }
+    crate::macos::unpersist_env(PROXY_ENV_VAR);
+    sync_shell_env(PROXY_ENV_VAR, None);
+    remove_legacy_proxy_env(url).ok();
     if !ca_path.is_empty() {
-        if let Err(e) = set_env(NODE_CA_ENV_VAR, None) {
-            trouble.push(e);
-        }
+        set_env(NODE_CA_ENV_VAR, None)?;
     }
-    if trouble.is_empty() {
-        Ok(())
-    } else {
-        Err(trouble.join("; "))
-    }
+    Ok(())
 }
 
 /// Linux: delete the `environment.d` drop-in and unset the live session vars.
@@ -619,6 +631,22 @@ pub fn remove_proxy(url: &str, _ca_path: &str) -> Result<(), String> {
         .ok();
     remove_legacy_proxy_env(url).ok();
     Ok(())
+}
+
+/// `HTTPS_PROXY`/`https_proxy` as launchd hands them to GUI apps.
+#[cfg(target_os = "macos")]
+fn session_manager_proxy(ours: &str) -> Option<ForeignProxy> {
+    for name in [LEGACY_PROXY_ENV_VAR, "https_proxy"] {
+        if let Some(value) = crate::macos::getenv(name) {
+            if !is_ours_on_any_port(&value, ours) {
+                return Some(ForeignProxy {
+                    value,
+                    found_in: format!("{} в launchctl (окружение приложений)", name),
+                });
+            }
+        }
+    }
+    None
 }
 
 /// A proxy the user set up themselves, which this tool must not get in front of.
@@ -660,35 +688,7 @@ pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
     antigravity_proxy_setting(ours)
 }
 
-#[cfg(target_os = "macos")]
-pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
-    use std::process::Command;
-    for name in [LEGACY_PROXY_ENV_VAR, "https_proxy"] {
-        if let Ok(value) = std::env::var(name) {
-            let value = value.trim().to_string();
-            if !value.is_empty() && !is_our_proxy_value(&value, ours) {
-                return Some(ForeignProxy {
-                    value,
-                    found_in: format!("переменная среды {}", name),
-                });
-            }
-        }
-        if let Ok(out) = Command::new("launchctl").args(["getenv", name]).output() {
-            if out.status.success() {
-                let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !value.is_empty() && !is_our_proxy_value(&value, ours) {
-                    return Some(ForeignProxy {
-                        value,
-                        found_in: format!("launchctl getenv {}", name),
-                    });
-                }
-            }
-        }
-    }
-    antigravity_proxy_setting(ours)
-}
-
-#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+#[cfg(not(target_os = "windows"))]
 pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
     for name in [LEGACY_PROXY_ENV_VAR, "https_proxy"] {
         if let Ok(value) = std::env::var(name) {
@@ -710,7 +710,7 @@ pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
 /// `HTTPS_PROXY`/`https_proxy` as the systemd user manager holds it - what a
 /// `environment.d` drop-in or a `systemctl --user set-environment` leaves behind,
 /// and what every app launched from the desktop inherits.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn session_manager_proxy(ours: &str) -> Option<ForeignProxy> {
     use std::process::Command;
     let out = Command::new("systemctl")
@@ -795,11 +795,10 @@ fn profile_root() -> Option<PathBuf> {
     std::env::var("APPDATA").ok().map(PathBuf::from)
 }
 
+/// macOS: Electron keeps the profile under `~/Library/Application Support`.
 #[cfg(target_os = "macos")]
 fn profile_root() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+    Some(crate::macos::application_support())
 }
 
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
@@ -939,17 +938,15 @@ fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
-    use std::process::Command;
     match value {
         Some(v) => {
-            Command::new("launchctl")
-                .args(["setenv", name, v])
-                .status()
-                .map_err(|e| format!("launchctl setenv: {}", e))?;
+            if !crate::macos::setenv(name, v) {
+                return Err(format!("launchctl setenv {name} не удался"));
+            }
             sync_shell_env(name, Some(v));
         }
         None => {
-            let _ = Command::new("launchctl").args(["unsetenv", name]).status();
+            crate::macos::unsetenv(name);
             sync_shell_env(name, None);
         }
     }
@@ -983,22 +980,17 @@ fn current_env(name: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// The process environment, then launchd's, then the login agent's plist or shell profile.
 #[cfg(target_os = "macos")]
 fn current_env(name: &str) -> Option<String> {
-    use std::process::Command;
-    if let Ok(out) = Command::new("launchctl").args(["getenv", name]).output() {
-        if out.status.success() {
-            let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
     if let Ok(val) = std::env::var(name) {
         let val = val.trim().to_string();
         if !val.is_empty() {
             return Some(val);
         }
+    }
+    if let Some(val) = crate::macos::getenv(name).or_else(|| crate::macos::persisted_env(name)) {
+        return Some(val);
     }
     let home = std::env::var("HOME").ok()?;
     let path = PathBuf::from(home).join(".zprofile");
@@ -1008,7 +1000,10 @@ fn current_env(name: &str) -> Option<String> {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix(&prefix) {
             if let Some(val) = rest.strip_suffix('"') {
-                return Some(val.to_string());
+                let val = val.trim();
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
             }
         }
     }

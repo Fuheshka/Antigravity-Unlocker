@@ -14,6 +14,10 @@ cask "antigravity-unlocker" do
 
   zap trash: [
     "~/Library/Application Support/AGUnlocker",
+    "~/.local/share/agunlocker",
     "~/Library/LaunchAgents/com.antigravity.unlocker.proxy.plist",
+    "~/Library/LaunchAgents/com.agunlocker.proxy.plist",
+    "~/Library/LaunchAgents/com.agunlocker.watchdog.plist",
+    "~/Library/LaunchAgents/com.agunlocker.env.plist",
   ]
 end

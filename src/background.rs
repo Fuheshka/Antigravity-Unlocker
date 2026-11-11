@@ -19,10 +19,7 @@ pub const PROXY_FLAG: &str = "--proxy";
 #[cfg(target_os = "windows")]
 pub use windows_impl::*;
 
-#[cfg(target_os = "macos")]
-pub use macos_impl::*;
-
-#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+#[cfg(not(target_os = "windows"))]
 pub use unix_impl::*;
 
 #[cfg(target_os = "windows")]
@@ -527,168 +524,23 @@ mod windows_impl {
     }
 }
 
-// macOS: runs the local CONNECT proxy (`proxy::run`, via `--proxy`) as a
-// LaunchAgent in ~/Library/LaunchAgents/com.antigravity.unlocker.proxy.plist.
-// Unprivileged, no root required, auto-starts on user login.
-#[cfg(target_os = "macos")]
-mod macos_impl {
-    use std::fs;
-    use std::path::PathBuf;
-    use std::process::Command;
-
-    use super::PROXY_FLAG;
-
-    const LABEL: &str = "com.antigravity.unlocker.proxy";
-
-    fn home() -> PathBuf {
-        PathBuf::from(std::env::var("HOME").unwrap_or_default())
-    }
-
-    pub fn install_dir() -> PathBuf {
-        home().join("Library").join("Application Support").join("AGUnlocker")
-    }
-
-    pub fn installed_exe() -> PathBuf {
-        install_dir().join("ag_proxy")
-    }
-
-    fn plist_path() -> PathBuf {
-        home().join("Library").join("LaunchAgents").join(format!("{}.plist", LABEL))
-    }
-
-    pub fn is_enabled() -> bool {
-        plist_path().exists()
-    }
-
-    pub fn is_watchdog_enabled() -> bool {
-        false
-    }
-
-    pub fn is_running() -> bool {
-        if crate::proxy::listener_answers() {
-            return true;
-        }
-        Command::new("launchctl")
-            .args(["list", LABEL])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
-    pub fn relay_is_outdated() -> bool {
-        false
-    }
-
-    pub fn ensure_running() -> Result<(), String> {
-        let src = std::env::current_exe().map_err(|e| format!("нет пути к exe: {}", e))?;
-        let dir = install_dir();
-        let exe = installed_exe();
-        fs::create_dir_all(&dir).map_err(|e| format!("не создать {}: {}", dir.display(), e))?;
-        if src != exe {
-            fs::copy(&src, &exe).map_err(|e| format!("копия exe: {}", e))?;
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&exe, fs::Permissions::from_mode(0o755));
-            let _ = Command::new("codesign")
-                .args(["--force", "-s", "-", &exe.to_string_lossy()])
-                .status();
-        }
-
-        let plist = plist_path();
-        if let Some(p) = plist.parent() {
-            fs::create_dir_all(p).map_err(|e| format!("не создать {}: {}", p.display(), e))?;
-        }
-
-        let log_file = dir.join("proxy.log");
-        let content = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{exe}</string>
-        <string>{flag}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>{log}</string>
-    <key>StandardErrorPath</key>
-    <string>{log}</string>
-</dict>
-</plist>
-"#,
-            label = LABEL,
-            exe = exe.display(),
-            flag = PROXY_FLAG,
-            log = log_file.display()
-        );
-        fs::write(&plist, content).map_err(|e| format!("не записать plist: {}", e))?;
-
-        let _ = Command::new("launchctl")
-            .args(["unload", "-w", &plist.to_string_lossy()])
-            .status();
-
-        let st = Command::new("launchctl")
-            .args(["load", "-w", &plist.to_string_lossy()])
-            .status()
-            .map_err(|e| format!("launchctl load: {}", e))?;
-
-        if !st.success() {
-            return Err("не удалось запустить LaunchAgent через launchctl".to_string());
-        }
-        Ok(())
-    }
-
-    pub fn enable() -> Result<(), String> {
-        ensure_running()
-    }
-
-    pub fn enable_watchdog() -> Result<(), String> {
-        Ok(())
-    }
-
-    pub fn ensure_installed() -> Result<(), String> {
-        Ok(())
-    }
-
-    pub fn disable_watchdog() {}
-
-    pub fn disable() -> Result<(), String> {
-        let plist = plist_path();
-        if plist.exists() {
-            let _ = Command::new("launchctl")
-                .args(["unload", "-w", &plist.to_string_lossy()])
-                .status();
-            let _ = fs::remove_file(&plist);
-        }
-        let _ = Command::new("pkill")
-            .args(["-f", &format!("ag_proxy {}", PROXY_FLAG)])
-            .status();
-        let _ = fs::remove_file(installed_exe());
-        let _ = fs::remove_dir(install_dir());
-        Ok(())
-    }
-}
-
 // Linux: phase 2 is the **proxy route**, not the DNS relay. This runs the local
 // CONNECT proxy (`proxy::run`, via `--proxy`) as a systemd **user** unit - no
 // root, no `:53` listener, so systemd-resolved is never touched. The DNS relay
 // (phase 5) would be a separate, privileged story; this is deliberately the
 // unprivileged half that already lifts the region gate through a permitted exit.
-#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+#[cfg(not(target_os = "windows"))]
 mod unix_impl {
     use std::fs;
     use std::path::PathBuf;
+    #[cfg(not(target_os = "macos"))]
     use std::process::Command;
 
     use super::{PROXY_FLAG, WATCHDOG_FLAG};
 
+    #[cfg(not(target_os = "macos"))]
     const UNIT_NAME: &str = "ag-unlocker-proxy.service";
+    #[cfg(not(target_os = "macos"))]
     const WATCHDOG_UNIT_NAME: &str = "ag-unlocker-watchdog.service";
 
     fn home() -> String {
@@ -714,12 +566,14 @@ mod unix_impl {
         install_dir().join("ag_proxy")
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn unit_path() -> PathBuf {
         xdg("XDG_CONFIG_HOME", ".config")
             .join("systemd/user")
             .join(UNIT_NAME)
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn watchdog_unit_path() -> PathBuf {
         xdg("XDG_CONFIG_HOME", ".config")
             .join("systemd/user")
@@ -728,6 +582,7 @@ mod unix_impl {
 
     /// Runs `systemctl --user ...`; true on success. Best-effort: a machine
     /// without a user systemd manager (rare on a desktop) just fails the enable.
+    #[cfg(not(target_os = "macos"))]
     fn systemctl(args: &[&str]) -> bool {
         Command::new("systemctl")
             .arg("--user")
@@ -738,6 +593,7 @@ mod unix_impl {
     }
 
     /// The unit file existing is what "enabled" means here.
+    #[cfg(not(target_os = "macos"))]
     pub fn is_enabled() -> bool {
         unit_path().exists()
     }
@@ -747,10 +603,12 @@ mod unix_impl {
     /// reason `ensure_installed` exists), and an update that replaces
     /// `language_server` under a running Antigravity is as real here as on
     /// Windows. The unit file existing is what "enabled" means, as for the proxy.
+    #[cfg(not(target_os = "macos"))]
     pub fn is_watchdog_enabled() -> bool {
         watchdog_unit_path().exists()
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub fn is_running() -> bool {
         Command::new("systemctl")
             .args(["--user", "is-active", "--quiet", UNIT_NAME])
@@ -768,6 +626,7 @@ mod unix_impl {
     /// runs it with `--proxy`, and starts it. No root: `systemctl --user` targets
     /// the caller's own session manager, which is why the whole Linux flow runs
     /// unprivileged (and "Run as a Program" works without a password prompt).
+    #[cfg(not(target_os = "macos"))]
     pub fn ensure_running() -> Result<(), String> {
         let replaced = install_copy()?;
 
@@ -807,6 +666,7 @@ mod unix_impl {
     }
 
     /// A user unit running the installed copy with `flag`.
+    #[cfg(not(target_os = "macos"))]
     fn unit_text(description: &str, flag: &str) -> String {
         let data_home = crate::dns_forwarder::log_dir()
             .parent()
@@ -853,6 +713,10 @@ mod unix_impl {
             let fresh = dir.join(".ag_proxy.new");
             fs::copy(&src, &fresh).map_err(|e| format!("копия exe: {}", e))?;
             let _ = fs::set_permissions(&fresh, fs::Permissions::from_mode(0o755));
+            // A copy of a browser download keeps its quarantine flag, and
+            // launchd would then be refused the binary by Gatekeeper.
+            #[cfg(target_os = "macos")]
+            crate::macos::strip_quarantine(&fresh);
             fs::rename(&fresh, &exe).map_err(|e| {
                 let _ = fs::remove_file(&fresh);
                 format!("замена exe: {}", e)
@@ -874,6 +738,7 @@ mod unix_impl {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub fn enable() -> Result<(), String> {
         ensure_running()?;
         let _ = systemctl(&["restart", UNIT_NAME]);
@@ -883,6 +748,7 @@ mod unix_impl {
     /// Writes the watcher's user unit and starts it. Only the file and the unit:
     /// the proxy unit is not touched, so auto-patch on its own never switches the
     /// 400 bypass on.
+    #[cfg(not(target_os = "macos"))]
     pub fn enable_watchdog() -> Result<(), String> {
         let replaced = install_copy()?;
         let up = watchdog_unit_path();
@@ -911,6 +777,7 @@ mod unix_impl {
         install_copy().map(|_| ())
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub fn disable_watchdog() {
         systemctl(&["disable", "--now", WATCHDOG_UNIT_NAME]);
         let _ = fs::remove_file(watchdog_unit_path());
@@ -919,11 +786,138 @@ mod unix_impl {
 
     /// Stops and removes the user unit and the installed copy. Quiet success even
     /// when nothing was installed, so the undo menus never error.
+    #[cfg(not(target_os = "macos"))]
     pub fn disable() -> Result<(), String> {
         systemctl(&["disable", "--now", UNIT_NAME]);
         let _ = fs::remove_file(unit_path());
         systemctl(&["daemon-reload"]);
         // The watcher runs the same copy: while its unit is there the file stays.
+        if !is_watchdog_enabled() {
+            let _ = fs::remove_file(installed_exe());
+            let _ = fs::remove_dir(install_dir());
+        }
+        Ok(())
+    }
+
+    // ---- macOS: launchd user agents in place of the systemd user units (S80).
+    // Same copy (`install_copy`), same flags, same data dir handed to the job;
+    // `~/Library/LaunchAgents/<label>.plist` existing is what "enabled" means.
+
+    #[cfg(target_os = "macos")]
+    const PROXY_LABEL: &str = "com.agunlocker.proxy";
+    #[cfg(target_os = "macos")]
+    const WATCHDOG_LABEL: &str = "com.agunlocker.watchdog";
+    #[cfg(target_os = "macos")]
+    const LEGACY_FORK_PROXY_LABEL: &str = "com.antigravity.unlocker.proxy";
+
+    /// Retires the LaunchAgent and helper binary used by macOS fork builds
+    /// before v2.29.0 so it does not hold port 53129 against `com.agunlocker.proxy`.
+    #[cfg(target_os = "macos")]
+    fn retire_legacy_fork_agent() {
+        let legacy_plist = crate::macos::agent_plist_path(LEGACY_FORK_PROXY_LABEL);
+        let legacy_dir = crate::macos::application_support().join("AGUnlocker");
+        if !legacy_plist.exists() && !legacy_dir.exists() {
+            return;
+        }
+        if legacy_plist.exists() {
+            let _ = std::process::Command::new("/bin/launchctl")
+                .args(["unload", "-w", &legacy_plist.to_string_lossy()])
+                .status();
+        }
+        crate::macos::agent_remove(LEGACY_FORK_PROXY_LABEL);
+        let legacy_exe = legacy_dir.join("ag_proxy");
+        if legacy_exe.exists() {
+            let _ = std::process::Command::new("/usr/bin/pkill")
+                .args(["-f", &legacy_exe.to_string_lossy()])
+                .status();
+            let _ = fs::remove_file(&legacy_exe);
+        }
+        let _ = fs::remove_file(legacy_dir.join("proxy.log"));
+        let _ = fs::remove_dir(&legacy_dir);
+    }
+
+    /// The agent's plist: the installed copy with `flag`, kept alive, with the
+    /// data dir the window reads (`log_dir()` follows `XDG_DATA_HOME`, which
+    /// launchd does not carry).
+    #[cfg(target_os = "macos")]
+    fn agent_text(label: &str, flag: &str) -> String {
+        let data_home = crate::dns_forwarder::log_dir()
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        crate::macos::agent_plist(
+            label,
+            &[installed_exe().display().to_string(), flag.to_string()],
+            &[("XDG_DATA_HOME", data_home)],
+            true,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn is_enabled() -> bool {
+        crate::macos::agent_exists(PROXY_LABEL)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn is_watchdog_enabled() -> bool {
+        crate::macos::agent_exists(WATCHDOG_LABEL)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn is_running() -> bool {
+        crate::macos::agent_is_running(PROXY_LABEL)
+    }
+
+    /// Installs the copy, writes the agent and loads it. A changed plist is
+    /// reloaded by `agent_install`; a replaced copy under an unchanged plist
+    /// needs a kickstart to leave the old binary.
+    #[cfg(target_os = "macos")]
+    pub fn ensure_running() -> Result<(), String> {
+        retire_legacy_fork_agent();
+        let replaced = install_copy()?;
+        let changed =
+            crate::macos::agent_install(PROXY_LABEL, &agent_text(PROXY_LABEL, PROXY_FLAG))?;
+        if replaced && !changed && !crate::macos::agent_restart(PROXY_LABEL) {
+            return Err(
+                "новая версия прокси записана, но служба не перезапустилась (launchctl)"
+                    .to_string(),
+            );
+        }
+        if replaced && is_watchdog_enabled() {
+            crate::macos::agent_restart(WATCHDOG_LABEL);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn enable() -> Result<(), String> {
+        ensure_running()?;
+        let _ = crate::macos::agent_restart(PROXY_LABEL);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn enable_watchdog() -> Result<(), String> {
+        let replaced = install_copy()?;
+        let changed = crate::macos::agent_install(
+            WATCHDOG_LABEL,
+            &agent_text(WATCHDOG_LABEL, WATCHDOG_FLAG),
+        )?;
+        if replaced && !changed && !crate::macos::agent_restart(WATCHDOG_LABEL) {
+            return Err("автопатч записан, но служба не перезапустилась (launchctl)".to_string());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn disable_watchdog() {
+        crate::macos::agent_remove(WATCHDOG_LABEL);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn disable() -> Result<(), String> {
+        retire_legacy_fork_agent();
+        crate::macos::agent_remove(PROXY_LABEL);
         if !is_watchdog_enabled() {
             let _ = fs::remove_file(installed_exe());
             let _ = fs::remove_dir(install_dir());

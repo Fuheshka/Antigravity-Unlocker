@@ -62,7 +62,14 @@ pub enum Kind {
     Vpn,
 }
 
-pub const ALL: [Kind; 6] = [Kind::Own, Kind::Group, Kind::Exits, Kind::Relay, Kind::Direct, Kind::Vpn];
+pub const ALL: [Kind; 6] = [
+    Kind::Own,
+    Kind::Group,
+    Kind::Exits,
+    Kind::Relay,
+    Kind::Direct,
+    Kind::Vpn,
+];
 const N: usize = ALL.len();
 
 impl Kind {
@@ -97,9 +104,17 @@ impl Kind {
 /// region-400s; then built-in foreign exits; the user's VPN next; and direct
 /// DNS substitution last as fallback when proxy routes are not usable.
 ///
-/// A build without a DNS layer (Linux) has no substituted address for the direct
-/// tunnel to reach, so there it goes to the back regardless; see `order_with`.
-const DEFAULT_ORDER: [Kind; N] = [Kind::Group, Kind::Own, Kind::Relay, Kind::Exits, Kind::Direct, Kind::Vpn];
+/// Every OS has the direct route: on Linux/macOS the proxy resolves the gate
+/// hosts through the provider pool itself and dials only a substituted address
+/// (`proxy::gate_direct_addrs`), so nothing demotes it there any more.
+const DEFAULT_ORDER: [Kind; N] = [
+    Kind::Group,
+    Kind::Own,
+    Kind::Relay,
+    Kind::Exits,
+    Kind::Direct,
+    Kind::Vpn,
+];
 
 /// Routes taken first whenever usable and not benched, ahead of anything
 /// measured (owner, 2026-10-05: «если активен прокси от моей группы - то все
@@ -529,6 +544,18 @@ pub fn set_context(fingerprint: u64) -> bool {
     let first = t.context == 0;
     t.context = fingerprint;
     if !first {
+        // The group server's exit sits in the same country on every network, so
+        // a region-400 it drew is not news that a VPN going up or down can
+        // overturn. Wiping it put the pinned group back in front of the VPN
+        // each time the network changed, and the VPN was never asked.
+        let g = Kind::Group.index();
+        let kept = (
+            t.penalised[g],
+            t.streak[g],
+            t.bad_at[g],
+            t.refused_at[g],
+            t.bad_count[g],
+        );
         t.ok_at = [None; N];
         t.bad_at = [None; N];
         t.refused_at = [None; N];
@@ -539,6 +566,13 @@ pub fn set_context(fingerprint: u64) -> bool {
         t.stumbled = [None; N];
         t.silent = [None; N];
         t.silent_streak = [0; N];
+        (
+            t.penalised[g],
+            t.streak[g],
+            t.bad_at[g],
+            t.refused_at[g],
+            t.bad_count[g],
+        ) = kept;
     }
     !first
 }
@@ -555,7 +589,7 @@ pub fn order(usable: impl Fn(Kind) -> bool) -> Vec<Kind> {
         return if usable(k) { vec![k] } else { Vec::new() };
     }
     let s = snapshot();
-    order_with(&s, cfg!(target_os = "windows"), usable)
+    order_with(&s, usable)
 }
 
 /// The route a diagnostic run pinned in `settings.json` (`debug_route`).
@@ -629,7 +663,7 @@ pub fn leader() -> Option<Kind> {
 /// in the log when it changed. Run once per warm pass, after the probes.
 pub fn refresh_leader(usable: impl Fn(Kind) -> bool) {
     let s = snapshot();
-    let order = order_with(&s, cfg!(target_os = "windows"), usable);
+    let order = order_with(&s, usable);
     let Some(&best) = order.first() else {
         return;
     };
@@ -658,9 +692,7 @@ pub fn refresh_leader(usable: impl Fn(Kind) -> bool) {
 ///
 /// Group, then Own, first when usable and not benched (`PINNED`). Then four tiers, each in the default
 /// order inside itself unless measured: proven (fastest first, the sitting
-/// leader kept unless clearly beaten), measured, unmeasured, penalised. Without
-/// a DNS layer the direct tunnel has nothing substituted to reach, so it counts
-/// as penalised.
+/// leader kept unless clearly beaten), measured, unmeasured, penalised.
 ///
 /// A benched Own joins the benched tier like any other route. Putting it first
 /// regardless meant a region 400 through the user's proxy was answered by
@@ -668,15 +700,23 @@ pub fn refresh_leader(usable: impl Fn(Kind) -> bool) {
 /// said «следующее соединение пойдёт другим» and the next one went the same
 /// way, refusal after refusal. The bench ends, or an answer lifts it, and Own
 /// is first again.
-fn order_with(s: &Snapshot, has_dns_layer: bool, usable: impl Fn(Kind) -> bool) -> Vec<Kind> {
+fn order_with(s: &Snapshot, usable: impl Fn(Kind) -> bool) -> Vec<Kind> {
     let benched = |k: Kind| {
         penalised(&s.penalised, k) || penalised(&s.stumbled, k) || penalised(&s.silent, k)
     };
     let mut out: Vec<Kind> = Vec::with_capacity(N);
     // Pinned routes: taken first whenever usable and not benched, in this
     // order, regardless of speed. A benched one joins the rest like any route.
+    // Except one that was refused and has not answered since while another
+    // usable route has: the pin is an owner's preference for a road that works,
+    // not for one that keeps drawing region-400 while the VPN carries the model.
+    let other_proven = |k: Kind| {
+        ALL.iter()
+            .any(|&o| o != k && usable(o) && !benched(o) && proven(&s.ok_at, &s.bad_at, o))
+    };
     for k in s.pinned {
-        if usable(k) && !benched(k) {
+        let refused_unproven = s.refused_at[k.index()].is_some() && !proven(&s.ok_at, &s.bad_at, k);
+        if usable(k) && !benched(k) && !(refused_unproven && other_proven(k)) {
             out.push(k);
         }
     }
@@ -688,7 +728,7 @@ fn order_with(s: &Snapshot, has_dns_layer: bool, usable: impl Fn(Kind) -> bool) 
         .collect();
 
     let tier = |k: Kind| -> u8 {
-        if benched(k) || (k == Kind::Direct && !has_dns_layer) {
+        if benched(k) {
             3
         } else if proven(&s.ok_at, &s.bad_at, k) {
             0
@@ -1070,7 +1110,10 @@ fn cut_tunnels(kind: Kind) {
 /// cuts, and a route the user turned off must not keep carrying traffic.
 pub fn cut_kind(kind: Kind) {
     let Ok(mut list) = TUNNELS.lock() else { return };
-    for t in list.iter_mut().filter(|t| t.kind == kind && t.closed.is_none()) {
+    for t in list
+        .iter_mut()
+        .filter(|t| t.kind == kind && t.closed.is_none())
+    {
         for sock in [t.client.take(), t.upstream.take()].into_iter().flatten() {
             sock.shutdown(std::net::Shutdown::Both).ok();
         }
@@ -1251,7 +1294,7 @@ pub struct Row {
 pub fn rows(usable: impl Fn(Kind) -> bool) -> Vec<Row> {
     let s = snapshot();
     let open = open_counts();
-    let order = order_with(&s, cfg!(target_os = "windows"), &usable);
+    let order = order_with(&s, &usable);
     let mut kinds: Vec<Kind> = order.clone();
     kinds.extend(ALL.iter().copied().filter(|k| !order.contains(k)));
     // A build without the relay has no such route at all - not an unusable one.
@@ -1320,6 +1363,18 @@ mod tests {
         STATEFUL.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    #[test]
+    fn a_refused_unproven_pin_yields_to_a_proven_route() {
+        let mut s = blank();
+        let (g, v) = (Kind::Group.index(), Kind::Vpn.index());
+        s.refused_at[g] = Some(Instant::now());
+        s.ok_at[v] = Some(Instant::now());
+        assert_eq!(order_with(&s, |k| k != Kind::Own)[0], Kind::Vpn);
+        // Nothing else has answered: the pin keeps its place.
+        s.ok_at[v] = None;
+        assert_eq!(order_with(&s, |k| k != Kind::Own)[0], Kind::Group);
+    }
+
     fn blank() -> Snapshot {
         Snapshot {
             samples: [None; N],
@@ -1340,30 +1395,31 @@ mod tests {
     fn the_later_added_of_group_and_own_leads() {
         let mut s = blank();
         let all = |_: Kind| true;
-        assert_eq!(order_with(&s, true, all)[..2], [Kind::Group, Kind::Own]);
+        assert_eq!(order_with(&s, all)[..2], [Kind::Group, Kind::Own]);
         s.pinned = [Kind::Own, Kind::Group];
-        let order = order_with(&s, true, all);
+        let order = order_with(&s, all);
         assert_eq!(order[..2], [Kind::Own, Kind::Group]);
         // Everything else keeps its own order behind the pair.
-        assert_eq!(order[2..], [Kind::Relay, Kind::Exits, Kind::Direct, Kind::Vpn]);
-    }
-
-    #[test]
-    fn unmeasured_routes_take_the_default_order() {
-        let order = order_with(&blank(), true, |_| true);
         assert_eq!(
-            order,
-            vec![Kind::Group, Kind::Own, Kind::Relay, Kind::Exits, Kind::Direct, Kind::Vpn]
+            order[2..],
+            [Kind::Relay, Kind::Exits, Kind::Direct, Kind::Vpn]
         );
     }
 
     #[test]
-    fn without_a_dns_layer_direct_goes_last_whatever_it_measured() {
-        let mut s = blank();
-        s.samples[Kind::Direct.index()] = sample(50);
-        s.samples[Kind::Exits.index()] = sample(400);
-        let order = order_with(&s, false, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group);
-        assert_eq!(order, vec![Kind::Exits, Kind::Relay, Kind::Direct]);
+    fn unmeasured_routes_take_the_default_order() {
+        let order = order_with(&blank(), |_| true);
+        assert_eq!(
+            order,
+            vec![
+                Kind::Group,
+                Kind::Own,
+                Kind::Relay,
+                Kind::Exits,
+                Kind::Direct,
+                Kind::Vpn
+            ]
+        );
     }
 
     #[test]
@@ -1371,7 +1427,7 @@ mod tests {
         let mut s = blank();
         s.samples[Kind::Relay.index()] = sample(1300);
         s.samples[Kind::Exits.index()] = sample(450);
-        let order = order_with(&s, true, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group);
+        let order = order_with(&s, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group);
         assert_eq!(order, vec![Kind::Exits, Kind::Relay, Kind::Direct]);
     }
 
@@ -1382,9 +1438,9 @@ mod tests {
         s.samples[Kind::Exits.index()] = sample(270);
         s.leader = Some(Kind::Direct);
         let usable = |k: Kind| k != Kind::Own && k != Kind::Vpn && k != Kind::Group;
-        assert_eq!(order_with(&s, true, usable)[0], Kind::Direct);
+        assert_eq!(order_with(&s, usable)[0], Kind::Direct);
         s.samples[Kind::Exits.index()] = sample(180);
-        assert_eq!(order_with(&s, true, usable)[0], Kind::Exits);
+        assert_eq!(order_with(&s, usable)[0], Kind::Exits);
     }
 
     #[test]
@@ -1396,12 +1452,12 @@ mod tests {
         s.leader = Some(Kind::Direct);
         let usable = |k: Kind| k != Kind::Own && k != Kind::Vpn && k != Kind::Group;
         assert_eq!(
-            order_with(&s, true, usable),
+            order_with(&s, usable),
             vec![Kind::Relay, Kind::Exits, Kind::Direct]
         );
         s.penalised[Kind::Direct.index()] = Some(Instant::now() - ms(1));
         s.leader = None;
-        assert_eq!(order_with(&s, true, usable)[0], Kind::Direct);
+        assert_eq!(order_with(&s, usable)[0], Kind::Direct);
     }
 
     /// The whole point of proof: the fastest route is not the one that works.
@@ -1415,10 +1471,10 @@ mod tests {
         s.ok_at[Kind::Exits.index()] = Some(Instant::now());
         s.leader = Some(Kind::Direct);
         let usable = |k: Kind| k != Kind::Own && k != Kind::Vpn && k != Kind::Group;
-        assert_eq!(order_with(&s, true, usable)[0], Kind::Exits);
+        assert_eq!(order_with(&s, usable)[0], Kind::Exits);
         // A refusal after the answer takes the proof away again.
         s.bad_at[Kind::Exits.index()] = Some(Instant::now() + ms(1));
-        assert_eq!(order_with(&s, true, usable)[0], Kind::Direct);
+        assert_eq!(order_with(&s, usable)[0], Kind::Direct);
     }
 
     /// A route that could not even open for a live connection steps aside for a
@@ -1429,11 +1485,11 @@ mod tests {
         s.samples[Kind::Direct.index()] = sample(100);
         s.samples[Kind::Exits.index()] = sample(500);
         s.stumbled[Kind::Direct.index()] = Some(Instant::now() + ms(60_000));
-        let order = order_with(&s, true, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group);
+        let order = order_with(&s, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group);
         assert_eq!(order, vec![Kind::Exits, Kind::Relay, Kind::Direct]);
         s.stumbled[Kind::Direct.index()] = Some(Instant::now() - ms(1));
         assert_eq!(
-            order_with(&s, true, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group)[0],
+            order_with(&s, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group)[0],
             Kind::Direct
         );
     }
@@ -1449,12 +1505,9 @@ mod tests {
         s.ok_at[Kind::Exits.index()] = Some(Instant::now() - ms(600_000));
         s.leader = Some(Kind::Exits);
         let usable = |k: Kind| k == Kind::Exits || k == Kind::Direct;
-        assert_eq!(order_with(&s, true, usable)[0], Kind::Exits);
+        assert_eq!(order_with(&s, usable)[0], Kind::Exits);
         s.silent[Kind::Exits.index()] = Some(Instant::now() + ms(120_000));
-        assert_eq!(
-            order_with(&s, true, usable),
-            vec![Kind::Direct, Kind::Exits]
-        );
+        assert_eq!(order_with(&s, usable), vec![Kind::Direct, Kind::Exits]);
     }
 
     #[test]
@@ -1500,7 +1553,7 @@ mod tests {
         s.penalised[Kind::Direct.index()] = Some(now + ms(600_000));
         s.penalised[Kind::Exits.index()] = Some(now + ms(60_000));
         s.penalised[Kind::Relay.index()] = Some(now + ms(3_600_000));
-        let order = order_with(&s, true, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group);
+        let order = order_with(&s, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group);
         assert_eq!(order, vec![Kind::Exits, Kind::Direct, Kind::Relay]);
     }
 
@@ -1511,9 +1564,9 @@ mod tests {
         s.samples[Kind::Direct.index()] = sample(100);
         s.ok_at[Kind::Direct.index()] = Some(Instant::now());
         s.leader = Some(Kind::Direct);
-        assert_eq!(order_with(&s, true, |k| k != Kind::Group)[0], Kind::Own);
+        assert_eq!(order_with(&s, |k| k != Kind::Group)[0], Kind::Own);
         assert_eq!(
-            order_with(&s, true, |k| k != Kind::Own && k != Kind::Group)[0],
+            order_with(&s, |k| k != Kind::Own && k != Kind::Group)[0],
             Kind::Direct
         );
     }
@@ -1526,10 +1579,10 @@ mod tests {
         s.samples[Kind::Direct.index()] = sample(100);
         s.ok_at[Kind::Direct.index()] = Some(Instant::now());
         s.leader = Some(Kind::Direct);
-        let order = order_with(&s, true, |_| true);
+        let order = order_with(&s, |_| true);
         assert_eq!(order[..3], [Kind::Group, Kind::Own, Kind::Direct]);
         // Group not usable (switch off, no key, probe failed): Own leads.
-        assert_eq!(order_with(&s, true, |k| k != Kind::Group)[0], Kind::Own);
+        assert_eq!(order_with(&s, |k| k != Kind::Group)[0], Kind::Own);
     }
 
     #[test]
@@ -1544,15 +1597,15 @@ mod tests {
             let mut s = blank();
             bench(&mut s, now + ms(600_000));
             assert_eq!(
-                order_with(&s, true, usable),
+                order_with(&s, usable),
                 vec![Kind::Relay, Kind::Exits, Kind::Direct, Kind::Group]
             );
             // With the user's own proxy present it takes the lead meanwhile.
-            assert_eq!(order_with(&s, true, |k| k != Kind::Vpn)[0], Kind::Own);
+            assert_eq!(order_with(&s, |k| k != Kind::Vpn)[0], Kind::Own);
 
             let mut s = blank();
             bench(&mut s, now - ms(1));
-            assert_eq!(order_with(&s, true, usable)[0], Kind::Group);
+            assert_eq!(order_with(&s, usable)[0], Kind::Group);
         }
     }
 
@@ -1567,7 +1620,7 @@ mod tests {
         ] {
             let mut s = blank();
             bench(&mut s, now + ms(600_000));
-            let order = order_with(&s, true, usable);
+            let order = order_with(&s, usable);
             assert_eq!(
                 order,
                 vec![Kind::Relay, Kind::Exits, Kind::Direct, Kind::Own]
@@ -1576,7 +1629,7 @@ mod tests {
             // The bench over, first again.
             let mut s = blank();
             bench(&mut s, now - ms(1));
-            assert_eq!(order_with(&s, true, usable)[0], Kind::Own);
+            assert_eq!(order_with(&s, usable)[0], Kind::Own);
         }
     }
 
@@ -1586,21 +1639,21 @@ mod tests {
         let mut s = blank();
         s.penalised[Kind::Own.index()] = Some(now + ms(600_000));
         s.penalised[Kind::Relay.index()] = Some(now + ms(60_000));
-        let order = order_with(&s, true, |k| k != Kind::Vpn && k != Kind::Group);
+        let order = order_with(&s, |k| k != Kind::Vpn && k != Kind::Group);
         assert_eq!(
             order,
             vec![Kind::Exits, Kind::Direct, Kind::Relay, Kind::Own]
         );
         // An unusable Own is not offered at all, benched or not.
-        let order = order_with(&s, true, |k| k != Kind::Vpn && k != Kind::Own && k != Kind::Group);
+        let order = order_with(&s, |k| k != Kind::Vpn && k != Kind::Own && k != Kind::Group);
         assert!(!order.contains(&Kind::Own));
     }
 
     #[test]
     fn unusable_routes_are_not_offered_at_all() {
-        let order = order_with(&blank(), true, |k| k == Kind::Relay);
+        let order = order_with(&blank(), |k| k == Kind::Relay);
         assert_eq!(order, vec![Kind::Relay]);
-        assert!(order_with(&blank(), true, |_| false).is_empty());
+        assert!(order_with(&blank(), |_| false).is_empty());
     }
 
     /// `usable` may ask the table questions of its own. This deadlocked once:
@@ -1665,7 +1718,10 @@ mod tests {
                 "but the refusal is still on the record the window shows"
             );
         } else {
-            assert!(relay_row.is_none(), "a build without the relay shows no relay row");
+            assert!(
+                relay_row.is_none(),
+                "a build without the relay shows no relay row"
+            );
         }
         // Once the proof has aged out, the same refusal benches - at the first
         // step, because the answer reset the streak.
@@ -1735,11 +1791,9 @@ mod tests {
         record(Kind::Direct, ms(300));
         record_failure(Kind::Direct);
         assert_eq!(latency(Kind::Direct), None);
-        // With the DNS layer, as on Windows: without it (Linux) Direct is last
-        // whatever happened to it, and the test could not tell the two apart.
-        let after_loss = order_with(&snapshot(), true, |_| true);
+        let after_loss = order_with(&snapshot(), |_| true);
         probe_failed(Kind::Direct);
-        let after_probe = order_with(&snapshot(), true, |_| true);
+        let after_probe = order_with(&snapshot(), |_| true);
         assert!(
             after_probe.last() == Some(&Kind::Direct) && after_loss.last() != Some(&Kind::Direct),
             "{after_loss:?} then {after_probe:?}"

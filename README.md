@@ -6,7 +6,7 @@
 [![UI](https://img.shields.io/badge/UI-egui%20%2F%20eframe-purple)](src/gui/mod.rs)
 [![Downloads](https://img.shields.io/github/downloads/Fuheshka/Antigravity-Unlocker/total?label=Downloads&logo=github)](https://github.com/Fuheshka/Antigravity-Unlocker/releases)
 
-Нативный порт [Antigravity Unlocker](https://github.com/confeden/Antigravity) для macOS (Apple Silicon и Intel). С ним аккаунт Google из любой страны, в том числе из России, может пользоваться Antigravity 2.0, Antigravity IDE и Antigravity CLI без VPN и без смены региона. Настройка делается один раз для компьютера. После обновления Antigravity анлокер сам патчит его заново.
+Нативный порт [Antigravity Unlocker](https://github.com/confeden/Antigravity) для macOS (Apple Silicon и Intel). С ним аккаунт Google из любой страны, в том числе из России, может пользоваться Antigravity 2.0, Antigravity IDE, Antigravity CLI и расширением Antigravity для VS Code без VPN и без смены региона. Настройка делается один раз для компьютера, после этого можно входить с любыми аккаунтами. После обновления Antigravity анлокер сам патчит его заново.
 
 ## Установка
 
@@ -52,13 +52,19 @@ cd Antigravity-Unlocker
 
 ## Если не работает
 
-Посмотрите на карточку вверху окна: там написано, что мешает и что делать. Если не помогло, нажмите «Скопировать отчёт» и пришлите его в группу.
+Смотрите карточку вверху окна: она пишет, что мешает (блокировка, сторонний прокси, повреждённая сигнатура или права доступа) и что делать. Если патч не записывается в `.app`, разрешите приложению или Терминалу **«Управление приложениями»** в **Настройки → Конфиденциальность и безопасность**. Не помогло — напишите об этом в группу [t.me/nova_txt](https://t.me/nova_txt).
 
 ## Что меняется в системе
 
-1. **Language Server и CLI** (`language_server*`, `agy`): меняются две строки одинаковой длины, `ineligible` → `inexigible` и `https_proxy` → `AG_LS_PROXY`. Потом бинарник переподписывается ad-hoc (`codesign -s -`), иначе macOS не даст его запустить.
-2. **Локальный прокси** `127.0.0.1:53129`, работает как LaunchAgent `~/Library/LaunchAgents/com.antigravity.unlocker.proxy.plist`. На него указывает только `AG_LS_PROXY`, а системный `HTTPS_PROXY` не меняется. TLS не расшифровывается, сертификаты не ставятся.
-3. DNS и сетевые настройки macOS не меняются.
+Всё точечно и откатывается переключателями в окне.
+
+1. **Language Server и CLI** (`language_server*`, `agy`, включая backend расширения VS Code в `~/.gemini/bin`): меняются две строки одинаковой длины — `ineligible` → `inexigible` (снимает региональное ограничение) и `https_proxy` → `AG_LS_PROXY`. Размер файла не меняется. После изменения Mach-O переподписывается ad-hoc (`codesign -s -`), а флаг карантина с бандла снимается.
+2. **Локальный прокси и фоновые агенты** (`127.0.0.1:53129`): LaunchAgents `com.agunlocker.proxy` (прокси), `com.agunlocker.watchdog` (контроль обновлений Antigravity) и `com.agunlocker.env` (`launchctl setenv AG_LS_PROXY`, плюс синхронизация `~/.zprofile` / `~/.zshrc` для CLI в открытом терминале). Системный `HTTPS_PROXY` не меняется, `git` и браузеры работают как раньше. TLS не расшифровывается, сертификаты не ставятся.
+3. Системный DNS macOS не изменяется; маршрутизация выполняется для узлов `cloudcode-pa.googleapis.com`, `daily-cloudcode-pa.googleapis.com` и `aicode.googleapis.com` (голосовые запросы).
+
+Gemini CLI не поддерживается: Google закрыл в нём вход для личных аккаунтов, и обойти это на стороне клиента нельзя.
+
+В открытом коде нет списка встроенных выходов и серверной части маршрута «Прокси из группы» (чтобы чужие серверы не перегружались); без них программа собирается и работает на остальных маршрутах.
 
 ---
 

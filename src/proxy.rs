@@ -394,8 +394,10 @@ fn is_local_host(host: &str) -> bool {
     }
 }
 
-/// The two region-gated CloudCode endpoints - the only names that ever need a
-/// route other than a plain direct tunnel. Everything else reaches genuine
+/// The region-gated endpoints - the only names that ever need a route other
+/// than a plain direct tunnel: the two CloudCode hosts, and `aicode`, which
+/// carries the voice session (`[voice-rap]` in the client log, one lookup of it
+/// per `voice_session_start`, measured 2026-11-06; revises D6). Everything else reaches genuine
 /// Google unaided, so it is never sent through anybody's proxy.
 ///
 /// Lives here rather than in the private relay module because it is policy, not
@@ -403,7 +405,9 @@ fn is_local_host(host: &str) -> bool {
 /// copy of a list like this drifts.
 pub fn is_gate_host(host: &str) -> bool {
     let h = host.trim_end_matches('.').to_ascii_lowercase();
-    h == "cloudcode-pa.googleapis.com" || h == "daily-cloudcode-pa.googleapis.com"
+    h == "cloudcode-pa.googleapis.com"
+        || h == "daily-cloudcode-pa.googleapis.com"
+        || h == "aicode.googleapis.com"
 }
 
 /// Sends a gate host through the user's own proxy, when they gave us one and it
@@ -493,11 +497,12 @@ fn try_direct(mut client: TcpStream, host: &str, port: u16) -> Result<(), TcpStr
 /// route to 400s that the log called «the DNS route».
 fn gate_direct_addrs(host: &str, port: u16) -> Result<(Vec<std::net::SocketAddr>, u32), String> {
     let if_index = crate::net::pin_interface();
-    let (addrs, _, verdict) = crate::resolvers::resolve_a_best(host, if_index)
+    let (addrs, _, verdict) = crate::resolvers::direct_addrs(host, if_index)
         .ok_or_else(|| "имя не разрешилось".to_string())?;
-    // With no relay to stand down for a tunnel (D13) and no VPN route of ours,
-    // Google's own address is the gate and nothing else: the next route in the
-    // table takes the connection instead.
+    // Outside Windows nothing stands down for a tunnel (D13) - the client
+    // reaches us through the proxy variable, not a DNS answer - and the user's
+    // VPN has a row of its own (`Kind::Vpn`), so Google's own address here is
+    // the gate and nothing else: the next route in the table takes it instead.
     if !cfg!(target_os = "windows") && verdict != crate::resolvers::Verdict::Substituted {
         return Err(
             "сервисы разблокировки не подменили адрес — напрямую будет ошибка 400".to_string(),

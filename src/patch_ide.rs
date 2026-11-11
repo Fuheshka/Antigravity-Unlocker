@@ -98,12 +98,18 @@ fn restore_js(target: &Path) -> Result<bool, String> {
 /// failed restore into a silent success, and the messages went to a console the
 /// window does not have.
 fn ide_app_dir(inst: &Path) -> PathBuf {
-    let mac = inst.join("Contents").join("Resources").join("app");
-    if mac.exists() {
-        mac
-    } else {
-        inst.join("resources").join("app")
+    let mac_bundle = inst.join("Contents").join("Resources").join("app");
+    if mac_bundle.exists() {
+        return mac_bundle;
     }
+    #[cfg(target_os = "macos")]
+    {
+        let mac_res = crate::macos::resources_dir(inst).join("app");
+        if mac_res.exists() {
+            return mac_res;
+        }
+    }
+    inst.join("resources").join("app")
 }
 
 pub fn unpatch_ide_js(inst: &Path) -> Vec<(String, Result<bool, String>)> {

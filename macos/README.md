@@ -9,8 +9,8 @@
 * **Нативный Mach-O бинарник:** компилируется без прослоек эмуляции, графический интерфейс работает через Metal / OpenGL (eframe/egui).
 * **Автоматический патч Language Server & CLI:** находит и патчит `language_server_macos_arm`, `language_server_macos_x64` и `agy` в `/Applications`, `~/Applications` и `~/.gemini/bin`.
 * **Автоматический ad-hoc codesign:** после модификации бинарника сразу выполняется `codesign --force -s -`, предотвращая сбой AMFI (`SIGKILL`) на Apple Silicon.
-* **Фоновый сервис LaunchAgent (без root):** локальный CONNECT-прокси автоматически запускается при входе в систему через `~/Library/LaunchAgents/com.antigravity.unlocker.proxy.plist`. Права администратора (`sudo`) не требуются.
-* **Бесшовная передача окружения:** переменная `AG_LS_PROXY` регистрируется в сессии `launchd` через `launchctl setenv` (наследуется всеми GUI-приложениями, запущенными из Finder / Dock / Spotlight) и прописывается в `~/.zprofile` для терминальных сессий.
+* **Фоновые сервисы LaunchAgent (без root):** локальный CONNECT-прокси, watchdog автопатча и восстановление переменной окружения автоматически запускаются при входе в систему через `~/Library/LaunchAgents/com.agunlocker.{proxy,watchdog,env}.plist`. Права администратора (`sudo`) не требуются.
+* **Бесшовная передача окружения:** переменная `AG_LS_PROXY` регистрируется в сессии `launchd` через `launchctl setenv` и login-агент `com.agunlocker.env` (наследуется всеми GUI-приложениями, запущенными из Finder / Dock / Spotlight), а также синхронизируется с `~/.zprofile` / `~/.zshrc` для терминальных сессий.
 
 ---
 
@@ -93,8 +93,10 @@ cargo build --release
 При выключении переключателей в интерфейсе приложения или удалении LaunchAgent:
 ```bash
 launchctl unsetenv AG_LS_PROXY
-launchctl unload -w ~/Library/LaunchAgents/com.antigravity.unlocker.proxy.plist 2>/dev/null || true
-rm -f ~/Library/LaunchAgents/com.antigravity.unlocker.proxy.plist
+for lbl in com.agunlocker.proxy com.agunlocker.watchdog com.agunlocker.env com.antigravity.unlocker.proxy; do
+  launchctl bootout "gui/$(id -u)/$lbl" 2>/dev/null || launchctl unload -w "$HOME/Library/LaunchAgents/${lbl}.plist" 2>/dev/null || true
+  rm -f "$HOME/Library/LaunchAgents/${lbl}.plist"
+done
 ```
 
 ---

@@ -155,7 +155,7 @@ pub const LISTEN_PORT: u16 = 53;
 ///     added, and an address that fails sits out of the DoH walk for a while
 ///     (`doh::plan`). An older relay still spends 2.5 s of every walk on two
 ///     dead addresses - the slow start of the 400 bypass.
-pub const RELAY_VERSION: u32 = 42;
+pub const RELAY_VERSION: u32 = 44;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -595,7 +595,11 @@ fn warm_forever() {
             // address reached from the tunnel's exit is refused by the RU-only
             // providers (N25) - so the relay answers as the tunnel would (D13's
             // old rule, now the fallback D25 leaves in place).
-            let (stand_down, _) = if tunnel && !loopback::active() {
+            //
+            // Never outside Windows: there the client's gate traffic reaches us
+            // through the renamed proxy variable, not through a DNS answer, so
+            // there is no answer to change and no door to be down.
+            let (stand_down, _) = if cfg!(target_os = "windows") && tunnel && !loopback::active() {
                 egress::vpn_verdict(eg.as_ref())
             } else {
                 (false, egress::ClientEgress::Unknown)
@@ -803,7 +807,12 @@ fn answer_log(hits: &[(std::path::PathBuf, ls_log::Tally)]) {
     // After the answers and refusals: an answer older than the drop must not
     // wipe the streak the drop is about to add to.
     if let Some(d) = drop {
-        on_drops(drops, d, dropped_host.as_deref(), answer.is_some_and(|a| a > d));
+        on_drops(
+            drops,
+            d,
+            dropped_host.as_deref(),
+            answer.is_some_and(|a| a > d),
+        );
     }
 }
 
@@ -911,7 +920,18 @@ fn on_refusals(count: usize, at: Instant, host: Option<&str>) {
         Some((kind, tunnel)) => {
             let shape = routes::tunnel_shape(tunnel);
             log_proxy(&connection_note(kind, tunnel, shape));
-            match routes::blame(kind) {
+            let blamed = routes::blame(kind);
+            // A route-wide bench is not enough for the group: the same server
+            // would be picked again when it ends. Bench the server itself.
+            if matches!(kind, routes::Kind::Group)
+                && matches!(
+                    blamed,
+                    routes::Blamed::Benched(_) | routes::Blamed::AlreadyBenched
+                )
+            {
+                crate::group::bench_current_server();
+            }
+            match blamed {
                 routes::Blamed::Benched(penalty) => {
                     log_proxy(&format!(
                         "маршрут «{}» нёс region-400 — отложен на {}, его соединения закрыты",

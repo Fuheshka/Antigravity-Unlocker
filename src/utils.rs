@@ -206,19 +206,22 @@ pub fn message_box(title: &str, text: &str) {
 /// run from a shell); the dialog is the copy the desktop user can see. Best
 /// effort by design: none of these three is guaranteed to be installed, and a
 /// missing one must not turn a diagnostic into a second failure.
+/// macOS: AppleScript's own alert, which every Mac has.
 #[cfg(target_os = "macos")]
 pub fn message_box(title: &str, text: &str) {
     eprintln!("{}: {}", title, text);
+    let q = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
-        "display dialog \"{}\" with title \"{}\" buttons {{\"OK\"}} default button \"OK\" with icon stop",
-        text.replace('\\', "\\\\").replace('"', "\\\""),
-        title.replace('\\', "\\\\").replace('"', "\\\"")
+        "display alert \"{}\" message \"{}\" as critical",
+        q(title),
+        q(text)
     );
-    let _ = Command::new("osascript")
+    Command::new("/usr/bin/osascript")
         .args(["-e", &script])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .status()
+        .ok();
 }
 
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
@@ -283,7 +286,7 @@ pub fn open_url(url: &str) {
     }
     #[cfg(target_os = "macos")]
     {
-        Command::new("open").arg(url).status().ok();
+        Command::new("/usr/bin/open").arg(url).status().ok();
     }
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
@@ -481,7 +484,8 @@ pub fn reveal_in_explorer(path: &Path) {
     }
     #[cfg(target_os = "macos")]
     {
-        Command::new("open")
+        // `open -R` opens Finder with the file selected.
+        Command::new("/usr/bin/open")
             .arg("-R")
             .arg(path)
             .stdout(Stdio::null())

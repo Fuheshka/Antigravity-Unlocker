@@ -375,7 +375,8 @@ fn count_refusals(buf: &[u8]) -> usize {
 /// matched by prefix rather than listed, so a rebranded build is picked up too.
 /// The CLI (`agy`) writes `~\.gemini\antigravity-cli\log\cli-<stamp>.log`, one
 /// per session, in the same glog format - found 2026-09-18, and watched from
-/// 2.14.0_1 on (before that "CLI log location unknown").
+/// 2.14.0_1 on (before that "CLI log location unknown"). The VS Code
+/// extension's backend writes the same files under `~\.geminintigravity\log`.
 /// Public because the window holds the list rather than rebuilding it: this
 /// walks `%APPDATA%` and then the IDE's `logs` folder, which has one sub-folder
 /// per launch, and a window ticking every three seconds must not do that.
@@ -388,11 +389,7 @@ pub fn candidate_logs() -> Vec<PathBuf> {
     #[cfg(not(target_os = "macos"))]
     let macos_logs: Option<PathBuf> = None;
 
-    let mut out = candidate_logs_in(root.as_deref(), macos_logs.as_deref());
-    if let Some(cli) = newest_cli_log() {
-        out.push(cli);
-    }
-    out
+    candidate_logs_in(root.as_deref(), macos_logs.as_deref())
 }
 
 fn candidate_logs_in(profile_root: Option<&Path>, macos_logs: Option<&Path>) -> Vec<PathBuf> {
@@ -444,15 +441,28 @@ fn candidate_logs_in(profile_root: Option<&Path>, macos_logs: Option<&Path>) -> 
             }
         }
     }
+    for app_dir in CLI_APP_DIRS {
+        if let Some(cli) = newest_cli_log(app_dir) {
+            out.push(cli);
+        }
+    }
     out
 }
 
-/// The CLI's current session log: the newest `cli-*.log`.
-fn newest_cli_log() -> Option<PathBuf> {
+/// `~/.gemini/<dir>/log` folders the `agy` backend writes `cli-<stamp>.log` to.
+/// `antigravity-cli` is the CLI's own; `antigravity` is the backend the VS Code
+/// extension (and IDE 2.6.0) downloads to `~/.gemini/bin` and starts as
+/// `agy --hub --app_data_dir=antigravity` - measured 2026-11-07: its model
+/// answers (`streamGenerateContent … ResponseID:`) and region refusals land
+/// there, in the same glog format, and nowhere else.
+const CLI_APP_DIRS: [&str; 2] = ["antigravity-cli", "antigravity"];
+
+/// One backend's current session log: the newest `cli-*.log` in its folder.
+fn newest_cli_log(app_dir: &str) -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
     let dir = PathBuf::from(home)
         .join(".gemini")
-        .join("antigravity-cli")
+        .join(app_dir)
         .join("log");
     fs::read_dir(dir)
         .ok()?
@@ -489,11 +499,10 @@ fn profile_root() -> Option<PathBuf> {
     std::env::var("APPDATA").ok().map(PathBuf::from)
 }
 
+/// macOS: Electron keeps the profile under `~/Library/Application Support`.
 #[cfg(target_os = "macos")]
 fn profile_root() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+    Some(crate::macos::application_support())
 }
 
 /// Linux keeps the same layout under `~/.config`; nothing tails it there yet

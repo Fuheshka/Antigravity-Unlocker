@@ -29,15 +29,20 @@ mod egress;
 mod elevate;
 mod endpoint;
 mod gate;
+pub mod group;
+mod group_key;
 mod gui;
 mod health;
 mod hosts_pin;
 mod hwid;
 mod instances;
-mod group_key;
 mod loopback;
 mod ls_log;
+#[cfg(target_os = "macos")]
+mod macos;
 mod net;
+#[cfg(not(target_os = "windows"))]
+mod netif;
 mod ops;
 mod patch_binary;
 mod patch_ide;
@@ -49,7 +54,6 @@ mod settings;
 mod tui;
 mod update;
 mod upstream;
-pub mod group;
 mod utils;
 mod watchdog;
 
@@ -83,6 +87,9 @@ fn is_install_root(path: &Path) -> bool {
         return false;
     }
 
+    #[cfg(target_os = "macos")]
+    let resources = macos::resources_dir(path);
+    #[cfg(not(target_os = "macos"))]
     let resources = path.join("resources");
     if resources.exists() && resources.is_dir() {
         if resources.join("app.asar").exists()
@@ -91,19 +98,6 @@ fn is_install_root(path: &Path) -> bool {
         {
             return true;
         }
-    }
-    // macOS .app bundle layout: Contents/Resources/app[.asar] or Contents/MacOS
-    let mac_resources = path.join("Contents").join("Resources");
-    if mac_resources.exists() && mac_resources.is_dir() {
-        if mac_resources.join("app.asar").exists()
-            || mac_resources.join("app").exists()
-            || mac_resources.join("bin").exists()
-        {
-            return true;
-        }
-    }
-    if path.join("Contents").join("MacOS").is_dir() {
-        return true;
     }
     // `is_file`, not `exists`: `%LOCALAPPDATA%\agy` is the CLI's *directory*, and
     // an `exists()` check there made the parent-walk treat `%LOCALAPPDATA%` itself
@@ -170,6 +164,8 @@ pub fn resolve_install_root(raw: &Path) -> Option<PathBuf> {
         "Programs\\Antigravity IDE",
         "Programs\\Antigravity",
         "resources",
+        // macOS: the `.app` itself was picked; the root is its `Contents`.
+        "Contents",
     ];
     for sub in subfolder_candidates {
         let candidate = p.join(sub);
@@ -206,6 +202,11 @@ fn standard_install_candidates() -> Vec<PathBuf> {
         PathBuf::from(&local_appdata).join("Antigravity IDE"),
         PathBuf::from(&local_appdata).join("agy").join("bin"),
         PathBuf::from(&local_appdata).join("agy"),
+        // IDE 2.6.0 no longer bundles its language server: the extension
+        // downloads the `agy` backend here at first start.
+        PathBuf::from(env::var("USERPROFILE").unwrap_or_default())
+            .join(".gemini")
+            .join("bin"),
     ]
 }
 
@@ -222,20 +223,6 @@ fn standard_install_candidates() -> Vec<PathBuf> {
 
     #[cfg(target_os = "macos")]
     {
-        for app in [
-            "/Applications/Antigravity IDE.app",
-            "/Applications/Antigravity Tools.app",
-            "/Applications/Antigravity.app",
-        ] {
-            v.push(PathBuf::from(app));
-        }
-        if !home.is_empty() {
-            let h = PathBuf::from(&home);
-            v.push(h.join("Applications/Antigravity IDE.app"));
-            v.push(h.join("Applications/Antigravity Tools.app"));
-            v.push(h.join("Applications/Antigravity.app"));
-            v.push(h.join(".gemini/bin"));
-        }
         v.push(PathBuf::from("/opt/homebrew/bin"));
         v.push(PathBuf::from("/usr/local/bin"));
     }
@@ -265,6 +252,10 @@ fn standard_install_candidates() -> Vec<PathBuf> {
         v.push(h.join(".agy"));
         v.push(h.join(".local/share/agy/bin"));
     }
+    // macOS: `.app` bundles in /Applications and ~/Applications; the install
+    // root is the bundle's `Contents` (S80).
+    #[cfg(target_os = "macos")]
+    v.extend(macos::app_bundles());
     v
 }
 
@@ -443,11 +434,17 @@ pub fn process_install(install: &Path) -> Result<InstallOutcome, String> {
     let bin_summary = patch_all_binaries(install);
     let mut warnings: Vec<String> = Vec::new();
 
-    let resources = if install.join("Contents").join("Resources").exists() {
-        install.join("Contents").join("Resources")
-    } else {
-        install.join("resources")
+    #[cfg(target_os = "macos")]
+    let resources = {
+        let bundle_res = install.join("Contents").join("Resources");
+        if bundle_res.exists() {
+            bundle_res
+        } else {
+            macos::resources_dir(install)
+        }
     };
+    #[cfg(not(target_os = "macos"))]
+    let resources = install.join("resources");
     let app_dir = resources.join("app");
     let app_asar = resources.join("app.asar");
 
@@ -538,7 +535,7 @@ pub fn process_install(install: &Path) -> Result<InstallOutcome, String> {
             warnings.push(format!("Прежний {} не снят: {}", endpoint::CLI_ENV_VAR, e));
         }
         return Ok(InstallOutcome {
-            label: "Antigravity CLI",
+            label: install_label(install),
             warnings,
             summary: bin_summary,
         });
@@ -582,11 +579,61 @@ pub fn remove_legacy_ca_quiet() -> bool {
 /// A guess from the layout rather than the name `process_install` returns,
 /// because the line is printed before the work starts - that is the whole point
 /// of it.
+/// Editor extension folders where the Antigravity extension for VS Code (and
+/// its forks, which install from the same marketplace package) lives. The
+/// extension downloads its backend to `~/.gemini/bin`, the folder discovery
+/// already patches, so the folder is that editor's install in the window.
+const VSCODE_EXTENSION_DIRS: [&str; 5] = [
+    ".vscode",
+    ".vscode-insiders",
+    ".vscode-oss",
+    ".cursor",
+    ".windsurf",
+];
+
+/// Whether the Antigravity extension is installed in any VS Code-family editor.
+pub fn vscode_extension_installed() -> bool {
+    let Some(home) = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")) else {
+        return false;
+    };
+    let home = PathBuf::from(home);
+    VSCODE_EXTENSION_DIRS.iter().any(|d| {
+        fs::read_dir(home.join(d).join("extensions"))
+            .map(|entries| {
+                entries.flatten().any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .starts_with("google.google-antigravity-")
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// `~/.gemini/bin`: the backend of the VS Code extension and of IDE 2.6.0.
+fn is_gemini_bin(install: &Path) -> bool {
+    install.file_name().is_some_and(|n| n == "bin")
+        && install
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == ".gemini")
+}
+
 pub fn install_label(install: &Path) -> &'static str {
-    if install.join("agy.exe").is_file() || install.join("agy").is_file() {
+    if is_gemini_bin(install) && vscode_extension_installed() {
+        "Antigravity для VS Code"
+    } else if install.join("agy.exe").is_file() || install.join("agy").is_file() {
         "Antigravity CLI"
     } else if install.join("Antigravity IDE.exe").exists()
         || install.join("resources").join("app").join("out").exists()
+        || install.join("Resources").join("app").join("out").exists()
+        || install
+            .join("Contents")
+            .join("Resources")
+            .join("app")
+            .join("out")
+            .exists()
     {
         "Antigravity IDE"
     } else {
@@ -728,7 +775,9 @@ mod tests {
         let base = env::temp_dir().join("Antigravity IDE.app");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("Contents").join("Resources").join("app")).unwrap();
-        assert!(is_install_root(&base));
+        assert!(!is_install_root(&base));
+        assert!(is_install_root(&base.join("Contents")));
+        assert_eq!(resolve_install_root(&base), Some(base.join("Contents")));
         fs::remove_dir_all(&base).ok();
     }
 }

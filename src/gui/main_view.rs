@@ -146,62 +146,64 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
                     pressed = Some(action);
                 }
             }
-            ui.add_space(10.0);
-            // The saved file is named on a line of its own, under the buttons.
-            // A report the size of these is pasted into a chat as a wall of
-            // text nobody reads and half of them arrive truncated, so the file
-            // *is* the deliverable and its name is what the user has to act on;
-            // the path is not shown, because «рабочий стол» plus «Показать» is
-            // what actually gets them to it.
-            let saved = app
-                .report_saved
-                .clone()
-                .filter(|(at, _)| at.elapsed() < REPORT_SHOWN_FOR);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(!busy, egui::Button::new(egui::RichText::new("Сохранить отчёт").size(12.5)))
-                    .on_hover_text("Всё, что нужно, чтобы понять, почему Antigravity отвечает или нет — одним файлом на рабочем столе: приложите его к сообщению")
-                    .clicked()
-                {
-                    copy = true;
-                }
-                if let Some((_, path)) = &saved {
+            if super::report::ENABLED {
+                ui.add_space(10.0);
+                // The saved file is named on a line of its own, under the buttons.
+                // A report the size of these is pasted into a chat as a wall of
+                // text nobody reads and half of them arrive truncated, so the file
+                // *is* the deliverable and its name is what the user has to act on;
+                // the path is not shown, because «рабочий стол» plus «Показать» is
+                // what actually gets them to it.
+                let saved = app
+                    .report_saved
+                    .clone()
+                    .filter(|(at, _)| at.elapsed() < REPORT_SHOWN_FOR);
+                ui.horizontal(|ui| {
                     if ui
-                        .add(egui::Button::new(egui::RichText::new("Показать файл").size(12.5)))
-                        .on_hover_text("Открыть папку с отчётом")
+                        .add_enabled(!busy, egui::Button::new(egui::RichText::new("Сохранить отчёт").size(12.5)))
+                        .on_hover_text("Всё, что нужно, чтобы понять, почему Antigravity отвечает или нет — одним файлом на рабочем столе: приложите его к сообщению")
                         .clicked()
                     {
-                        reveal = Some(path.clone());
+                        copy = true;
                     }
+                    if let Some((_, path)) = &saved {
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("Показать файл").size(12.5)))
+                            .on_hover_text("Открыть папку с отчётом")
+                            .clicked()
+                        {
+                            reveal = Some(path.clone());
+                        }
+                    }
+                });
+                if let Some((_, path)) = &saved {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Отчёт сохранён на рабочий стол: «{}». Приложите этот файл к сообщению.",
+                            path.file_name()
+                                .map(|f| f.to_string_lossy().into_owned())
+                                .unwrap_or_default()
+                        ))
+                        .size(12.5)
+                        .color(theme::OK),
+                    );
+                    ui.ctx().request_repaint_after(Duration::from_millis(500));
                 }
-            });
-            if let Some((_, path)) = &saved {
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Отчёт сохранён на рабочий стол: «{}». Приложите этот файл к сообщению.",
-                        path.file_name()
-                            .map(|f| f.to_string_lossy().into_owned())
-                            .unwrap_or_default()
-                    ))
-                    .size(12.5)
-                    .color(theme::OK),
-                );
-                ui.ctx().request_repaint_after(Duration::from_millis(500));
-            }
-            if app
-                .report_clipboard_at
-                .is_some_and(|at| at.elapsed() < REPORT_SHOWN_FOR)
-            {
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Файл сохранить не удалось — отчёт скопирован, вставьте его в сообщение.",
-                    )
-                    .size(12.5)
-                    .color(theme::WARN),
-                );
-                ui.ctx().request_repaint_after(Duration::from_millis(500));
+                if app
+                    .report_clipboard_at
+                    .is_some_and(|at| at.elapsed() < REPORT_SHOWN_FOR)
+                {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Файл сохранить не удалось — отчёт скопирован, вставьте его в сообщение.",
+                        )
+                        .size(12.5)
+                        .color(theme::WARN),
+                    );
+                    ui.ctx().request_repaint_after(Duration::from_millis(500));
+                }
             }
         });
 
@@ -310,6 +312,7 @@ fn install_rows(app: &mut App, ui: &mut egui::Ui) {
 
     let mut forget: Option<std::path::PathBuf> = None;
     let mut edit: Option<String> = None;
+    let mut patch: Option<std::path::PathBuf> = None;
 
     for row in &rows {
         ui.horizontal(|ui| {
@@ -359,6 +362,15 @@ fn install_rows(app: &mut App, ui: &mut egui::Ui) {
                         }
                     }
                 }
+                if let (Some(path), Some(false)) = (&row.path, row.patched) {
+                    if ui
+                        .small_button("Пропатчить")
+                        .on_hover_text("Наложить патч на эту установку")
+                        .clicked()
+                    {
+                        patch = Some(path.clone());
+                    }
+                }
                 if ui
                     .small_button("✏")
                     .on_hover_text("Указать путь вручную")
@@ -377,6 +389,9 @@ fn install_rows(app: &mut App, ui: &mut egui::Ui) {
 
     if let Some(p) = forget {
         app.worker.send(Cmd::ForgetPath(p));
+    }
+    if let Some(p) = patch {
+        app.worker.send(Cmd::PatchInstall(p));
     }
     if let Some(text) = edit {
         app.path_dialog = Some(text);
